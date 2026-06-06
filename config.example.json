@@ -1,0 +1,4 @@
+{
+    "source_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_SOURCE_SERVER_IP;Database=personnelGharb;UID=YOUR_SOURCE_USER;PWD=YOUR_SOURCE_PASSWORD;",
+    "dest_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_DESTINATION_SERVER_IP;Database=MadaniSG;UID=YOUR_DESTINATION_USER;PWD=YOUR_DESTINATION_PASSWORD;"
+}

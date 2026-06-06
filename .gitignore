@@ -1,0 +1,33 @@
+# --- Virtual Environments ---
+venv/
+env/
+.env
+.venv/
+Scripts/
+
+# --- Configuration & Secrets ---
+config.json
+*.secret.*
+credentials/
+
+# --- Python Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Logs & Output ---
+*.log
+logs/
+migration_errors.txt
+
+# --- Temporary Data Dumps (Crucial for ETL) ---
+*.csv
+*.xlsx
+*.bak
+data_dumps/
+
+# --- IDEs and OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
