@@ -1,26 +1,27 @@
-# main.py
-from steps import step_01_base_info, step_02_personnel, step_03_contracts
+from steps import step_01_party
 
-def run_migration():
-    print("--- Starting Migration Process ---")
+def main():
+    print("========================================")
+    print("   DATA MIGRATION PIPELINE STARTED      ")
+    print("========================================")
     
     try:
-        # Step 1: Lookups and Base Data
-        print("\nExecuting Step 1: Base Information...")
-        # step_01_base_info.run() 
+        # Execute Step 1
+        step_01_party.run()
         
-        # Step 2: Core Personnel Data
-        print("\nExecuting Step 2: Personnel...")
-        step_02_personnel.migrate_personnel()
+        # Space for future steps
+        # print("\n--- Running Step 2: Employee Data ---")
+        # step_02_employee.run()
         
-        # Step 3: Dependent Data
-        print("\nExecuting Step 3: Contracts...")
-        # step_03_contracts.run()
-        
-        print("\n--- Migration Completed Successfully ---")
+        print("\n========================================")
+        print("   PIPELINE COMPLETED SUCCESSFULLY      ")
+        print("========================================")
         
     except Exception as e:
-        print(f"\nCRITICAL ERROR: Migration halted. Details: {e}")
+        print("\n========================================")
+        print("   PIPELINE FAILED                      ")
+        print(f"   Error: {e}")
+        print("========================================")
 
 if __name__ == "__main__":
-    run_migration()
+    main()
