@@ -3,7 +3,6 @@ import warnings
 from db_core import get_connections
 from utils.date_helpers import shamsi_to_gregorian
 
-# Suppress the pandas UserWarning about pyodbc
 warnings.filterwarnings('ignore', category=UserWarning)
 
 def setup_mapping_table(cursor):
@@ -23,18 +22,13 @@ def setup_mapping_table(cursor):
 def run():
     print("\n--- Running Step 1: Base Party Migration ---")
     
-    # 1. Initialize Connections
     source_cnxn, dest_cnxn = get_connections()
     source_cursor = source_cnxn.cursor()
     dest_cursor = dest_cnxn.cursor()
     
     setup_mapping_table(dest_cursor)
 
-    # 2. Fetch Source Data
     print("Fetching Source Data...")
-    
-    # FIXED: TBL_PersonnelNationaNo (removed the 'l' to match the source database typo)
-    # FIXED: Changed ID to TBL_PersonnelID based on the CSV headers
     source_query = """
         SELECT 
             TBL_PersonnelID AS SourceID, 
@@ -54,7 +48,6 @@ def run():
     """
     source_df = pd.read_sql(source_query, source_cnxn)
 
-    # 3. Fetch Deduplication Keys
     print("Fetching Destination Deduplication Keys...")
     mapped_ids = pd.read_sql("SELECT SourceID FROM master.dbo.PartyMigrationMapping", dest_cnxn)['SourceID'].tolist()
     dest_party_df = pd.read_sql("SELECT NationalID, Mobile, LTRIM(RTRIM(FirstName)) + LTRIM(RTRIM(LastName)) AS FullName FROM GNR3.Party", dest_cnxn)
@@ -66,7 +59,6 @@ def run():
     cities_df = pd.read_sql("SELECT Name, RegionalDivisionID FROM GNR3.RegionalDivision", dest_cnxn)
     city_map = dict(zip(cities_df['Name'], cities_df['RegionalDivisionID']))
 
-    # 4. Transform and Filter Data
     valid_records = []
     for index, row in source_df.iterrows():
         if row['SourceID'] in mapped_ids: continue
@@ -100,7 +92,6 @@ def run():
         print("No new Party records to migrate.")
         return
 
-    # 5. Insert into Destination (With Transaction Lock)
     try:
         print(f"Preparing to insert {len(valid_records)} records...")
         
@@ -111,12 +102,13 @@ def run():
         """)
         current_last_id = dest_cursor.fetchone()[0]
         
+        # FIXED: Added Type to the columns and 0 to the VALUES
         insert_party_sql = """
             INSERT INTO GNR3.Party (
                 PartyID, FirstName, LastName, NationalID, FatherName, BirthDate, 
                 BirthPlaceRef, IssuancePlaceRef, Mobile, Tel, IDSerial, Gender, MaritalStatus,
-                CreationDate, Creator, LastModificationDate, LastModificator
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+                CreationDate, Creator, LastModificationDate, LastModifier, Type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
         """
         
         insert_mapping_sql = """
@@ -138,7 +130,7 @@ def run():
             dest_cursor.execute(insert_mapping_sql, (record['SourceID'], new_party_id))
 
         dest_cursor.execute("""
-            UPDATE tableIdGen 
+            UPDATE SYS3.tableIdGen 
             SET LastId = ? 
             WHERE TableName = 'gnr3.party'
         """, (current_last_id,))
@@ -149,6 +141,8 @@ def run():
     except Exception as e:
         dest_cnxn.rollback()
         print(f"Migration failed during insertion. Transaction rolled back. Error: {e}")
+        # FIXED: Re-raise the exception so main.py knows the step actually failed
+        raise e
     finally:
         source_cnxn.close()
         dest_cnxn.close()
