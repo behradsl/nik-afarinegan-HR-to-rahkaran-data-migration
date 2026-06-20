@@ -7,8 +7,18 @@ def shamsi_to_gregorian(shamsi_str):
     try:
         parts = str(shamsi_str).split('/')
         if len(parts) == 3:
-            jdate = jdatetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+            y = int(parts[0])
+            m = int(parts[1])
+            d = int(parts[2])
+            
+            # Fix legacy system dates where month or day is '00'
+            if m == 0: m = 1
+            if d == 0: d = 1
+            
+            jdate = jdatetime.date(y, m, d)
             return jdate.togregorian().strftime('%Y-%m-%d')
     except Exception as e:
-        print(f"Warning: Date conversion error for '{shamsi_str}': {e}")
+        # If it still fails (e.g. 1388/02/32), silently return NULL instead of spamming the console
+        pass
+        
     return None

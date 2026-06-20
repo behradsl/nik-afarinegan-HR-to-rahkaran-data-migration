@@ -1,6 +1,10 @@
 import pandas as pd
+import warnings
 from db_core import get_connections
 from utils.date_helpers import shamsi_to_gregorian
+
+# Suppress the pandas UserWarning about pyodbc
+warnings.filterwarnings('ignore', category=UserWarning)
 
 def setup_mapping_table(cursor):
     """Creates the mapping table in the master database if it doesn't exist."""
@@ -28,12 +32,15 @@ def run():
 
     # 2. Fetch Source Data
     print("Fetching Source Data...")
+    
+    # FIXED: TBL_PersonnelNationaNo (removed the 'l' to match the source database typo)
+    # FIXED: Changed ID to TBL_PersonnelID based on the CSV headers
     source_query = """
         SELECT 
-            ID AS SourceID, 
+            TBL_PersonnelID AS SourceID, 
             TBL_PersonnelFirstName AS FirstName,
             TBL_PersonnelLastName AS LastName,
-            TBL_PersonnelNationalNo AS NationalNo,
+            TBL_PersonnelNationaNo AS NationalNo, 
             TBL_PersonnelFatherName AS FatherName,
             TBL_PersonnelBirthDate AS BirthDate,
             TBL_PersonnelMobileNo AS Mobile,
@@ -99,7 +106,7 @@ def run():
         
         dest_cursor.execute("""
             SELECT LastId 
-            FROM tableIdGen WITH (UPDLOCK, HOLDLOCK) 
+            FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK) 
             WHERE TableName = 'gnr3.party'
         """)
         current_last_id = dest_cursor.fetchone()[0]
