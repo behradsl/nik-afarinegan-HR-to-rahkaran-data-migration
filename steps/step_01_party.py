@@ -19,6 +19,15 @@ def setup_mapping_table(cursor):
     """)
     cursor.commit()
 
+def clean_value(val):
+    """Converts '0', 0, empty strings, and NaNs to Python None (which becomes SQL NULL)."""
+    if pd.isna(val): 
+        return None
+    val_str = str(val).strip()
+    if val_str in ('', '0', '0.0', 'None'): 
+        return None
+    return val
+
 def run():
     print("\n--- Running Step 1: Base Party Migration ---")
     
@@ -74,16 +83,16 @@ def run():
         
         valid_records.append({
             'SourceID': row['SourceID'],
-            'FirstName': row['FirstName'],
-            'LastName': row['LastName'],
-            'NationalID': row['NationalNo'],
-            'FatherName': row['FatherName'],
+            'FirstName': clean_value(row['FirstName']),
+            'LastName': clean_value(row['LastName']),
+            'NationalID': clean_value(row['NationalNo']),
+            'FatherName': clean_value(row['FatherName']),
             'BirthDate': gregorian_birthdate,
             'BirthPlaceRef': city_map.get(row['BirthPlace'], None),
             'IssuancePlaceRef': city_map.get(row['ExportPlace'], None),
-            'Mobile': row['Mobile'],
-            'Tel': row['Tel'],
-            'IDSerial': row['IDSerial'],
+            'Mobile': clean_value(row['Mobile']),
+            'Tel': clean_value(row['Tel']),
+            'IDSerial': clean_value(row['IDSerial']),
             'Gender': gender,
             'MaritalStatus': marital_status
         })
