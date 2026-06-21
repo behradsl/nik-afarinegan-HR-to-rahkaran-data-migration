@@ -2,8 +2,11 @@ import pandas as pd
 import warnings
 from db_core import get_connections
 from utils.date_helpers import shamsi_to_gregorian
+from utils.data_helpers import clean_value  # <--- NEW IMPORT
 
 warnings.filterwarnings('ignore', category=UserWarning)
+
+
 
 def setup_mapping_table(cursor):
     """Creates the mapping table in the master database if it doesn't exist."""
@@ -19,14 +22,7 @@ def setup_mapping_table(cursor):
     """)
     cursor.commit()
 
-def clean_value(val):
-    """Converts '0', 0, empty strings, and NaNs to Python None (which becomes SQL NULL)."""
-    if pd.isna(val): 
-        return None
-    val_str = str(val).strip()
-    if val_str in ('', '0', '0.0', 'None'): 
-        return None
-    return val
+
 
 def run():
     print("\n--- Running Step 1: Base Party Migration ---")
@@ -79,7 +75,7 @@ def run():
 
         gregorian_birthdate = shamsi_to_gregorian(row['BirthDate'])
         gender = 1 if row['SexID'] == 1001 else (2 if row['SexID'] == 1002 else None)
-        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else None)
+        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else (3 if row['MaritalStatusID'] == 20003) )
         
         valid_records.append({
             'SourceID': row['SourceID'],

@@ -1,4 +1,11 @@
-from steps import step_01_party
+from steps import step_01_party, step_02_employee
+
+# --- CONFIGURATION: TOGGLE STEPS HERE ---
+STEPS_TO_RUN = {
+    "1_party": True,      # Set to False to skip Party migration
+    "2_employee": True    # Set to True to run Employee migration
+}
+# -----------------------------------------
 
 def main():
     print("========================================")
@@ -6,13 +13,16 @@ def main():
     print("========================================")
     
     try:
-        # Execute Step 1
-        step_01_party.run()
-        
-        # Space for future steps
-        # print("\n--- Running Step 2: Employee Data ---")
-        # step_02_employee.run()
-        
+        if STEPS_TO_RUN.get("1_party"):
+            step_01_party.run()
+        else:
+            print("\n--- Skipping Step 1: Party Migration ---")
+            
+        if STEPS_TO_RUN.get("2_employee"):
+            step_02_employee.run()
+        else:
+            print("\n--- Skipping Step 2: Employee Migration ---")
+            
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
         print("========================================")
@@ -20,7 +30,6 @@ def main():
     except Exception as e:
         print("\n========================================")
         print("   PIPELINE FAILED                      ")
-        print(f"   Error: {e}")
         print("========================================")
 
 if __name__ == "__main__":
