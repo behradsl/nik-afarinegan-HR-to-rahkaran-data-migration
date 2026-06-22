@@ -74,8 +74,8 @@ def run():
         if full_name in existing_fullnames: continue
 
         gregorian_birthdate = shamsi_to_gregorian(row['BirthDate'])
-        gender = 1 if row['SexID'] == 1001 else (2 if row['SexID'] == 1002 else None)
-        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else (3 if row['MaritalStatusID'] == 20003) )
+        gender = 1 if row['SexID'] == 10001 else (2 if row['SexID'] == 10002 else None)
+        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else (3 if row['MaritalStatusID'] == 20003 else null) )
         
         valid_records.append({
             'SourceID': row['SourceID'],

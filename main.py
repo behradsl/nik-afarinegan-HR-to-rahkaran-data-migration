@@ -1,9 +1,10 @@
-from steps import step_01_party, step_02_employee
+from steps import step_01_party, step_02_employee, step_03_education
 
 # --- CONFIGURATION: TOGGLE STEPS HERE ---
 STEPS_TO_RUN = {
-    "1_party": True,      # Set to False to skip Party migration
-    "2_employee": True    # Set to True to run Employee migration
+    "1_party": False,
+    "2_employee": False,
+    "3_education": True   # <--- Set this to True to run only education
 }
 # -----------------------------------------
 
@@ -22,6 +23,11 @@ def main():
             step_02_employee.run()
         else:
             print("\n--- Skipping Step 2: Employee Migration ---")
+            
+        if STEPS_TO_RUN.get("3_education"):
+            step_03_education.run()
+        else:
+            print("\n--- Skipping Step 3: Education Migration ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
