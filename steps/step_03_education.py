@@ -14,16 +14,21 @@ def run():
 
     try:
         print("Fetching Source Education History...")
+        # Added the 3 dates and joined the University Center table
         source_query = """
             SELECT 
                 dh.TBL_PersonnelId_fk AS SourceID,
                 d.TBL_DegreeName AS DegreeName,
                 db.TBL_DbName AS DisciplineName,
+                uc.HRS_UcName AS CenterName,
                 dh.HRS_DhAverage AS GPA,
-                dh.HRS_DhExcuteDate AS EndDate
+                dh.HRS_DhEnterDate AS StartDate,
+                dh.HRS_DhRecieveDate AS EndDate,
+                dh.HRS_DhExcuteDate AS EffectiveDate
             FROM dbo.HRS_DegreeHistory dh
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = dh.TBL_DegreeId_fk
             LEFT JOIN dbo.TBL_DegreeBranch db ON db.TBL_DbID = dh.TBL_DbID_fk
+            LEFT JOIN dbo.HRS_UnivercityCenter uc ON uc.HRS_UCId = dh.HRS_UCId_fk 
             WHERE dh.TBL_PersonnelId_fk IS NOT NULL
         """
         source_df = pd.read_sql(source_query, source_cnxn)
@@ -44,14 +49,18 @@ def run():
             
         print("Cleaning and Normalizing Text...")
         merged_df['DegreeName'] = merged_df['DegreeName'].apply(lambda x: normalize_persian(clean_value(x)))
-        merged_df = merged_df.dropna(subset=['DegreeName']) # Must have at least a Degree
+        merged_df = merged_df.dropna(subset=['DegreeName']) 
         
-        # FIXED: Fallback for missing Disciplines (Rahkaran requires this column)
         merged_df['DisciplineName'] = merged_df['DisciplineName'].apply(
             lambda x: 'نامشخص' if pd.isna(clean_value(x)) else normalize_persian(clean_value(x))
         )
         
-        print("Synchronizing Education Lookups (Degrees and Disciplines)...")
+        # Fallback for missing Education Centers
+        merged_df['CenterName'] = merged_df['CenterName'].apply(
+            lambda x: 'نامشخص' if pd.isna(clean_value(x)) else normalize_persian(clean_value(x))
+        )
+        
+        print("Synchronizing Education Lookups (Degrees, Disciplines, and Centers)...")
         
         def sync_lookup(lookup_type, unique_values):
             lookup_df = pd.read_sql(f"SELECT Code, Value FROM SYS3.Lookup WHERE Type = '{lookup_type}'", dest_cnxn)
@@ -89,8 +98,10 @@ def run():
                 
             return existing_map
 
+        # Sync all three lookups
         degree_map = sync_lookup('EducationDegree', merged_df['DegreeName'].unique())
         discipline_map = sync_lookup('EducationDiscipline', merged_df['DisciplineName'].unique())
+        center_map = sync_lookup('EducationCenter', merged_df['CenterName'].unique())
         
         print("Preparing to insert Employee Education records...")
         existing_edu_df = pd.read_sql("SELECT EmployeeRef, DegreeCode, DisciplineCode FROM HCM3.EmployeeEducation", dest_cnxn)
@@ -100,16 +111,18 @@ def run():
         for _, row in merged_df.iterrows():
             emp_id = int(row['EmployeeID'])
             deg_code = int(degree_map[row['DegreeName']])
-            
-            # This is now guaranteed to have a value (at least "نامشخص")
             disc_code = int(discipline_map[row['DisciplineName']]) 
+            center_code = int(center_map[row['CenterName']])
             
             if (emp_id, deg_code, disc_code) in existing_edu_set:
                 continue
-                
-            raw_end_date = clean_value(row['EndDate'])
-            gregorian_end_date = shamsi_to_gregorian(raw_end_date) if raw_end_date else None
             
+            # Map the 3 dates
+            start_date = shamsi_to_gregorian(clean_value(row['StartDate']))
+            end_date = shamsi_to_gregorian(clean_value(row['EndDate']))
+            effective_date = shamsi_to_gregorian(clean_value(row['EffectiveDate']))
+            
+            # Safe GPA cast
             gpa = None
             raw_gpa = clean_value(row['GPA'])
             if raw_gpa is not None:
@@ -118,7 +131,7 @@ def run():
                 except ValueError:
                     pass
             
-            valid_records.append((emp_id, deg_code, disc_code, gregorian_end_date, gpa))
+            valid_records.append((emp_id, deg_code, disc_code, center_code, start_date, end_date, effective_date, gpa))
             
         if not valid_records:
             print("No new Employee Education records to migrate.")
@@ -129,21 +142,22 @@ def run():
         id_row = dest_cursor.fetchone()
         current_last_id = int(id_row[0]) if id_row else 1000
         
+        # Updated INSERT to include CenterCode, StartDate, and dynamic EffectiveDate
         insert_edu_sql = """
             INSERT INTO HCM3.EmployeeEducation (
-                EmployeeEducationID, EmployeeRef, DegreeCode, DisciplineCode, 
-                EndDate, GPA, CenterCode, NeedLevelCode, QualityCode, EffectiveDate,
+                EmployeeEducationID, EmployeeRef, DegreeCode, DisciplineCode, CenterCode,
+                StartDate, EndDate, GPA, NeedLevelCode, QualityCode, EffectiveDate,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1, ISNULL(?, GETDATE()), GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ISNULL(?, GETDATE()), GETDATE(), 1, GETDATE(), 1)
         """
         
         for record in valid_records:
             current_last_id += 1
-            emp_id, deg_code, disc_code, end_date, gpa = record
+            emp_id, deg_code, disc_code, center_code, start_date, end_date, effective_date, gpa = record
             
             dest_cursor.execute(insert_edu_sql, (
-                current_last_id, emp_id, deg_code, disc_code, 
-                end_date, gpa, end_date
+                current_last_id, emp_id, deg_code, disc_code, center_code, 
+                start_date, end_date, gpa, effective_date
             ))
             
         if id_row:

@@ -75,7 +75,7 @@ def run():
 
         gregorian_birthdate = shamsi_to_gregorian(row['BirthDate'])
         gender = 1 if row['SexID'] == 10001 else (2 if row['SexID'] == 10002 else None)
-        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else (3 if row['MaritalStatusID'] == 20003 else null) )
+        marital_status = 1 if row['MaritalStatusID'] == 20001 else (2 if row['MaritalStatusID'] == 20002 else (3 if row['MaritalStatusID'] == 20003 else None) )
         
         valid_records.append({
             'SourceID': row['SourceID'],
