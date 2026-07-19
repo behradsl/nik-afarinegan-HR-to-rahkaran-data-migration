@@ -4,6 +4,7 @@
     "steps_to_run": {
         "1_party": true,
         "2_employee": true,
-        "3_education": true
+        "3_education": true,
+        "4_military": true
     }
 }

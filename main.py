@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from steps import step_01_party, step_02_employee, step_03_education
+from steps import step_01_party, step_02_employee, step_03_education, step_04_military
 
 def get_config_path():
     """Ensures the .exe looks for config.json in the folder it is currently in."""
@@ -44,6 +44,11 @@ def main():
             step_03_education.run()
         else:
             print("\n--- Skipping Step 3: Education Migration ---")
+
+        if steps_to_run.get("4_military", False):
+            step_04_military.run()
+        else:
+            print("\n--- Skipping Step 4: Military Migration ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
