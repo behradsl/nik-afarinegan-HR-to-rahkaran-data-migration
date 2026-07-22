@@ -18,6 +18,68 @@ def setup_degree_mapping_table(cursor):
     cursor.commit()
 
 
+def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
+    """
+    Ensure fixed Code→Value pairs exist in SYS3.Lookup for lookup_type.
+    Inserts any missing Code with IF NOT EXISTS (does not overwrite existing).
+    Returns dict: code (int) -> value (str) for the requested codes after ensure.
+    """
+    result = {}
+    inserted = 0
+
+    dest_cursor.execute(
+        "SELECT LastId FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK) WHERE TableName = 'sys3.lookup'"
+    )
+    id_row = dest_cursor.fetchone()
+    current_last_id = int(id_row[0]) if id_row else 10000
+    idgen_exists = id_row is not None
+
+    for code, value in sorted((int(c), v) for c, v in code_to_value.items()):
+        value = normalize_persian(value) if value else value
+        dest_cursor.execute(
+            """
+            SELECT LookupID, Value
+            FROM SYS3.Lookup
+            WHERE Type = ? AND Code = ?
+            """,
+            (lookup_type, code),
+        )
+        row = dest_cursor.fetchone()
+        if row:
+            result[code] = row[1]
+            continue
+
+        current_last_id += 1
+        dest_cursor.execute(
+            """
+            INSERT INTO SYS3.Lookup (
+                LookupID, Type, Code, Value, DisplayOrder, System, CanEdit, CanDelete
+            ) VALUES (?, ?, ?, ?, ?, 'HCM3', 1, 1)
+            """,
+            (current_last_id, lookup_type, code, value, max(code - 1, 0)),
+        )
+        result[code] = value
+        inserted += 1
+
+    if inserted:
+        print(f"  -> Added {inserted} missing {lookup_type} code(s).")
+        if idgen_exists:
+            dest_cursor.execute(
+                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'sys3.lookup'",
+                (current_last_id,),
+            )
+        else:
+            dest_cursor.execute(
+                "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES ('sys3.lookup', ?)",
+                (current_last_id,),
+            )
+    elif not result:
+        # Nothing inserted and nothing found — still return requested defaults
+        result = {int(c): normalize_persian(v) for c, v in code_to_value.items()}
+
+    return result
+
+
 def sync_lookup(dest_cnxn, dest_cursor, lookup_type, unique_values):
     """
     Ensures each value exists in SYS3.Lookup for the given Type.

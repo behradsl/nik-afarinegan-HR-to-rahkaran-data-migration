@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from steps import (
+    step_00_cleanup,
     step_01_party,
     step_02_employee,
     step_03_education,
@@ -39,6 +40,11 @@ def main():
     steps_to_run = config.get("steps_to_run", {})
 
     try:
+        if steps_to_run.get("0_cleanup", False):
+            step_00_cleanup.run()
+        else:
+            print("\n--- Skipping Step 0: Cleanup Migrated Data ---")
+
         if steps_to_run.get("1_party", False):
             step_01_party.run()
         else:

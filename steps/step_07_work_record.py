@@ -4,7 +4,7 @@ from datetime import date
 from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 from utils.date_helpers import shamsi_to_gregorian
-from utils.lookup_helpers import ensure_degree_mappings
+from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -12,6 +12,46 @@ DEFAULT_ORG_NAME = '-'
 DEFAULT_TITLE = '-'
 OPEN_END_SHAMSI = '1499/12/29'
 DEFAULT_DEGREE_CODE = 1
+
+# WorkRelationType codes (SYS3.Lookup Type = WorkRelationType)
+WORK_RELATION_RELATED = 1          # مرتبط
+WORK_RELATION_GOV_IN_INDUSTRY = 3  # دولتی داخل صنعت
+WORK_RELATION_GOV_OUT_INDUSTRY = 4  # دولتی خارج از صنعت
+WORK_RELATION_PRIV_IN_INDUSTRY = 5  # خصوصی داخل صنعت
+WORK_RELATION_PRIV_OUT_INDUSTRY = 6  # خصوصی خارج از صنعت
+
+WORK_RELATION_LOOKUP_VALUES = {
+    WORK_RELATION_GOV_IN_INDUSTRY: 'دولتی داخل صنعت',
+    WORK_RELATION_GOV_OUT_INDUSTRY: 'دولتی خارج از صنعت',
+    WORK_RELATION_PRIV_IN_INDUSTRY: 'خصوصی داخل صنعت',
+    WORK_RELATION_PRIV_OUT_INDUSTRY: 'خصوصی خارج از صنعت',
+}
+
+# WorkRecordExtra1: active flag on EmployeeWorkRecord.Extra1Code
+WORK_RECORD_EXTRA1_ACTIVE = 1      # فعال
+WORK_RECORD_EXTRA1_INACTIVE = 2    # غیرفعال
+WORK_RECORD_EXTRA1_LOOKUP_VALUES = {
+    WORK_RECORD_EXTRA1_ACTIVE: 'فعال',
+    WORK_RECORD_EXTRA1_INACTIVE: 'غیرفعال',
+}
+
+# WorkRecordExtra2: supervision/heading right from HRS_EshHeadingStatus
+WORK_RECORD_EXTRA2_LOOKUP_VALUES = {
+    0: 'بدون حق سرپرستی',
+    1: 'دارای حق سرپرستی',
+    2: 'دارای حق سرپرستی (نوع ۲)',
+}
+
+# HRS_EshType → (WorkTypeCode, WorkRelationTypeCode)
+# 1 دولتی(داخل شرکت) → داخلی + مرتبط
+# 2/3/4/5 → خارجی + industry sector relation
+ESH_TYPE_WORK_CODES = {
+    1: (1, WORK_RELATION_RELATED),                 # دولتی داخل شرکت
+    2: (2, WORK_RELATION_GOV_IN_INDUSTRY),          # دولتی داخل صنعت
+    3: (2, WORK_RELATION_GOV_OUT_INDUSTRY),         # دولتی خارج صنعت
+    4: (2, WORK_RELATION_PRIV_OUT_INDUSTRY),        # خصوصی خارج صنعت
+    5: (2, WORK_RELATION_PRIV_IN_INDUSTRY),         # خصوصی داخل صنعت
+}
 
 
 def _parse_shamsi_date(raw, *, treat_open_end_as_null=False):
@@ -89,22 +129,37 @@ def _ensure_table_id(cursor, table_name, default_last_id=0):
     return int(row[0])
 
 
-def _work_type_code(esh_type):
+def _work_type_and_relation(esh_type):
+    """
+    Map source HRS_EshType to (WorkTypeCode, WorkRelationTypeCode).
+
+    دولتی(داخل شرکت)=1 → داخلی + مرتبط
+    other sector types → خارجی + matching industry WorkRelationType
+    """
     try:
         t = int(esh_type)
     except (TypeError, ValueError):
-        return 1
-    if t in (3, 4):
-        return 2  # خارجی
-    return 1  # داخلی (1,2,5 and unknown)
+        t = 1
+    return ESH_TYPE_WORK_CODES.get(t, (2, WORK_RELATION_PRIV_OUT_INDUSTRY))
 
 
-def _work_relation_code(job_relation_id):
+def _extra1_active_code(esh_active):
+    """Map HRS_EshActive → WorkRecordExtra1 (1=فعال, 2=غیرفعال)."""
     try:
-        rid = int(job_relation_id)
+        return WORK_RECORD_EXTRA1_ACTIVE if int(esh_active) == 1 else WORK_RECORD_EXTRA1_INACTIVE
     except (TypeError, ValueError):
-        return 2
-    return 1 if rid == 300001 else 2
+        return WORK_RECORD_EXTRA1_INACTIVE
+
+
+def _extra2_heading_code(heading_status):
+    """Map HRS_EshHeadingStatus → WorkRecordExtra2 (0/1/2)."""
+    try:
+        code = int(heading_status)
+    except (TypeError, ValueError):
+        return 0
+    if code in WORK_RECORD_EXTRA2_LOOKUP_VALUES:
+        return code
+    return 0
 
 
 def _as_int_or_none(val):
@@ -352,6 +407,8 @@ def run():
                 esh.HRS_EshScore AS Score,
                 esh.HRS_EshNote AS Note,
                 esh.HRS_EshType AS EshType,
+                esh.HRS_EshActive AS EshActive,
+                esh.HRS_EshHeadingStatus AS HeadingStatus,
                 esh.HRS_JobRelationID_fk AS JobRelationID,
                 esh.HRS_CompanyID_fk AS CompanyID,
                 esh.TBL_DegreeID_fk AS SourceDegreeID,
@@ -362,13 +419,12 @@ def run():
             FROM dbo.HRS_EmploymentServiceHistory esh
             LEFT JOIN dbo.TBL_Job j ON j.TBL_JobID = esh.TBL_JobID_fk
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = esh.TBL_DegreeID_fk
-            WHERE esh.HRS_EshActive = 1
-              AND esh.TBL_PersonnelID_fk IS NOT NULL
+            WHERE esh.TBL_PersonnelID_fk IS NOT NULL
               AND esh.TBL_PersonnelID_fk > 0
         """, source_cnxn)
 
         if source_df.empty:
-            print("No active employment service history rows found.")
+            print("No employment service history rows found.")
             dest_cnxn.commit()
             return
 
@@ -418,6 +474,30 @@ def run():
             work_df[['SourceDegreeID', 'DegreeName']],
         )
 
+        print("Ensuring WorkRelationType lookup values...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'WorkRelationType',
+            WORK_RELATION_LOOKUP_VALUES,
+        )
+
+        print("Ensuring WorkRecordExtra1 lookup values...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'WorkRecordExtra1',
+            WORK_RECORD_EXTRA1_LOOKUP_VALUES,
+        )
+
+        print("Ensuring WorkRecordExtra2 lookup values...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'WorkRecordExtra2',
+            WORK_RECORD_EXTRA2_LOOKUP_VALUES,
+        )
+
         print("Preparing ID generator...")
         work_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeWorkRecord', 0)
 
@@ -426,16 +506,27 @@ def run():
                 EmployeeWorkRecordID, EmployeeRef, WorkTypeCode, OrgName, Role,
                 WorkRelationTypeCode, EducationDegreeCode, StartDate, EndDate,
                 EffectiveDate, Duration, InsuranceDuration, Score, Description,
-                PostRef, DepartmentRef,
+                PostRef, DepartmentRef, Extra1Code, Extra2Code,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
         insert_mapping_sql = """
             INSERT INTO master.dbo.WorkRecordMigrationMapping (
                 SourceEmploymentServiceHistoryID, DestEmployeeWorkRecordID
             ) VALUES (?, ?)
         """
+        update_type_sql = """
+            UPDATE HCM3.EmployeeWorkRecord
+            SET WorkTypeCode = ?,
+                WorkRelationTypeCode = ?,
+                Extra1Code = ?,
+                Extra2Code = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeWorkRecordID = ?
+        """
         inserted = 0
+        types_corrected = 0
         skipped_already_mapped = 0
         open_ended_ends = 0
         defaulted_org = 0
@@ -446,7 +537,17 @@ def run():
         print(f"Inserting EmployeeWorkRecord records ({len(work_df)} candidates)...")
         for _, row in work_df.iterrows():
             source_id = int(row['SourceEmploymentServiceHistoryID'])
+            work_type_code, work_relation_code = _work_type_and_relation(row['EshType'])
+            extra1_code = _extra1_active_code(row['EshActive'])
+            extra2_code = _extra2_heading_code(row['HeadingStatus'])
+
             if source_id in already_mapped:
+                dest_wr_id = already_mapped[source_id]
+                dest_cursor.execute(
+                    update_type_sql,
+                    (work_type_code, work_relation_code, extra1_code, extra2_code, dest_wr_id),
+                )
+                types_corrected += 1
                 skipped_already_mapped += 1
                 continue
 
@@ -485,9 +586,6 @@ def run():
 
             description = clean_persian_text(row['Note'])
 
-            work_type_code = _work_type_code(row['EshType'])
-            work_relation_code = _work_relation_code(row['JobRelationID'])
-
             degree_code = DEFAULT_DEGREE_CODE
             try:
                 source_degree_id = int(row['SourceDegreeID'])
@@ -516,6 +614,8 @@ def run():
                 description,
                 post_ref,
                 department_ref,
+                extra1_code,
+                extra2_code,
             ))
             dest_cursor.execute(insert_mapping_sql, (source_id, work_last_id))
             already_mapped[source_id] = work_last_id
@@ -529,6 +629,7 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! Work records inserted: {inserted}. "
+            f"Types/Extra corrected: {types_corrected}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Open-ended ends: {open_ended_ends}. "

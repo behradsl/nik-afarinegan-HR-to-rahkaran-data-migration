@@ -2,6 +2,7 @@
     "source_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_SOURCE_IP;Database=personnelGharb;UID=sa;PWD=YourPassword;",
     "dest_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_DEST_IP;Database=MadaniSG;UID=sa;PWD=YourPassword;",
     "steps_to_run": {
+        "0_cleanup": false,
         "1_party": true,
         "2_employee": true,
         "3_education": true,
