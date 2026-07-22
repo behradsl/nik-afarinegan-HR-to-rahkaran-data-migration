@@ -3,6 +3,7 @@ import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
+from utils.lookup_helpers import ensure_lookup_codes
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -12,6 +13,8 @@ MASS_REGISTER_DATE = '1391/11/30'
 DEFAULT_BIRTH = '1900-01-01'
 DEFAULT_NATIONAL_ID = '0'
 DEFAULT_FIRST_NAME = '-'
+DEFAULT_ORG_CODE = 'MIG-INS-DEFAULT'
+DEFAULT_ORG_TITLE = 'سازمان بیمه پیش‌فرض مهاجرت'
 
 RELATION_MAP = {
     30003: 7,  # پسر
@@ -19,6 +22,31 @@ RELATION_MAP = {
     30005: 1,  # پدر
     30006: 2,  # مادر
 }
+
+# HRS_SponserStatusID_fk (PayBase parent 15) → dest relative status codes
+# EducationState: 1=محصل, 2=دانشجو
+SPONSOR_EDUCATION_STATE = {
+    150011: 1,  # محصل
+    150005: 2,  # دانشجو
+}
+# PhysicalState: 1=سالم, 2=معلول
+SPONSOR_PHYSICAL_STATE = {
+    150016: 2,  # معلول/ازکارافتاده کلی
+}
+# MaritalStatus: 1=مجرد, 2=متأهل, 3=معیل
+SPONSOR_MARITAL_STATUS = {
+    150013: 1,  # مجرد
+    150006: 1,  # دختر ازدواج نکرده
+    150007: 1,  # دختر مطلقه
+    150017: 1,  # طلاق
+    150008: 2,  # متاهل
+}
+
+# Insurance statuses that mean "no coverage" — skip insurance row
+INSURANCE_STATUS_SKIP = {0, 710008}  # پایه / ندارد
+
+EDUCATION_STATE_LOOKUP = {1: 'محصل', 2: 'دانشجو'}
+PHYSICAL_STATE_LOOKUP = {1: 'سالم', 2: 'معلول'}
 
 
 def _parse_shamsi_date(raw, *, reject_mass_register=False):
@@ -28,7 +56,6 @@ def _parse_shamsi_date(raw, *, reject_mass_register=False):
     text = str(raw).strip()
     if not text:
         return None
-    # RegisterDate may include time: "1391/11/30 8:40:29"
     date_part = text.split()[0]
     if date_part in ('', '0', '____/__/__', '/  /', '//', '0/0/0'):
         return None
@@ -76,6 +103,24 @@ def _relation_code(source_related_id, gender):
     return RELATION_MAP[source_related_id]
 
 
+def _as_int(val, default=None):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return default
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return default
+
+
+def _status_codes_from_sponsor(sponsor_status_id):
+    """Return (education_state, physical_state, marital_status) from SponserStatus."""
+    sid = _as_int(sponsor_status_id)
+    education = SPONSOR_EDUCATION_STATE.get(sid)
+    physical = SPONSOR_PHYSICAL_STATE.get(sid)
+    marital = SPONSOR_MARITAL_STATUS.get(sid)
+    return education, physical, marital
+
+
 def setup_relative_mapping_table(cursor):
     cursor.execute("""
         IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'RelativeMigrationMapping')
@@ -83,6 +128,20 @@ def setup_relative_mapping_table(cursor):
             CREATE TABLE master.dbo.RelativeMigrationMapping (
                 SourceSponsorID INT PRIMARY KEY,
                 DestEmployeeRelativeID BIGINT NOT NULL,
+                MigrationDate DATETIME DEFAULT GETDATE()
+            )
+        END
+    """)
+    cursor.commit()
+
+
+def setup_relative_insurance_mapping_table(cursor):
+    cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'RelativeInsuranceMigrationMapping')
+        BEGIN
+            CREATE TABLE master.dbo.RelativeInsuranceMigrationMapping (
+                SourceSponsorID INT PRIMARY KEY,
+                DestEmployeeRelativeInsuranceID BIGINT NOT NULL,
                 MigrationDate DATETIME DEFAULT GETDATE()
             )
         END
@@ -114,6 +173,70 @@ def _required_text(val, default):
     return text, False
 
 
+def ensure_default_insurance_organization(dest_cnxn, dest_cursor):
+    """
+    EmployeeRelativeInsurance.OrganizationRef is NOT NULL.
+    Use existing org or insert a migration default (OrganizationType=1 تامین اجتماعی).
+    """
+    existing = pd.read_sql(
+        "SELECT TOP 1 OrganizationID FROM HCM3.Organization ORDER BY OrganizationID",
+        dest_cnxn,
+    )
+    if not existing.empty:
+        return int(existing.iloc[0]['OrganizationID'])
+
+    print("  -> Creating default insurance Organization...")
+    last_id = _ensure_table_id(dest_cursor, 'HCM3.Organization', 0)
+    last_id += 1
+    dest_cursor.execute("""
+        INSERT INTO HCM3.Organization (
+            OrganizationID, Code, Title, TypeCode,
+            MandatoryEmployeeRelatedCode, Nature,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        ) VALUES (?, ?, ?, 1, 0, 1, GETDATE(), 1, GETDATE(), 1)
+    """, (last_id, DEFAULT_ORG_CODE, DEFAULT_ORG_TITLE))
+    dest_cursor.execute(
+        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Organization'",
+        (last_id,),
+    )
+    return last_id
+
+
+def _should_insert_insurance(row):
+    """Insert insurance when there is a create date or a meaningful insurance status."""
+    status_id = _as_int(row.get('InsuranceStatusID'), 0) or 0
+    if status_id in INSURANCE_STATUS_SKIP:
+        start = _parse_shamsi_date(row.get('InsuranceCreateDate'))
+        return start is not None
+    start = _parse_shamsi_date(row.get('InsuranceCreateDate'))
+    if start is not None:
+        return True
+    # Status says covered but no date — still insert with fallback start
+    return status_id not in INSURANCE_STATUS_SKIP and status_id > 0
+
+
+def _insurance_number(row):
+    book = row.get('BookNo')
+    if book is None or (isinstance(book, float) and pd.isna(book)):
+        return None
+    try:
+        num = int(float(book))
+    except (TypeError, ValueError):
+        text = str(book).strip()
+        return text[:50] if text and text not in ('0', 'None') else None
+    if num <= 0:
+        return None
+    return str(num)[:50]
+
+
+def _is_surety(sponsor_ship_status):
+    """Map HRS_SponserShipStatus (تحت تکفل flag) → IsSurety."""
+    try:
+        return 1 if int(sponsor_ship_status) == 1 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def run():
     print("\n--- Running Step 5: Employee Relatives Migration ---")
 
@@ -122,6 +245,14 @@ def run():
 
     try:
         setup_relative_mapping_table(dest_cursor)
+        setup_relative_insurance_mapping_table(dest_cursor)
+
+        print("Ensuring EducationState / PhysicalState lookups...")
+        ensure_lookup_codes(dest_cnxn, dest_cursor, 'EducationState', EDUCATION_STATE_LOOKUP)
+        ensure_lookup_codes(dest_cnxn, dest_cursor, 'PhysicalState', PHYSICAL_STATE_LOOKUP)
+
+        print("Ensuring default insurance Organization...")
+        organization_ref = ensure_default_insurance_organization(dest_cnxn, dest_cursor)
 
         print("Fetching Source Sponsorship / Relatives...")
         source_df = pd.read_sql("""
@@ -129,12 +260,16 @@ def run():
                 ss.HRS_SSID AS SourceSponsorID,
                 ss.TBL_PersonnelID_fk AS SourceID,
                 ss.HRS_SponserRelatedID_fk AS SourceRelatedID,
+                ss.HRS_SponserStatusID_fk AS SponsorStatusID,
+                ss.HRS_SponserShipStatus AS SponsorShipStatus,
+                ss.HRS_InsuranceStatusID_fk AS InsuranceStatusID,
                 ss.HRS_SsFirstName AS FirstName,
                 ss.HRS_SsLastName AS LastName,
                 ss.HRS_SsFatherName AS FatherName,
                 ss.HRS_SsNationalCode AS NationalID,
                 ss.HRS_SsBirthDate AS BirthDate,
                 ss.HRS_SsIdentifyNo AS IDNumber,
+                ss.HRS_SsBookNo AS BookNo,
                 ss.HRS_SsWelfareCreateDate AS WelfareCreateDate,
                 ss.HRS_InsuranceCreateDate AS InsuranceCreateDate,
                 ss.HRS_SsRegisterDate AS RegisterDate,
@@ -182,11 +317,27 @@ def run():
             print(f"No matching employees found. Skipped (no employee): {skipped_no_employee}.")
             return
 
-        mapped_df = pd.read_sql(
-            "SELECT SourceSponsorID FROM master.dbo.RelativeMigrationMapping",
-            dest_cnxn,
-        )
-        already_mapped = set(mapped_df['SourceSponsorID'].tolist()) if not mapped_df.empty else set()
+        mapped_df = pd.read_sql("""
+            SELECT SourceSponsorID, DestEmployeeRelativeID
+            FROM master.dbo.RelativeMigrationMapping
+        """, dest_cnxn)
+        already_mapped = {}
+        if not mapped_df.empty:
+            already_mapped = {
+                int(row['SourceSponsorID']): int(row['DestEmployeeRelativeID'])
+                for _, row in mapped_df.iterrows()
+            }
+
+        insured_mapped_df = pd.read_sql("""
+            SELECT SourceSponsorID, DestEmployeeRelativeInsuranceID
+            FROM master.dbo.RelativeInsuranceMigrationMapping
+        """, dest_cnxn)
+        already_insured = {}
+        if not insured_mapped_df.empty:
+            already_insured = {
+                int(row['SourceSponsorID']): int(row['DestEmployeeRelativeInsuranceID'])
+                for _, row in insured_mapped_df.iterrows()
+            }
 
         existing_marriage_df = pd.read_sql("""
             SELECT EmployeeRef, StatusCode, EffectiveDate
@@ -203,14 +354,25 @@ def run():
         print("Preparing ID generators...")
         relative_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeRelative', 0)
         marriage_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeMarriage', 0)
+        insurance_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeRelativeInsurance', 0)
 
         insert_relative_sql = """
             INSERT INTO HCM3.EmployeeRelative (
                 EmployeeRelativeID, EmployeeRef, FirstName, LastName, FatherName,
                 RelationCode, AllegianceCode, NationalID, IDNumber, BirthDate,
+                DegreeCode, EducationStateCode, PhysicalStateCode, MaritalStatusCode,
                 IsFourthChild, IncludeInSonshipPay, EffectiveDate, RelativeType,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, 0, ?, 1, GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?, 0, 0, ?, 1, GETDATE(), 1, GETDATE(), 1)
+        """
+        update_relative_status_sql = """
+            UPDATE HCM3.EmployeeRelative
+            SET EducationStateCode = ?,
+                PhysicalStateCode = ?,
+                MaritalStatusCode = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeRelativeID = ?
         """
         insert_mapping_sql = """
             INSERT INTO master.dbo.RelativeMigrationMapping (SourceSponsorID, DestEmployeeRelativeID)
@@ -222,6 +384,25 @@ def run():
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
+        insert_insurance_sql = """
+            INSERT INTO HCM3.EmployeeRelativeInsurance (
+                EmployeeRelativeInsuranceID, EmployeeRelativeRef, OrganizationRef,
+                StartDate, EndDate, InsuranceNumber, IsSurety,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        """
+        insert_insurance_mapping_sql = """
+            INSERT INTO master.dbo.RelativeInsuranceMigrationMapping (
+                SourceSponsorID, DestEmployeeRelativeInsuranceID
+            ) VALUES (?, ?)
+        """
+        update_insurance_surety_sql = """
+            UPDATE HCM3.EmployeeRelativeInsurance
+            SET IsSurety = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeRelativeInsuranceID = ?
+        """
         update_party_sql = """
             UPDATE GNR3.Party
             SET MaritalStatus = ?,
@@ -231,22 +412,75 @@ def run():
         """
 
         relatives_inserted = 0
+        relatives_status_updated = 0
+        insurance_inserted = 0
+        insurance_surety_updated = 0
         marriages_inserted = 0
         defaulted_fields = 0
         skipped_already_mapped = 0
         skipped_marriage_no_date = 0
+        skipped_insurance = 0
 
         employees_touched = {
             (int(r['EmployeeID']), int(r['PartyRef']))
             for _, r in work_df.iterrows()
         }
-        newly_spouse_employees = set()  # got a new spouse relative this run
-        spouse_events_by_employee = {}  # EmployeeID -> list of (start, end)
+        newly_spouse_employees = set()
+        spouse_events_by_employee = {}
 
-        print("Inserting EmployeeRelative records...")
+        def maybe_insert_insurance(source_sponsor_id, dest_relative_id, row):
+            nonlocal insurance_last_id, insurance_inserted, insurance_surety_updated, skipped_insurance
+            is_surety = _is_surety(row.get('SponsorShipStatus'))
+
+            if source_sponsor_id in already_insured:
+                dest_cursor.execute(
+                    update_insurance_surety_sql,
+                    (is_surety, already_insured[source_sponsor_id]),
+                )
+                insurance_surety_updated += 1
+                return
+            if not _should_insert_insurance(row):
+                skipped_insurance += 1
+                return
+
+            start = _parse_shamsi_date(row.get('InsuranceCreateDate'))
+            if start is None:
+                start = _parse_shamsi_date(row.get('RegisterDate'), reject_mass_register=True)
+            if start is None:
+                start = _parse_shamsi_date(row.get('BirthDate')) or DEFAULT_BIRTH
+
+            end = _parse_shamsi_date(row.get('InsuranceDeleteDate'))
+            number = _insurance_number(row)
+
+            insurance_last_id += 1
+            dest_cursor.execute(insert_insurance_sql, (
+                insurance_last_id,
+                dest_relative_id,
+                organization_ref,
+                start,
+                end,
+                number,
+                is_surety,
+            ))
+            dest_cursor.execute(insert_insurance_mapping_sql, (source_sponsor_id, insurance_last_id))
+            already_insured[source_sponsor_id] = insurance_last_id
+            insurance_inserted += 1
+
+        print("Inserting/updating EmployeeRelative records...")
         for _, row in work_df.iterrows():
             source_sponsor_id = int(row['SourceSponsorID'])
+            education_code, physical_code, marital_code = _status_codes_from_sponsor(
+                row['SponsorStatusID']
+            )
+
             if source_sponsor_id in already_mapped:
+                dest_rel_id = already_mapped[source_sponsor_id]
+                dest_cursor.execute(
+                    update_relative_status_sql,
+                    (education_code, physical_code, marital_code, dest_rel_id),
+                )
+                relatives_status_updated += 1
+                maybe_insert_insurance(source_sponsor_id, dest_rel_id, row)
                 skipped_already_mapped += 1
                 continue
 
@@ -254,7 +488,6 @@ def run():
 
             first_name, d1 = _required_text(row['FirstName'], DEFAULT_FIRST_NAME)
             national_id, d2 = _required_text(row['NationalID'], DEFAULT_NATIONAL_ID)
-            # NationalID column is varchar(20)
             national_id = str(national_id)[:20]
             if d1 or d2:
                 defaulted_fields += 1
@@ -285,11 +518,16 @@ def run():
                 national_id,
                 id_number,
                 birth_date,
+                education_code,
+                physical_code,
+                marital_code,
                 effective_date,
             ))
             dest_cursor.execute(insert_mapping_sql, (source_sponsor_id, relative_last_id))
+            already_mapped[source_sponsor_id] = relative_last_id
             relatives_inserted += 1
-            already_mapped.add(source_sponsor_id)
+
+            maybe_insert_insurance(source_sponsor_id, relative_last_id, row)
 
             if int(row['SourceRelatedID']) == SPOUSE_RELATION:
                 newly_spouse_employees.add(employee_id)
@@ -354,17 +592,26 @@ def run():
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeMarriage'",
             (marriage_last_id,),
         )
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeRelativeInsurance'",
+            (insurance_last_id,),
+        )
 
         dest_cnxn.commit()
         print(
             f"Success! Relatives inserted: {relatives_inserted}. "
+            f"Status updated: {relatives_status_updated}. "
+            f"Insurance inserted: {insurance_inserted}. "
+            f"IsSurety updated: {insurance_surety_updated}. "
             f"Marriages inserted: {marriages_inserted}. "
             f"Party marital updates: {party_updates}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
+            f"Skipped insurance: {skipped_insurance}. "
             f"Defaulted required fields: {defaulted_fields}. "
             f"Skipped marriage (no date): {skipped_marriage_no_date}. "
-            f"Multi-spouse people: {multi_spouse_people}."
+            f"Multi-spouse people: {multi_spouse_people}. "
+            f"OrganizationRef used: {organization_ref}."
         )
 
     except Exception as e:
