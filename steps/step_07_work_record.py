@@ -437,17 +437,7 @@ def run():
                 SourceEmploymentServiceHistoryID, DestEmployeeWorkRecordID
             ) VALUES (?, ?)
         """
-        update_fk_sql = """
-            UPDATE HCM3.EmployeeWorkRecord
-            SET PostRef = ?,
-                DepartmentRef = ?,
-                LastModificationDate = GETDATE(),
-                LastModifier = 1
-            WHERE EmployeeWorkRecordID = ?
-        """
-
         inserted = 0
-        backfilled = 0
         skipped_already_mapped = 0
         open_ended_ends = 0
         defaulted_org = 0
@@ -455,19 +445,14 @@ def run():
         defaulted_effective = 0
         today_str = date.today().strftime('%Y-%m-%d')
 
-        print(f"Inserting/updating EmployeeWorkRecord records ({len(work_df)} candidates)...")
+        print(f"Inserting EmployeeWorkRecord records ({len(work_df)} candidates)...")
         for _, row in work_df.iterrows():
             source_id = int(row['SourceEmploymentServiceHistoryID'])
-            post_ref, department_ref = _resolve_org_fks(row, dept_map, post_map)
-
             if source_id in already_mapped:
-                dest_wr_id = already_mapped[source_id]
-                if post_ref is not None or department_ref is not None:
-                    dest_cursor.execute(update_fk_sql, (post_ref, department_ref, dest_wr_id))
-                    backfilled += 1
                 skipped_already_mapped += 1
                 continue
 
+            post_ref, department_ref = _resolve_org_fks(row, dept_map, post_map)
             employee_id = int(row['EmployeeID'])
 
             org_name = clean_value(row['CompanyTitle'])
@@ -556,7 +541,6 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! Work records inserted: {inserted}. "
-            f"FK backfilled: {backfilled}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Open-ended ends: {open_ended_ends}. "

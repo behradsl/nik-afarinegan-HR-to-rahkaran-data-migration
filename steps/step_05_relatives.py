@@ -238,12 +238,11 @@ def run():
         skipped_already_mapped = 0
         skipped_marriage_no_date = 0
 
-        # Employees touched in this run (for marriage history / party update)
-        employees_with_spouse = set()
         employees_touched = {
             (int(r['EmployeeID']), int(r['PartyRef']))
             for _, r in work_df.iterrows()
         }
+        newly_spouse_employees = set()  # got a new spouse relative this run
         spouse_events_by_employee = {}  # EmployeeID -> list of (start, end)
 
         print("Inserting EmployeeRelative records...")
@@ -251,8 +250,6 @@ def run():
             source_sponsor_id = int(row['SourceSponsorID'])
             if source_sponsor_id in already_mapped:
                 skipped_already_mapped += 1
-                if int(row['SourceRelatedID']) == SPOUSE_RELATION:
-                    employees_with_spouse.add(int(row['EmployeeID']))
                 continue
 
             employee_id = int(row['EmployeeID'])
@@ -302,30 +299,13 @@ def run():
             already_mapped.add(source_sponsor_id)
 
             if int(row['SourceRelatedID']) == SPOUSE_RELATION:
-                employees_with_spouse.add(employee_id)
+                newly_spouse_employees.add(employee_id)
                 start = _resolve_marriage_start(row)
                 end = _resolve_marriage_end(row)
                 if start is None:
                     skipped_marriage_no_date += 1
                 else:
                     spouse_events_by_employee.setdefault(employee_id, []).append((start, end))
-
-        # Also collect spouse events for already-mapped spouse rows (marriage history may still be missing)
-        for _, row in work_df[work_df['SourceRelatedID'] == SPOUSE_RELATION].iterrows():
-            employee_id = row['EmployeeID']
-            if pd.isna(employee_id):
-                continue
-            employee_id = int(employee_id)
-            employees_with_spouse.add(employee_id)
-            party_ref = int(row['PartyRef'])
-            employees_touched.add((employee_id, party_ref))
-            start = _resolve_marriage_start(row)
-            end = _resolve_marriage_end(row)
-            if start is None:
-                continue
-            events = spouse_events_by_employee.setdefault(employee_id, [])
-            if (start, end) not in events:
-                events.append((start, end))
 
         def add_marriage(employee_id, status_code, effective_date):
             nonlocal marriage_last_id, marriages_inserted
@@ -339,8 +319,7 @@ def run():
             existing_marriage_keys.add(key)
             marriages_inserted += 1
 
-        print("Building EmployeeMarriage history...")
-        # Ensure single-at-birth for every touched employee
+        print("Building EmployeeMarriage history for newly inserted spouses...")
         party_birth_by_employee = {
             int(r['EmployeeID']): (
                 pd.to_datetime(r['PartyBirthDate']).strftime('%Y-%m-%d')
@@ -350,7 +329,12 @@ def run():
             if pd.notna(r['EmployeeID'])
         }
 
-        for employee_id, _party_ref in employees_touched:
+        party_ref_by_employee = {
+            int(emp_id): int(party_ref)
+            for emp_id, party_ref in employees_touched
+        }
+
+        for employee_id in newly_spouse_employees:
             birth = party_birth_by_employee.get(employee_id, DEFAULT_BIRTH)
             add_marriage(employee_id, 1, birth)
 
@@ -360,12 +344,14 @@ def run():
                 if end and end > start:
                     add_marriage(employee_id, 1, end)
 
-        print("Updating Party.MaritalStatus for employees with spouses...")
+        print("Updating Party.MaritalStatus for newly married employees...")
         party_updates = 0
-        for employee_id, party_ref in employees_touched:
-            if employee_id in employees_with_spouse:
-                dest_cursor.execute(update_party_sql, (2, party_ref))
-                party_updates += 1
+        for employee_id in newly_spouse_employees:
+            party_ref = party_ref_by_employee.get(employee_id)
+            if party_ref is None:
+                continue
+            dest_cursor.execute(update_party_sql, (2, party_ref))
+            party_updates += 1
 
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeRelative'",

@@ -8,6 +8,21 @@ from utils.lookup_helpers import ensure_degree_mappings
 warnings.filterwarnings('ignore', category=UserWarning)
 
 
+def setup_military_mapping_table(cursor):
+    cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'MilitaryMigrationMapping')
+        BEGIN
+            CREATE TABLE master.dbo.MilitaryMigrationMapping (
+                SourcePersonnelID BIGINT PRIMARY KEY,
+                DestEmployeeID BIGINT NOT NULL,
+                SourceMilitaryHistoryID BIGINT NULL,
+                MigrationDate DATETIME DEFAULT GETDATE()
+            )
+        END
+    """)
+    cursor.commit()
+
+
 def _sortable_end_date(shamsi_val):
     """Return a sort key for Shamsi end dates; invalid/empty sort last."""
     greg = shamsi_to_gregorian(clean_value(shamsi_val))
@@ -21,6 +36,8 @@ def run():
     dest_cursor = dest_cnxn.cursor()
 
     try:
+        setup_military_mapping_table(dest_cursor)
+
         print("Fetching Source Military History...")
         source_df = pd.read_sql("""
             SELECT
@@ -74,6 +91,15 @@ def run():
             )
             return
 
+        mapped_df = pd.read_sql(
+            "SELECT SourcePersonnelID FROM master.dbo.MilitaryMigrationMapping",
+            dest_cnxn,
+        )
+        already_mapped = (
+            set(int(x) for x in mapped_df['SourcePersonnelID'].tolist())
+            if not mapped_df.empty else set()
+        )
+
         print("Synchronizing degree mappings...")
         degree_id_map = ensure_degree_mappings(
             source_cnxn,
@@ -93,11 +119,22 @@ def run():
                 LastModifier = 1
             WHERE EmployeeID = ?
         """
+        insert_mapping_sql = """
+            INSERT INTO master.dbo.MilitaryMigrationMapping (
+                SourcePersonnelID, DestEmployeeID, SourceMilitaryHistoryID
+            ) VALUES (?, ?, ?)
+        """
 
         updated = 0
+        skipped_already_mapped = 0
         skipped_bad_dates = 0
 
         for _, row in work_df.iterrows():
+            source_id = int(row['SourceID'])
+            if source_id in already_mapped:
+                skipped_already_mapped += 1
+                continue
+
             start_date = shamsi_to_gregorian(clean_value(row['StartDate']))
             end_date = shamsi_to_gregorian(clean_value(row['EndDate']))
             duration = months_between(start_date, end_date)
@@ -114,19 +151,26 @@ def run():
             if source_degree_id > 0 and source_degree_id in degree_id_map:
                 degree_code = int(degree_id_map[source_degree_id])
 
+            employee_id = int(row['EmployeeID'])
             dest_cursor.execute(update_sql, (
                 start_date,
                 end_date,
                 duration,
                 degree_code,
-                int(row['EmployeeID']),
+                employee_id,
             ))
+            dest_cursor.execute(
+                insert_mapping_sql,
+                (source_id, employee_id, int(row['MilitaryHistoryID'])),
+            )
+            already_mapped.add(source_id)
             updated += 1
 
         dest_cnxn.commit()
         print(
             f"Success! Updated {updated} Employee military records. "
             f"Source people: {total_source_people}. "
+            f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (bad dates): {skipped_bad_dates}. "
             f"Multi-row people collapsed: {multi_row_people}."
