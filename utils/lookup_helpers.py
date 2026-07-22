@@ -1,5 +1,5 @@
 import pandas as pd
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 
 
 def setup_degree_mapping_table(cursor):
@@ -96,9 +96,7 @@ def ensure_degree_mappings(source_cnxn, dest_cnxn, dest_cursor, degree_rows):
     pairs_df['SourceDegreeID'] = pairs_df['SourceDegreeID'].astype(int)
     pairs_df = pairs_df[pairs_df['SourceDegreeID'] > 0]
 
-    pairs_df['DegreeName'] = pairs_df['DegreeName'].apply(
-        lambda x: normalize_persian(clean_value(x))
-    )
+    pairs_df['DegreeName'] = pairs_df['DegreeName'].apply(clean_persian_text)
     pairs_df = pairs_df.dropna(subset=['DegreeName'])
     pairs_df = pairs_df.drop_duplicates(subset=['SourceDegreeID'], keep='first')
 

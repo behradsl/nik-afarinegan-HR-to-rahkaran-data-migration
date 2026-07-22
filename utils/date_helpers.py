@@ -41,3 +41,15 @@ def months_between(start_date_str, end_date_str):
     if end.day < start.day:
         months -= 1
     return max(months, 0)
+
+
+def days_between(start_date_str, end_date_str):
+    """Whole days between two Gregorian YYYY-MM-DD strings. Returns None if either is invalid."""
+    if not start_date_str or not end_date_str:
+        return None
+    try:
+        start = datetime.strptime(str(start_date_str), '%Y-%m-%d').date()
+        end = datetime.strptime(str(end_date_str), '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    return max((end - start).days, 0)

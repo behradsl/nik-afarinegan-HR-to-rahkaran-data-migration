@@ -1,7 +1,7 @@
 import pandas as pd
 import warnings
 from db_core import get_connections
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -107,11 +107,9 @@ def _ensure_table_id(cursor, table_name, default_last_id=0):
 
 
 def _required_text(val, default):
-    cleaned = clean_value(val)
-    if cleaned is None:
-        return default, True
-    text = normalize_persian(str(cleaned).strip()) if isinstance(cleaned, str) else str(cleaned).strip()
-    if not text:
+    """Return cleaned Persian text or default; second value True if defaulted."""
+    text = clean_persian_text(val)
+    if text is None:
         return default, True
     return text, False
 
@@ -261,13 +259,8 @@ def run():
             if d1 or d2:
                 defaulted_fields += 1
 
-            last_name = clean_value(row['LastName'])
-            if last_name is not None:
-                last_name = normalize_persian(str(last_name).strip()) or None
-
-            father_name = clean_value(row['FatherName'])
-            if father_name is not None:
-                father_name = normalize_persian(str(father_name).strip()) or None
+            last_name = clean_persian_text(row['LastName'])
+            father_name = clean_persian_text(row['FatherName'])
 
             id_number = clean_value(row['IDNumber'])
             if id_number is not None:

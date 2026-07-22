@@ -2,7 +2,7 @@ import pandas as pd
 import warnings
 from datetime import date
 from db_core import get_connections
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings
 
@@ -133,9 +133,7 @@ def _positive_score(val):
 
 
 def _title_and_code(title_raw, code_raw, source_id, title_max=200, code_max=100):
-    title = clean_value(title_raw)
-    if title is not None:
-        title = normalize_persian(str(title).strip()) or None
+    title = clean_persian_text(title_raw)
     if not title:
         title = DEFAULT_TITLE
     title = title[:title_max]
@@ -455,23 +453,15 @@ def run():
             post_ref, department_ref = _resolve_org_fks(row, dept_map, post_map)
             employee_id = int(row['EmployeeID'])
 
-            org_name = clean_value(row['CompanyTitle'])
+            org_name = clean_persian_text(row['CompanyTitle'])
             if org_name is None:
                 org_name = DEFAULT_ORG_NAME
                 defaulted_org += 1
-            else:
-                org_name = normalize_persian(str(org_name).strip()) or DEFAULT_ORG_NAME
-                if org_name == DEFAULT_ORG_NAME:
-                    defaulted_org += 1
             org_name = org_name[:400]
 
-            role = clean_value(row['JobName'])
-            if role is not None:
-                role = normalize_persian(str(role).strip()) or None
+            role = clean_persian_text(row['JobName'])
             if role is None:
-                post_name = clean_value(row['PostName'])
-                if post_name is not None:
-                    role = normalize_persian(str(post_name).strip()) or None
+                role = clean_persian_text(row['PostName'])
             if role is not None:
                 role = role[:200]
 
@@ -493,9 +483,7 @@ def run():
             insurance_duration = _as_int_or_none(row['InsuranceDuration'])
             score = _positive_score(row['Score'])
 
-            description = clean_value(row['Note'])
-            if description is not None:
-                description = normalize_persian(str(description).strip()) or None
+            description = clean_persian_text(row['Note'])
 
             work_type_code = _work_type_code(row['EshType'])
             work_relation_code = _work_relation_code(row['JobRelationID'])

@@ -2,7 +2,7 @@ import pandas as pd
 import warnings
 from datetime import date
 from db_core import get_connections
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian, months_between
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -94,8 +94,8 @@ def _build_paybase_parent_map(source_cnxn):
         pb_id = int(row['HRS_PayBaseID'])
         parent = row['HRS_PayBaseParentID_fk']
         parent_map[pb_id] = int(parent) if parent is not None and not pd.isna(parent) else None
-        name = clean_value(row['HRS_PayBaseName'])
-        name_map[pb_id] = normalize_persian(str(name).strip()) if name else None
+        name = clean_persian_text(row['HRS_PayBaseName'])
+        name_map[pb_id] = name
     return parent_map, name_map
 
 
@@ -148,11 +148,9 @@ def _build_description(title, note):
     parts = []
     if title:
         parts.append(title)
-    note_clean = clean_value(note)
-    if note_clean is not None:
-        note_norm = normalize_persian(str(note_clean).strip()) or None
-        if note_norm and note_norm not in parts:
-            parts.append(note_norm)
+    note_norm = clean_persian_text(note)
+    if note_norm and note_norm not in parts:
+        parts.append(note_norm)
     if not parts:
         return None
     return ' | '.join(parts)
@@ -259,9 +257,7 @@ def run():
             employee_id = int(row['EmployeeID'])
             pb_id = _as_int_or_none(row['PayBaseID'])
 
-            title = clean_value(row['SacrificeTitle'])
-            if title is not None:
-                title = normalize_persian(str(title).strip()) or None
+            title = clean_persian_text(row['SacrificeTitle'])
             if not title and pb_id and pb_id in name_map:
                 title = name_map[pb_id]
 

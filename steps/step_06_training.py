@@ -2,7 +2,7 @@ import pandas as pd
 import warnings
 from datetime import date
 from db_core import get_connections
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -158,11 +158,7 @@ def run():
 
             employee_id = int(row['EmployeeID'])
 
-            course_title = clean_value(row['CourseName'])
-            if course_title is None:
-                course_title = DEFAULT_COURSE_TITLE
-            else:
-                course_title = normalize_persian(str(course_title).strip()) or DEFAULT_COURSE_TITLE
+            course_title = clean_persian_text(row['CourseName']) or DEFAULT_COURSE_TITLE
             course_title = course_title[:400]
 
             start_date = _parse_shamsi_date(row['StartDate'])

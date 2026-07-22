@@ -1,7 +1,7 @@
 import pandas as pd
 import warnings
 from db_core import get_connections
-from utils.data_helpers import clean_value, normalize_persian
+from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings, sync_lookup
 
@@ -76,15 +76,15 @@ def run():
         )
 
         print("Cleaning and Normalizing Text...")
-        merged_df['DegreeName'] = merged_df['DegreeName'].apply(lambda x: normalize_persian(clean_value(x)))
+        merged_df['DegreeName'] = merged_df['DegreeName'].apply(clean_persian_text)
         merged_df = merged_df.dropna(subset=['DegreeName'])
 
         merged_df['DisciplineName'] = merged_df['DisciplineName'].apply(
-            lambda x: 'نامشخص' if pd.isna(clean_value(x)) else normalize_persian(clean_value(x))
+            lambda x: clean_persian_text(x) or 'نامشخص'
         )
 
         merged_df['CenterName'] = merged_df['CenterName'].apply(
-            lambda x: 'نامشخص' if pd.isna(clean_value(x)) else normalize_persian(clean_value(x))
+            lambda x: clean_persian_text(x) or 'نامشخص'
         )
 
         print("Synchronizing Education Lookups (Degrees, Disciplines, and Centers)...")

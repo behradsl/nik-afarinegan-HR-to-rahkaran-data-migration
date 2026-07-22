@@ -2,7 +2,7 @@ import pandas as pd
 import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_value
-from utils.date_helpers import months_between, shamsi_to_gregorian
+from utils.date_helpers import days_between, shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -119,6 +119,13 @@ def run():
                 LastModifier = 1
             WHERE EmployeeID = ?
         """
+        update_duration_sql = """
+            UPDATE HCM3.Employee
+            SET MilitaryDuration = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeID = ?
+        """
         insert_mapping_sql = """
             INSERT INTO master.dbo.MilitaryMigrationMapping (
                 SourcePersonnelID, DestEmployeeID, SourceMilitaryHistoryID
@@ -126,21 +133,29 @@ def run():
         """
 
         updated = 0
+        duration_corrected = 0
         skipped_already_mapped = 0
         skipped_bad_dates = 0
 
         for _, row in work_df.iterrows():
             source_id = int(row['SourceID'])
-            if source_id in already_mapped:
-                skipped_already_mapped += 1
-                continue
-
             start_date = shamsi_to_gregorian(clean_value(row['StartDate']))
             end_date = shamsi_to_gregorian(clean_value(row['EndDate']))
-            duration = months_between(start_date, end_date)
+            # Dest MilitaryDuration is day count between start and end
+            duration = days_between(start_date, end_date)
 
             if start_date is None and end_date is None:
                 skipped_bad_dates += 1
+                continue
+
+            employee_id = int(row['EmployeeID'])
+
+            if source_id in already_mapped:
+                # Refresh duration in days for previously migrated rows
+                if duration is not None:
+                    dest_cursor.execute(update_duration_sql, (duration, employee_id))
+                    duration_corrected += 1
+                skipped_already_mapped += 1
                 continue
 
             degree_code = None
@@ -151,7 +166,6 @@ def run():
             if source_degree_id > 0 and source_degree_id in degree_id_map:
                 degree_code = int(degree_id_map[source_degree_id])
 
-            employee_id = int(row['EmployeeID'])
             dest_cursor.execute(update_sql, (
                 start_date,
                 end_date,
@@ -169,6 +183,7 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! Updated {updated} Employee military records. "
+            f"Duration corrected (days): {duration_corrected}. "
             f"Source people: {total_source_people}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Skipped (no employee): {skipped_no_employee}. "

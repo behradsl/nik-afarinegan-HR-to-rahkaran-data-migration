@@ -2,7 +2,7 @@ import pandas as pd
 import warnings
 from db_core import get_connections
 from utils.date_helpers import shamsi_to_gregorian
-from utils.data_helpers import clean_value
+from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -78,10 +78,15 @@ def run():
             mobile_to_party.setdefault(str(mobile).strip(), party_id)
         full_name = prow['FullName']
         if pd.notna(full_name) and str(full_name).strip():
-            fullname_to_party.setdefault(str(full_name).strip(), party_id)
+            # Normalize for comparison with cleaned source names
+            fullname_to_party.setdefault(normalize_persian(str(full_name).strip()), party_id)
 
     cities_df = pd.read_sql("SELECT Name, RegionalDivisionID FROM GNR3.RegionalDivision", dest_cnxn)
-    city_map = dict(zip(cities_df['Name'], cities_df['RegionalDivisionID']))
+    city_map = {
+        normalize_persian(str(name).strip()): rid
+        for name, rid in zip(cities_df['Name'], cities_df['RegionalDivisionID'])
+        if pd.notna(name) and str(name).strip()
+    }
 
     to_insert = []
     to_link = []  # (SourceID, DestPartyID)
@@ -90,6 +95,9 @@ def run():
         source_id = int(row['SourceID'])
         if source_id in mapped_ids:
             continue
+
+        first_name = clean_persian_text(row['FirstName'])
+        last_name = clean_persian_text(row['LastName'])
 
         existing_party_id = None
         national_no = clean_value(row['NationalNo'])
@@ -100,8 +108,8 @@ def run():
             if mobile and str(mobile).strip() in mobile_to_party:
                 existing_party_id = mobile_to_party[str(mobile).strip()]
             else:
-                full_name = f"{str(row['FirstName']).strip()}{str(row['LastName']).strip()}"
-                if full_name in fullname_to_party:
+                full_name = f"{first_name or ''}{last_name or ''}"
+                if full_name and full_name in fullname_to_party:
                     existing_party_id = fullname_to_party[full_name]
 
         if existing_party_id is not None:
@@ -117,15 +125,18 @@ def run():
                   else (3 if row['MaritalStatusID'] == 20003 else None))
         )
 
+        birth_place = clean_persian_text(row['BirthPlace'])
+        export_place = clean_persian_text(row['ExportPlace'])
+
         to_insert.append({
             'SourceID': source_id,
-            'FirstName': clean_value(row['FirstName']),
-            'LastName': clean_value(row['LastName']),
+            'FirstName': first_name,
+            'LastName': last_name,
             'NationalID': national_no,
-            'FatherName': clean_value(row['FatherName']),
+            'FatherName': clean_persian_text(row['FatherName']),
             'BirthDate': gregorian_birthdate,
-            'BirthPlaceRef': city_map.get(row['BirthPlace'], None),
-            'IssuancePlaceRef': city_map.get(row['ExportPlace'], None),
+            'BirthPlaceRef': city_map.get(birth_place) if birth_place else None,
+            'IssuancePlaceRef': city_map.get(export_place) if export_place else None,
             'Mobile': clean_value(row['Mobile']),
             'Tel': clean_value(row['Tel']),
             'IDSerial': clean_value(row['IDSerial']),
