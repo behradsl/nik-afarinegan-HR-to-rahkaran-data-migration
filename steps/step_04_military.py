@@ -89,6 +89,7 @@ def run():
                 MilitaryDuration = ?,
                 MilitaryEducationDegreeCode = ?,
                 LastModificationDate = GETDATE(),
+                MilitaryServiceStatusCode = 1,
                 LastModifier = 1
             WHERE EmployeeID = ?
         """

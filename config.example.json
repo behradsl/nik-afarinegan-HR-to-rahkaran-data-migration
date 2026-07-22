@@ -5,6 +5,10 @@
         "1_party": true,
         "2_employee": true,
         "3_education": true,
-        "4_military": true
+        "4_military": true,
+        "5_relatives": true,
+        "6_training": true,
+        "7_work_record": true,
+        "8_warrior_record": true
     }
 }

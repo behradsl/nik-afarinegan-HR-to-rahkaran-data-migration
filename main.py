@@ -1,7 +1,16 @@
 import json
 import os
 import sys
-from steps import step_01_party, step_02_employee, step_03_education, step_04_military
+from steps import (
+    step_01_party,
+    step_02_employee,
+    step_03_education,
+    step_04_military,
+    step_05_relatives,
+    step_06_training,
+    step_07_work_record,
+    step_08_warrior_record,
+)
 
 def get_config_path():
     """Ensures the .exe looks for config.json in the folder it is currently in."""
@@ -49,6 +58,26 @@ def main():
             step_04_military.run()
         else:
             print("\n--- Skipping Step 4: Military Migration ---")
+
+        if steps_to_run.get("5_relatives", False):
+            step_05_relatives.run()
+        else:
+            print("\n--- Skipping Step 5: Relatives Migration ---")
+
+        if steps_to_run.get("6_training", False):
+            step_06_training.run()
+        else:
+            print("\n--- Skipping Step 6: Training Migration ---")
+
+        if steps_to_run.get("7_work_record", False):
+            step_07_work_record.run()
+        else:
+            print("\n--- Skipping Step 7: Work Record Migration ---")
+
+        if steps_to_run.get("8_warrior_record", False):
+            step_08_warrior_record.run()
+        else:
+            print("\n--- Skipping Step 8: Warrior Record Migration ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
