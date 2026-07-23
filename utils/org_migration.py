@@ -360,6 +360,15 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         print(f"  -> Jobs already mapped: {len(result)}.")
         return result
 
+    existing_pairs_df = pd.read_sql(
+        "SELECT Code, Title FROM HCM3.Job WHERE Code IS NOT NULL",
+        dest_cnxn,
+    )
+    used_pairs = {
+        (str(row['Code']), normalize_persian(str(row['Title'])) if row['Title'] else DEFAULT_TITLE)
+        for _, row in existing_pairs_df.iterrows()
+    }
+
     last_id = ensure_table_id(dest_cursor, 'HCM3.Job', 0)
     insert_sql = """
         INSERT INTO HCM3.Job (
@@ -374,11 +383,15 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
     """
 
     inserted = 0
+    uniquified = 0
     for _, row in missing_df.iterrows():
         source_id = int(row['SourceJobID'])
-        title, code = _title_and_code(
+        title, base_code = _title_and_code(
             row['JobName'], row['JobCode'], source_id, title_max=400
         )
+        code = _unique_code_for_title(base_code, title, source_id, used_pairs)
+        if code != base_code:
+            uniquified += 1
         status = _active_status(row['JobActive'])
         last_id += 1
         dest_cursor.execute(
@@ -386,6 +399,7 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
             (last_id, code, title, DEFAULT_JOB_CLASS_CODE, status),
         )
         dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
+        used_pairs.add((code, title))
         result[source_id] = last_id
         inserted += 1
 
@@ -393,7 +407,10 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
         (last_id,),
     )
-    print(f"  -> Jobs inserted: {inserted}. Total mapped: {len(result)}.")
+    print(
+        f"  -> Jobs inserted: {inserted} "
+        f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
+    )
     return result
 
 

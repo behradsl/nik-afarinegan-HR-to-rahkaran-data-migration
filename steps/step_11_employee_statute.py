@@ -2,7 +2,7 @@
 import pandas as pd
 import warnings
 from db_core import get_connections
-from utils.data_helpers import clean_persian_text
+from utils.data_helpers import clean_persian_text, normalize_persian
 from utils.date_helpers import shamsi_to_gregorian
 from utils.org_migration import (
     ensure_departments,
@@ -58,15 +58,25 @@ def _positive_fk(val):
     return num if num > 0 else None
 
 
-def _date_sequence(date_str):
-    """Build a decimal sequence from YYYY-MM-DD for Apply*DateSequence NOT NULL cols."""
-    if not date_str:
-        return 0
-    try:
-        parts = str(date_str).split('-')
-        return int(parts[0]) * 10000 + int(parts[1]) * 100 + int(parts[2])
-    except (TypeError, ValueError, IndexError):
-        return 0
+def _statute_title_key(title):
+    """
+    Fold title for uniqueness matching SQL Arabic collation quirks
+    (tatweel/kashida, trailing dots, spacing).
+    """
+    text = normalize_persian(title) if title else '-'
+    text = text.replace('\u0640', '')  # Arabic tatweel ـ
+    text = text.replace('.', '')
+    text = ' '.join(text.split())
+    return text
+
+
+def _statute_display_title(title):
+    """Canonical title stored in dest (no tatweel / trailing dots)."""
+    text = title or '-'
+    text = text.replace('\u0640', '')
+    text = text.rstrip('.').strip()
+    text = ' '.join(text.split())
+    return text[:400]
 
 
 def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
@@ -102,6 +112,15 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
         print(f"  -> Statute types already mapped: {len(result)}.")
         return result
 
+    existing_titles_df = pd.read_sql(
+        "SELECT StatuteTypeID, Title FROM HCM3.StatuteType",
+        dest_cnxn,
+    )
+    title_key_to_id = {}
+    for _, row in existing_titles_df.iterrows():
+        raw = str(row['Title']) if row['Title'] is not None else '-'
+        title_key_to_id[_statute_title_key(raw)] = int(row['StatuteTypeID'])
+
     last_id = ensure_table_id(dest_cursor, 'HCM3.StatuteType', 0)
     insert_sql = """
         INSERT INTO HCM3.StatuteType (
@@ -118,23 +137,54 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
     """
 
     inserted = 0
+    reused = 0
+    uniquified = 0
     for _, row in missing_df.iterrows():
         source_id = int(row['SourceRuleTypeID'])
         title = clean_persian_text(row['RuleName']) or '-'
-        title = title[:400]
+        display_title = _statute_display_title(title)
+        title_key = _statute_title_key(display_title)
+
+        if title_key in title_key_to_id:
+            dest_id = title_key_to_id[title_key]
+            dest_cursor.execute(insert_mapping_sql, (source_id, dest_id))
+            result[source_id] = dest_id
+            reused += 1
+            continue
+
+        dest_cursor.execute(
+            "SELECT TOP 1 StatuteTypeID FROM HCM3.StatuteType WHERE Title = ?",
+            (display_title,),
+        )
+        existing_row = dest_cursor.fetchone()
+        if existing_row:
+            dest_id = int(existing_row[0])
+            dest_cursor.execute(insert_mapping_sql, (source_id, dest_id))
+            title_key_to_id[title_key] = dest_id
+            result[source_id] = dest_id
+            reused += 1
+            continue
+
         code_raw = row['RuleCode']
         code = None
         if code_raw is not None and not (isinstance(code_raw, float) and pd.isna(code_raw)):
             code = str(code_raw).strip()[:100] or None
         if not code:
             code = str(source_id)
+
+        insert_title = display_title
+        # Final guarantee for unique index
+        suffix = f"-{source_id}"
+        insert_title = f"{insert_title[:max(0, 400 - len(suffix))]}{suffix}"
+        uniquified += 1
+
         last_id += 1
         dest_cursor.execute(
             insert_sql,
             (
                 last_id,
                 code,
-                title,
+                insert_title,
                 STATUTE_TYPE_DEFAULTS['IssueTimeCode'],
                 STATUTE_TYPE_DEFAULTS['AfterIssueStatusCode'],
                 STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
@@ -144,6 +194,8 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
             ),
         )
         dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
+        title_key_to_id[title_key] = last_id
+        title_key_to_id[_statute_title_key(insert_title)] = last_id
         result[source_id] = last_id
         inserted += 1
 
@@ -151,7 +203,10 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.StatuteType'",
         (last_id,),
     )
-    print(f"  -> Statute types inserted: {inserted}. Total mapped: {len(result)}.")
+    print(
+        f"  -> Statute types inserted: {inserted}, reused by title: {reused}, "
+        f"titles uniquified: {uniquified}. Total mapped: {len(result)}."
+    )
     return result
 
 
@@ -306,10 +361,9 @@ def run():
                 Number, IssueDate, ApplyDate, ExpiryDate,
                 OrganizationalStructureRef, PostRef, DepartmentRef,
                 WorkLocationCode, RankCode, Description, Status,
-                ApplyConfirmDateSequence, ApplyIssueDateSequence,
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 GETDATE(), 1, GETDATE(), 1
             )
         """
@@ -377,9 +431,6 @@ def run():
                     desc_parts.append(part)
             description = ' | '.join(desc_parts)[:2000] if desc_parts else None
 
-            apply_seq = _date_sequence(apply_date)
-            issue_seq = _date_sequence(issue_date)
-
             statute_last_id += 1
             dest_cursor.execute(
                 insert_sql,
@@ -399,8 +450,6 @@ def run():
                     rank_code,
                     description,
                     STATUTE_STATUS_ACTIVE,
-                    apply_seq,
-                    issue_seq,
                 ),
             )
             dest_cursor.execute(insert_mapping_sql, (source_rd_id, statute_last_id))
