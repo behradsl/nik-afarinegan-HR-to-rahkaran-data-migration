@@ -49,13 +49,12 @@ def run():
                 mh.HRS_MhEndDate AS EndDate
             FROM dbo.HRS_MilitaryHistory mh
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = mh.TBL_DegreeID_fk
-            WHERE mh.HRS_MhActive = 1
-              AND mh.TBL_PersonnelID_fk IS NOT NULL
+            WHERE mh.TBL_PersonnelID_fk IS NOT NULL
               AND mh.TBL_PersonnelID_fk > 0
         """, source_cnxn)
 
         if source_df.empty:
-            print("No active military history rows found.")
+            print("No military history rows found.")
             return
 
         total_source_people = source_df['SourceID'].nunique()

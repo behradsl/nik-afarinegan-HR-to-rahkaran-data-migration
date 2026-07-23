@@ -93,13 +93,12 @@ def run():
                 c.LMS_CourseDuration AS CourseDuration
             FROM dbo.LMS_EducationHistory eh
             LEFT JOIN dbo.LMS_Course c ON c.LMS_CourseID = eh.LMS_CourseID_fk
-            WHERE eh.LMS_EhActive = 1
-              AND eh.Tbl_PersonnelId_fk IS NOT NULL
+            WHERE eh.Tbl_PersonnelId_fk IS NOT NULL
               AND eh.Tbl_PersonnelId_fk > 0
         """, source_cnxn)
 
         if source_df.empty:
-            print("No active training history rows found.")
+            print("No training history rows found.")
             return
 
         print("Mapping Source to Rahkaran Employees...")

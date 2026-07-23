@@ -277,14 +277,13 @@ def run():
                 ss.HRS_InsuranceDeleteDate AS InsuranceDeleteDate,
                 ss.HRS_SsDeathDate AS DeathDate
             FROM dbo.HRS_SponsorShip ss
-            WHERE ss.HRS_SsActive = 1
-              AND ss.TBL_PersonnelID_fk IS NOT NULL
+            WHERE ss.TBL_PersonnelID_fk IS NOT NULL
               AND ss.TBL_PersonnelID_fk > 0
               AND ss.HRS_SponserRelatedID_fk IN (30002, 30003, 30004, 30005, 30006)
         """, source_cnxn)
 
         if source_df.empty:
-            print("No active relative rows found.")
+            print("No relative rows found.")
             return
 
         multi_spouse_people = int(

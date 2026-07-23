@@ -183,13 +183,12 @@ def run():
                 pb.HRS_PayBaseName AS SacrificeTitle
             FROM dbo.HRS_SacrificeHistory sh
             LEFT JOIN dbo.HRS_PayBase pb ON pb.HRS_PayBaseID = sh.HRS_PbID_fk
-            WHERE sh.HRS_ShActive = 1
-              AND sh.TBL_PersonnelID_fk IS NOT NULL
+            WHERE sh.TBL_PersonnelID_fk IS NOT NULL
               AND sh.TBL_PersonnelID_fk > 0
         """, source_cnxn)
 
         if source_df.empty:
-            print("No active sacrifice history rows found.")
+            print("No sacrifice history rows found.")
             return
 
         print("Mapping Source to Rahkaran Employees...")

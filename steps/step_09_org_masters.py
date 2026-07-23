@@ -40,8 +40,7 @@ def run():
         grades_df = pd.read_sql("""
             SELECT DISTINCT HRS_RdPersonalGrade AS Grade
             FROM dbo.HRS_RuleDocument
-            WHERE HRS_RdActive = 1
-              AND HRS_RdPersonalGrade IS NOT NULL
+            WHERE HRS_RdPersonalGrade IS NOT NULL
               AND HRS_RdPersonalGrade > 0
         """, source_cnxn)
         ensure_rank_codes_from_grades(
