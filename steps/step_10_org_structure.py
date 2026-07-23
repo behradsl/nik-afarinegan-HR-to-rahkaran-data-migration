@@ -1,18 +1,35 @@
-"""Step 10: Migrate all OrganizationChart eras into HCM3.OrganizationalStructure."""
+"""
+Step 10: Rebuild HCM3.OrganizationalStructure for Rahkaran UI.
+
+Per OrganizationChart (Oc) era:
+  - Department nodes (PostRef NULL) form the tree via department parent links
+  - Post nodes hang under their department node
+  - InsertionDate = Oc date; DeletionDate = next Oc date (NULL for latest)
+  - OrganizationalStructureDescription per Oc ChangeDate
+  - OrganizationalStructureItem (مصوب) on each post node
+"""
 import pandas as pd
 import warnings
+from datetime import date
 from utils.date_helpers import shamsi_to_gregorian
 from db_core import get_connections
+from utils.data_helpers import clean_persian_text
 from utils.org_migration import (
     ensure_departments,
     ensure_posts,
     ensure_table_id,
+    setup_org_structure_description_mapping_table,
     setup_org_structure_mapping_table,
+    upgrade_org_structure_mapping_schema,
 )
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
 OPEN_END_SHAMSI = '1499/12/29'
+NODE_DEPT = 'D'
+NODE_POST = 'P'
+# OrganizationStructurePostType: 1 = مصوب
+POST_TYPE_APPROVED = 1
 
 
 def _parse_shamsi_date(raw):
@@ -39,47 +56,216 @@ def _positive_fk(val):
     return num if num > 0 else None
 
 
+def _clear_previous_structure(dest_cursor):
+    """Remove previously migrated structure so this step can fully rebuild."""
+    # Legacy schema: (SourcePostID, SourceOcID, DestOrganizationalStructureID)
+    dest_cursor.execute("""
+        IF EXISTS (SELECT * FROM master.sys.tables WHERE name = 'OrgStructureMigrationMapping')
+        BEGIN
+            UPDATE os SET os.ParentRef = NULL
+            FROM HCM3.OrganizationalStructure os
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON os.OrganizationalStructureID = m.DestOrganizationalStructureID
+
+            IF OBJECT_ID('HCM3.OrganizationalStructureItem') IS NOT NULL
+            BEGIN
+                DELETE i
+                FROM HCM3.OrganizationalStructureItem i
+                INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                    ON i.OrganizationalStructureRef = m.DestOrganizationalStructureID
+            END
+
+            IF EXISTS (SELECT * FROM master.sys.tables WHERE name = 'StatuteMigrationMapping')
+            BEGIN
+                UPDATE s SET s.OrganizationalStructureRef = NULL
+                FROM HCM3.EmployeeStatute s
+                INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                    ON s.OrganizationalStructureRef = m.DestOrganizationalStructureID
+            END
+
+            DELETE os
+            FROM HCM3.OrganizationalStructure os
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON os.OrganizationalStructureID = m.DestOrganizationalStructureID
+
+            DELETE FROM master.dbo.OrgStructureMigrationMapping
+        END
+    """)
+    dest_cursor.execute("""
+        IF EXISTS (
+            SELECT * FROM master.sys.tables
+            WHERE name = 'OrgStructureDescriptionMigrationMapping'
+        )
+        BEGIN
+            DELETE d
+            FROM HCM3.OrganizationalStructureDescription d
+            INNER JOIN master.dbo.OrgStructureDescriptionMigrationMapping m
+                ON d.OrganizationalStructureDescriptionID = m.DestDescriptionID
+
+            DELETE FROM master.dbo.OrgStructureDescriptionMigrationMapping
+        END
+    """)
+
+
+def _collect_dept_ancestors(dept_id, parent_by_dept, needed):
+    """Add dept_id and all ancestors into needed set."""
+    seen = set()
+    current = dept_id
+    while current and current not in seen:
+        seen.add(current)
+        needed.add(current)
+        current = parent_by_dept.get(current)
+
+
+def _insert_dept_nodes(
+    dest_cursor,
+    oc_id,
+    needed_depts,
+    parent_by_dept,
+    dept_map,
+    insertion,
+    deletion,
+    structure_last_id,
+    insert_os_sql,
+    insert_map_sql,
+):
+    """Insert department-only OS nodes; return source_dept_id -> dest_os_id."""
+    local = {}
+    pending = set(needed_depts)
+    inserted = 0
+    skipped = 0
+    safety = 0
+    max_passes = len(pending) + 5
+
+    while pending and safety < max_passes:
+        safety += 1
+        progress = False
+        for source_dept_id in list(pending):
+            dest_dept = dept_map.get(source_dept_id)
+            if not dest_dept:
+                skipped += 1
+                pending.discard(source_dept_id)
+                progress = True
+                continue
+
+            parent_src = parent_by_dept.get(source_dept_id)
+            if parent_src and parent_src in needed_depts and parent_src not in local:
+                continue
+
+            parent_ref = local.get(parent_src) if parent_src else None
+            structure_last_id += 1
+            dest_cursor.execute(
+                insert_os_sql,
+                (structure_last_id, dest_dept, None, parent_ref, insertion, deletion),
+            )
+            dest_cursor.execute(
+                insert_map_sql,
+                (oc_id, NODE_DEPT, source_dept_id, structure_last_id),
+            )
+            local[source_dept_id] = structure_last_id
+            pending.discard(source_dept_id)
+            inserted += 1
+            progress = True
+
+        if not progress:
+            for source_dept_id in list(pending):
+                dest_dept = dept_map.get(source_dept_id)
+                if not dest_dept:
+                    skipped += 1
+                    pending.discard(source_dept_id)
+                    continue
+                structure_last_id += 1
+                dest_cursor.execute(
+                    insert_os_sql,
+                    (structure_last_id, dest_dept, None, None, insertion, deletion),
+                )
+                dest_cursor.execute(
+                    insert_map_sql,
+                    (oc_id, NODE_DEPT, source_dept_id, structure_last_id),
+                )
+                local[source_dept_id] = structure_last_id
+                pending.discard(source_dept_id)
+                inserted += 1
+            break
+
+    return local, structure_last_id, inserted, skipped
+
+
 def run():
-    print("\n--- Running Step 10: Organizational Structure Migration ---")
+    print("\n--- Running Step 10: Organizational Structure Migration (rebuild) ---")
 
     source_cnxn, dest_cnxn = get_connections()
     dest_cursor = dest_cnxn.cursor()
 
     try:
-        setup_org_structure_mapping_table(dest_cursor)
+        print("Clearing previously migrated organizational structure...")
+        _clear_previous_structure(dest_cursor)
+
+        print("Ensuring mapping schema...")
+        upgrade_org_structure_mapping_schema(dest_cursor)
+        setup_org_structure_description_mapping_table(dest_cursor)
 
         print("Ensuring Department / Post masters...")
         dept_map = ensure_departments(source_cnxn, dest_cnxn, dest_cursor)
         post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
 
-        existing_df = pd.read_sql("""
-            SELECT SourcePostID, SourceOcID, DestOrganizationalStructureID
-            FROM master.dbo.OrgStructureMigrationMapping
-        """, dest_cnxn)
-        already = {
-            (int(r['SourcePostID']), int(r['SourceOcID'])): int(r['DestOrganizationalStructureID'])
-            for _, r in existing_df.iterrows()
-        }
-
-        print("Fetching Organization Charts and Posts...")
+        print("Fetching Organization Charts...")
         oc_df = pd.read_sql("""
-            SELECT TBL_OcID AS SourceOcID, TBL_OcDate AS OcDate
+            SELECT
+                TBL_OcID AS SourceOcID,
+                TBL_OcDate AS OcDate,
+                TBL_OcDescription AS OcDescription,
+                TBL_OcNo AS OcNo
             FROM dbo.TBL_OrganizationChart
             WHERE TBL_OcID > 0
         """, source_cnxn)
-        oc_dates = {
-            int(r['SourceOcID']): _parse_shamsi_date(r['OcDate'])
-            for _, r in oc_df.iterrows()
-        }
+
+        if oc_df.empty:
+            print("No organization charts found.")
+            dest_cnxn.commit()
+            return
+
+        oc_df['_sort'] = oc_df['OcDate'].apply(
+            lambda x: _parse_shamsi_date(x) or '1900-01-01'
+        )
+        oc_df = oc_df.sort_values(by=['_sort', 'SourceOcID']).reset_index(drop=True)
+
+        oc_windows = []
+        for i, row in oc_df.iterrows():
+            oc_id = int(row['SourceOcID'])
+            insertion = _parse_shamsi_date(row['OcDate']) or '1900-01-01'
+            if i + 1 < len(oc_df):
+                next_date = _parse_shamsi_date(oc_df.iloc[i + 1]['OcDate'])
+                deletion = next_date  # superseded when next chart starts
+            else:
+                deletion = None  # current chart stays open
+            oc_windows.append({
+                'SourceOcID': oc_id,
+                'InsertionDate': insertion,
+                'DeletionDate': deletion,
+                'OcDescription': row['OcDescription'],
+                'OcNo': row['OcNo'],
+            })
+
+        depts_df = pd.read_sql("""
+            SELECT
+                TBL_DepartmentID AS SourceDepartmentID,
+                TBL_DepartmentParentID_fk AS SourceParentDepartmentID
+            FROM dbo.TBL_Department
+            WHERE TBL_DepartmentID > 0
+        """, source_cnxn)
+        parent_by_dept = {}
+        for _, r in depts_df.iterrows():
+            did = int(r['SourceDepartmentID'])
+            pid = _positive_fk(r['SourceParentDepartmentID'])
+            if pid and pid != did:
+                parent_by_dept[did] = pid
 
         posts_df = pd.read_sql("""
             SELECT
                 TBL_PostID AS SourcePostID,
                 TBL_OcID_fk AS SourceOcID,
-                TBL_DepartmentID_fk AS SourceDepartmentID,
-                TBL_PostParentID_fk AS SourceParentPostID,
-                TBL_PostCreateDate AS PostCreateDate,
-                TBL_PostExpireDate AS PostExpireDate
+                TBL_DepartmentID_fk AS SourceDepartmentID
             FROM dbo.TBL_Post
             WHERE TBL_PostID > 0
               AND TBL_OcID_fk IS NOT NULL
@@ -92,158 +278,172 @@ def run():
             return
 
         structure_last_id = ensure_table_id(dest_cursor, 'HCM3.OrganizationalStructure', 0)
-        insert_sql = """
+        item_last_id = ensure_table_id(dest_cursor, 'HCM3.OrganizationalStructureItem', 0)
+        desc_last_id = ensure_table_id(
+            dest_cursor, 'HCM3.OrganizationalStructureDescription', 0
+        )
+
+        insert_os_sql = """
             INSERT INTO HCM3.OrganizationalStructure (
                 OrganizationalStructureID, DepartmentRef, PostRef, ParentRef,
                 InsertionDate, DeletionDate
             ) VALUES (?, ?, ?, ?, ?, ?)
         """
-        insert_mapping_sql = """
+        insert_map_sql = """
             INSERT INTO master.dbo.OrgStructureMigrationMapping (
-                SourcePostID, SourceOcID, DestOrganizationalStructureID
-            ) VALUES (?, ?, ?)
+                SourceOcID, NodeKind, SourceID, DestOrganizationalStructureID
+            ) VALUES (?, ?, ?, ?)
+        """
+        insert_item_sql = """
+            INSERT INTO HCM3.OrganizationalStructureItem (
+                OrganizationalStructureItemID, OrganizationalStructureRef,
+                OrganizationalStructurePostTypeCode, InsertionDate, DeletionDate
+            ) VALUES (?, ?, ?, ?, ?)
+        """
+        insert_desc_sql = """
+            INSERT INTO HCM3.OrganizationalStructureDescription (
+                OrganizationalStructureDescriptionID, ChangeDate, Description,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        """
+        insert_desc_map_sql = """
+            INSERT INTO master.dbo.OrgStructureDescriptionMigrationMapping (
+                SourceOcID, DestDescriptionID
+            ) VALUES (?, ?)
         """
 
-        inserted = 0
+        dept_nodes = 0
+        post_nodes = 0
+        items_inserted = 0
+        descs_inserted = 0
         skipped_no_dept = 0
         skipped_no_post = 0
-        skipped_already = 0
-        deferred_forced = 0
+        skipped_no_dept_master = 0
 
-        for oc_id, group in posts_df.groupby('SourceOcID'):
-            oc_id = int(oc_id)
-            oc_insertion = oc_dates.get(oc_id)
-            post_ids_in_oc = set(int(p) for p in group['SourcePostID'].tolist())
+        for oc in oc_windows:
+            oc_id = oc['SourceOcID']
+            insertion = oc['InsertionDate']
+            deletion = oc['DeletionDate']
+            print(
+                f"  Oc {oc_id}: insert={insertion}, delete={deletion or 'NULL'}..."
+            )
 
-            # Build row lookup
-            rows_by_post = {
-                int(r['SourcePostID']): r for _, r in group.iterrows()
-            }
+            # Description for this chart effective date
+            desc_text = clean_persian_text(oc['OcDescription'])
+            if not desc_text:
+                oc_no = clean_persian_text(oc['OcNo'])
+                desc_text = oc_no or f'ساختار سازمانی {oc_id}'
+            desc_last_id += 1
+            dest_cursor.execute(
+                insert_desc_sql,
+                (desc_last_id, insertion, desc_text[:2000]),
+            )
+            dest_cursor.execute(insert_desc_map_sql, (oc_id, desc_last_id))
+            descs_inserted += 1
 
-            pending = set(post_ids_in_oc)
-            local_map = {
-                pid: already[(pid, oc_id)]
-                for pid in post_ids_in_oc
-                if (pid, oc_id) in already
-            }
-            for pid in list(local_map.keys()):
-                pending.discard(pid)
-                skipped_already += 1
-
-            safety = 0
-            while pending and safety < len(post_ids_in_oc) + 5:
-                safety += 1
-                progress = False
-                for source_post_id in list(pending):
-                    row = rows_by_post[source_post_id]
-                    parent_src = _positive_fk(row['SourceParentPostID'])
-                    if (
-                        parent_src
-                        and parent_src in post_ids_in_oc
-                        and parent_src not in local_map
-                    ):
-                        continue
-
-                    dest_post = post_map.get(source_post_id)
-                    if not dest_post:
-                        skipped_no_post += 1
-                        pending.discard(source_post_id)
-                        progress = True
-                        continue
-
-                    source_dept = _positive_fk(row['SourceDepartmentID'])
-                    dest_dept = dept_map.get(source_dept) if source_dept else None
-                    if not dest_dept:
-                        skipped_no_dept += 1
-                        pending.discard(source_post_id)
-                        progress = True
-                        continue
-
-                    parent_ref = None
-                    if parent_src and parent_src in local_map:
-                        parent_ref = local_map[parent_src]
-
-                    insertion = oc_insertion or _parse_shamsi_date(row['PostCreateDate'])
-                    if insertion is None:
-                        insertion = '1900-01-01'
-                    deletion = _parse_shamsi_date(row['PostExpireDate'])
-
-                    structure_last_id += 1
+            # For the latest Oc (no deletion), also publish a description on "today"
+            # so the UI ChangeDate=today lookup finds a row. Mapped as SourceOcID=0.
+            if deletion is None:
+                today_str = date.today().strftime('%Y-%m-%d')
+                if str(insertion)[:10] != today_str:
+                    desc_last_id += 1
                     dest_cursor.execute(
-                        insert_sql,
-                        (
-                            structure_last_id,
-                            dest_dept,
-                            dest_post,
-                            parent_ref,
-                            insertion,
-                            deletion,
-                        ),
+                        insert_desc_sql,
+                        (desc_last_id, today_str, desc_text[:2000]),
                     )
-                    dest_cursor.execute(
-                        insert_mapping_sql,
-                        (source_post_id, oc_id, structure_last_id),
-                    )
-                    local_map[source_post_id] = structure_last_id
-                    already[(source_post_id, oc_id)] = structure_last_id
-                    pending.discard(source_post_id)
-                    inserted += 1
-                    progress = True
+                    dest_cursor.execute(insert_desc_map_sql, (0, desc_last_id))
+                    descs_inserted += 1
 
-                if not progress:
-                    # Force remaining with null parent to break cycles
-                    for source_post_id in list(pending):
-                        row = rows_by_post[source_post_id]
-                        dest_post = post_map.get(source_post_id)
-                        source_dept = _positive_fk(row['SourceDepartmentID'])
-                        dest_dept = dept_map.get(source_dept) if source_dept else None
-                        if not dest_post or not dest_dept:
-                            if not dest_post:
-                                skipped_no_post += 1
-                            if not dest_dept:
-                                skipped_no_dept += 1
-                            pending.discard(source_post_id)
-                            continue
-                        insertion = oc_insertion or _parse_shamsi_date(row['PostCreateDate'])
-                        if insertion is None:
-                            insertion = '1900-01-01'
-                        deletion = _parse_shamsi_date(row['PostExpireDate'])
-                        structure_last_id += 1
-                        dest_cursor.execute(
-                            insert_sql,
-                            (
-                                structure_last_id,
-                                dest_dept,
-                                dest_post,
-                                None,
-                                insertion,
-                                deletion,
-                            ),
-                        )
-                        dest_cursor.execute(
-                            insert_mapping_sql,
-                            (source_post_id, oc_id, structure_last_id),
-                        )
-                        local_map[source_post_id] = structure_last_id
-                        already[(source_post_id, oc_id)] = structure_last_id
-                        pending.discard(source_post_id)
-                        inserted += 1
-                        deferred_forced += 1
-                    break
+            oc_posts = posts_df[posts_df['SourceOcID'] == oc_id]
+            needed_depts = set()
+            for _, prow in oc_posts.iterrows():
+                source_dept = _positive_fk(prow['SourceDepartmentID'])
+                if source_dept:
+                    _collect_dept_ancestors(source_dept, parent_by_dept, needed_depts)
+
+            dept_local, structure_last_id, d_ins, d_skip = _insert_dept_nodes(
+                dest_cursor,
+                oc_id,
+                needed_depts,
+                parent_by_dept,
+                dept_map,
+                insertion,
+                deletion,
+                structure_last_id,
+                insert_os_sql,
+                insert_map_sql,
+            )
+            dept_nodes += d_ins
+            skipped_no_dept_master += d_skip
+
+            for _, prow in oc_posts.iterrows():
+                source_post_id = int(prow['SourcePostID'])
+                dest_post = post_map.get(source_post_id)
+                if not dest_post:
+                    skipped_no_post += 1
+                    continue
+
+                source_dept = _positive_fk(prow['SourceDepartmentID'])
+                dest_dept = dept_map.get(source_dept) if source_dept else None
+                if not dest_dept:
+                    skipped_no_dept += 1
+                    continue
+
+                parent_ref = dept_local.get(source_dept) if source_dept else None
+                structure_last_id += 1
+                dest_cursor.execute(
+                    insert_os_sql,
+                    (
+                        structure_last_id,
+                        dest_dept,
+                        dest_post,
+                        parent_ref,
+                        insertion,
+                        deletion,
+                    ),
+                )
+                dest_cursor.execute(
+                    insert_map_sql,
+                    (oc_id, NODE_POST, source_post_id, structure_last_id),
+                )
+                post_nodes += 1
+
+                item_last_id += 1
+                dest_cursor.execute(
+                    insert_item_sql,
+                    (
+                        item_last_id,
+                        structure_last_id,
+                        POST_TYPE_APPROVED,
+                        insertion,
+                        deletion,
+                    ),
+                )
+                items_inserted += 1
 
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? "
             "WHERE TableName = 'HCM3.OrganizationalStructure'",
             (structure_last_id,),
         )
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? "
+            "WHERE TableName = 'HCM3.OrganizationalStructureItem'",
+            (item_last_id,),
+        )
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? "
+            "WHERE TableName = 'HCM3.OrganizationalStructureDescription'",
+            (desc_last_id,),
+        )
 
         dest_cnxn.commit()
         print(
-            f"Success! OrganizationalStructure inserted: {inserted}. "
-            f"Already mapped: {skipped_already}. "
-            f"Skipped (no post): {skipped_no_post}. "
-            f"Skipped (no dept): {skipped_no_dept}. "
-            f"Forced null parent (cycles): {deferred_forced}."
+            f"Success! Dept nodes: {dept_nodes}, Post nodes: {post_nodes}, "
+            f"Items: {items_inserted}, Descriptions: {descs_inserted}. "
+            f"Skipped (no post master): {skipped_no_post}. "
+            f"Skipped (no dept on post): {skipped_no_dept}. "
+            f"Skipped (no dept master): {skipped_no_dept_master}."
         )
 
     except Exception as e:

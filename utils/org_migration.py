@@ -95,15 +95,55 @@ def setup_place_mapping_table(cursor):
 
 
 def setup_org_structure_mapping_table(cursor):
+    """
+    Mapping for org-structure nodes.
+    NodeKind: 'D' = department node (PostRef NULL), 'P' = post node.
+    SourceID: TBL_DepartmentID or TBL_PostID.
+    Does not drop existing data — caller must clear before schema upgrade.
+    """
     cursor.execute("""
         IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'OrgStructureMigrationMapping')
         BEGIN
             CREATE TABLE master.dbo.OrgStructureMigrationMapping (
-                SourcePostID BIGINT NOT NULL,
                 SourceOcID INT NOT NULL,
+                NodeKind CHAR(1) NOT NULL,
+                SourceID BIGINT NOT NULL,
                 DestOrganizationalStructureID BIGINT NOT NULL,
                 MigrationDate DATETIME DEFAULT GETDATE(),
-                PRIMARY KEY (SourcePostID, SourceOcID)
+                PRIMARY KEY (SourceOcID, NodeKind, SourceID)
+            )
+        END
+    """)
+    cursor.commit()
+
+
+def upgrade_org_structure_mapping_schema(cursor):
+    """Drop legacy post-only mapping table after data has been cleared."""
+    cursor.execute("""
+        IF EXISTS (SELECT * FROM master.sys.tables WHERE name = 'OrgStructureMigrationMapping')
+          AND NOT EXISTS (
+            SELECT 1 FROM master.sys.columns
+            WHERE object_id = OBJECT_ID('master.dbo.OrgStructureMigrationMapping')
+              AND name = 'NodeKind'
+          )
+        BEGIN
+            DROP TABLE master.dbo.OrgStructureMigrationMapping
+        END
+    """)
+    cursor.commit()
+    setup_org_structure_mapping_table(cursor)
+
+
+def setup_org_structure_description_mapping_table(cursor):
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT * FROM master.sys.tables WHERE name = 'OrgStructureDescriptionMigrationMapping'
+        )
+        BEGIN
+            CREATE TABLE master.dbo.OrgStructureDescriptionMigrationMapping (
+                SourceOcID INT PRIMARY KEY,
+                DestDescriptionID BIGINT NOT NULL,
+                MigrationDate DATETIME DEFAULT GETDATE()
             )
         END
     """)

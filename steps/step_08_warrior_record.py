@@ -34,7 +34,10 @@ def _parse_shamsi_date(raw, *, treat_open_end_as_null=False):
     text = str(raw).strip()
     if not text:
         return None
-    date_part = text.split()[0]
+    parts = text.split()
+    if not parts:
+        return None
+    date_part = parts[0]
     if date_part in ('', '0', '____/__/__', '/  /', '//', '0/0/0'):
         return None
     if treat_open_end_as_null and date_part == OPEN_END_SHAMSI:
@@ -42,6 +45,14 @@ def _parse_shamsi_date(raw, *, treat_open_end_as_null=False):
     if '_' in date_part or date_part.count('/') != 2:
         return None
     return shamsi_to_gregorian(date_part)
+
+
+def _shamsi_date_token(raw):
+    """First whitespace-separated token of a Shamsi date field, or ''."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ''
+    parts = str(raw).strip().split()
+    return parts[0] if parts else ''
 
 
 def setup_warrior_mapping_table(cursor):
@@ -267,17 +278,12 @@ def run():
             activity_level = _activity_level_code(warrior_group, title)
 
             start_date = _parse_shamsi_date(row['StartDate'])
-            end_raw = row['EndDate']
-            end_text = (
-                str(end_raw).strip().split()[0]
-                if end_raw is not None and not (isinstance(end_raw, float) and pd.isna(end_raw))
-                else ''
-            )
+            end_text = _shamsi_date_token(row['EndDate'])
             if end_text == OPEN_END_SHAMSI:
                 end_date = None
                 open_ended_ends += 1
             else:
-                end_date = _parse_shamsi_date(end_raw, treat_open_end_as_null=True)
+                end_date = _parse_shamsi_date(row['EndDate'], treat_open_end_as_null=True)
 
             effective_date = _parse_shamsi_date(row['ExecuteDate'])
             if effective_date is None:

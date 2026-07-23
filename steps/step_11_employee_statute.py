@@ -263,8 +263,9 @@ def run():
 
         print("Loading org-structure mappings...")
         struct_map_df = pd.read_sql("""
-            SELECT SourcePostID, SourceOcID, DestOrganizationalStructureID
+            SELECT SourceID AS SourcePostID, SourceOcID, DestOrganizationalStructureID
             FROM master.dbo.OrgStructureMigrationMapping
+            WHERE NodeKind = 'P'
         """, dest_cnxn)
         structure_map = {
             (int(r['SourcePostID']), int(r['SourceOcID'])): int(r['DestOrganizationalStructureID'])
@@ -320,13 +321,12 @@ def run():
                 rt.HRS_RtRuleName AS RuleTypeName
             FROM dbo.HRS_RuleDocument rd
             LEFT JOIN dbo.HRS_RuleType rt ON rt.HRS_RtID = rd.HRS_RtID_fk
-            WHERE rd.HRS_RdActive = 1
-              AND rd.TBL_PersonnelID_fk IS NOT NULL
+            WHERE rd.TBL_PersonnelID_fk IS NOT NULL
               AND rd.TBL_PersonnelID_fk > 0
         """, source_cnxn)
 
         if rd_df.empty:
-            print("No active rule documents found.")
+            print("No rule documents found.")
             dest_cnxn.commit()
             return
 

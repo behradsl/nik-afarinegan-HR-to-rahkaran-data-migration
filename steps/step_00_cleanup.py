@@ -1,24 +1,28 @@
 """
-Rollback step: delete destination rows that were inserted by this migration,
+Rollback step: delete destination rows inserted by this migration,
 using master.dbo.*MigrationMapping tables as the source of truth.
 
 Order is reverse dependency (children before parents).
 Linked (pre-existing) parties are kept; only parties created during migration
 are deleted (CreationDate near Mapping.MigrationDate).
+
+SYS3.Lookup values (degrees, places, ranks, etc.) are left in place —
+only PlaceMigrationMapping / DegreeMigrationMapping rows are cleared.
 """
 import warnings
 from db_core import get_connections
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# Mapping table name -> (dest schema.table, dest PK, mapping dest-ID column)
-# Children before parents (statutes before structure; WR before masters they reference).
+# Mapping table -> (dest table, dest PK, mapping dest-ID column)
+# Children / dependents before parents / masters.
 DELETE_BY_MAPPING = (
     ('WarriorMigrationMapping', 'HCM3.EmployeeWarriorRecord', 'EmployeeWarriorRecordID', 'DestEmployeeWarriorRecordID'),
     ('WorkRecordMigrationMapping', 'HCM3.EmployeeWorkRecord', 'EmployeeWorkRecordID', 'DestEmployeeWorkRecordID'),
     ('StatuteMigrationMapping', 'HCM3.EmployeeStatute', 'EmployeeStatuteID', 'DestEmployeeStatuteID'),
     ('OrgStructureMigrationMapping', 'HCM3.OrganizationalStructure', 'OrganizationalStructureID', 'DestOrganizationalStructureID'),
     ('TrainingMigrationMapping', 'HCM3.EmployeeTraining', 'EmployeeTrainingID', 'DestEmployeeTrainingID'),
+    ('RelativeInsuranceMigrationMapping', 'HCM3.EmployeeRelativeInsurance', 'EmployeeRelativeInsuranceID', 'DestEmployeeRelativeInsuranceID'),
     ('RelativeMigrationMapping', 'HCM3.EmployeeRelative', 'EmployeeRelativeID', 'DestEmployeeRelativeID'),
     ('EducationMigrationMapping', 'HCM3.EmployeeEducation', 'EmployeeEducationID', 'DestEmployeeEducationID'),
     ('StatuteTypeMigrationMapping', 'HCM3.StatuteType', 'StatuteTypeID', 'DestStatuteTypeID'),
@@ -33,8 +37,10 @@ MAPPING_TABLES_TO_CLEAR = (
     'WorkRecordMigrationMapping',
     'StatuteMigrationMapping',
     'OrgStructureMigrationMapping',
+    'OrgStructureDescriptionMigrationMapping',
     'StatuteTypeMigrationMapping',
     'TrainingMigrationMapping',
+    'RelativeInsuranceMigrationMapping',
     'RelativeMigrationMapping',
     'EducationMigrationMapping',
     'MilitaryMigrationMapping',
@@ -63,11 +69,18 @@ def _delete_joined(cursor, label, sql):
     return count
 
 
+def _exec_count(cursor, label, sql):
+    cursor.execute(sql)
+    count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+    print(f"  -> {label}: {count}")
+    return count
+
+
 def _clear_military_fields(cursor):
     if not _mapping_exists(cursor, 'MilitaryMigrationMapping'):
         print("  -> MilitaryMigrationMapping not found, skip military field clear.")
         return 0
-    cursor.execute("""
+    return _exec_count(cursor, 'Military fields cleared on Employee', """
         UPDATE e
         SET e.MilitaryStartDate = NULL,
             e.MilitaryEndDate = NULL,
@@ -80,9 +93,6 @@ def _clear_military_fields(cursor):
         INNER JOIN master.dbo.MilitaryMigrationMapping m
             ON e.EmployeeID = m.DestEmployeeID
     """)
-    count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-    print(f"  -> Military fields cleared on Employee: {count}")
-    return count
 
 
 def _delete_migrated_marriages(cursor):
@@ -115,6 +125,147 @@ def _delete_by_mapping(cursor, mapping_table, dest_table, dest_pk, mapping_col):
         FROM {dest_table} d
         INNER JOIN master.dbo.{mapping_table} m
             ON d.{dest_pk} = m.{mapping_col}
+    """)
+
+
+def _prepare_org_structure_delete(cursor):
+    """Break OS self-FK, delete items, clear statute OS refs, delete descriptions."""
+    if _mapping_exists(cursor, 'OrgStructureMigrationMapping'):
+        _exec_count(cursor, 'OrganizationalStructure ParentRef cleared', """
+            UPDATE os
+            SET os.ParentRef = NULL
+            FROM HCM3.OrganizationalStructure os
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON os.OrganizationalStructureID = m.DestOrganizationalStructureID
+        """)
+        _exec_count(cursor, 'OrganizationalStructureItem deleted', """
+            DELETE i
+            FROM HCM3.OrganizationalStructureItem i
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON i.OrganizationalStructureRef = m.DestOrganizationalStructureID
+        """)
+        _exec_count(cursor, 'EmployeeStatute.OrganizationalStructureRef cleared', """
+            UPDATE s
+            SET s.OrganizationalStructureRef = NULL
+            FROM HCM3.EmployeeStatute s
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON s.OrganizationalStructureRef = m.DestOrganizationalStructureID
+        """)
+
+    if _mapping_exists(cursor, 'OrgStructureDescriptionMigrationMapping'):
+        _delete_by_mapping(
+            cursor,
+            'OrgStructureDescriptionMigrationMapping',
+            'HCM3.OrganizationalStructureDescription',
+            'OrganizationalStructureDescriptionID',
+            'DestDescriptionID',
+        )
+
+
+def _null_master_fks_before_delete(cursor):
+    """
+    Clear FKs from remaining rows onto masters we are about to delete.
+    Main child tables are deleted earlier; this is a safety net.
+    """
+    if _mapping_exists(cursor, 'JobMigrationMapping'):
+        _exec_count(cursor, 'WR JobRef/JobRankRef cleared', """
+            UPDATE wr
+            SET wr.JobRef = NULL, wr.JobRankRef = NULL,
+                wr.LastModificationDate = GETDATE(), wr.LastModifier = 1
+            FROM HCM3.EmployeeWorkRecord wr
+            WHERE wr.JobRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+               OR wr.JobRankRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+        """)
+        _exec_count(cursor, 'Statute JobRef cleared', """
+            UPDATE s
+            SET s.JobRef = NULL,
+                s.LastModificationDate = GETDATE(), s.LastModifier = 1
+            FROM HCM3.EmployeeStatute s
+            WHERE s.JobRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+        """)
+
+    if _mapping_exists(cursor, 'EmploymentTypeMigrationMapping'):
+        _exec_count(cursor, 'WR EmploymentTypeRef cleared', """
+            UPDATE wr
+            SET wr.EmploymentTypeRef = NULL,
+                wr.LastModificationDate = GETDATE(), wr.LastModifier = 1
+            FROM HCM3.EmployeeWorkRecord wr
+            WHERE wr.EmploymentTypeRef IN (
+                SELECT DestEmploymentTypeID FROM master.dbo.EmploymentTypeMigrationMapping
+            )
+        """)
+        _exec_count(cursor, 'Statute EmploymentTypeRef cleared', """
+            UPDATE s
+            SET s.EmploymentTypeRef = NULL,
+                s.LastModificationDate = GETDATE(), s.LastModifier = 1
+            FROM HCM3.EmployeeStatute s
+            WHERE s.EmploymentTypeRef IN (
+                SELECT DestEmploymentTypeID FROM master.dbo.EmploymentTypeMigrationMapping
+            )
+        """)
+
+    if _mapping_exists(cursor, 'PostMigrationMapping'):
+        _exec_count(cursor, 'WR/Statute PostRef cleared', """
+            UPDATE wr
+            SET wr.PostRef = NULL,
+                wr.LastModificationDate = GETDATE(), wr.LastModifier = 1
+            FROM HCM3.EmployeeWorkRecord wr
+            WHERE wr.PostRef IN (SELECT DestPostID FROM master.dbo.PostMigrationMapping)
+        """)
+        _exec_count(cursor, 'Statute PostRef cleared', """
+            UPDATE s
+            SET s.PostRef = NULL,
+                s.LastModificationDate = GETDATE(), s.LastModifier = 1
+            FROM HCM3.EmployeeStatute s
+            WHERE s.PostRef IN (SELECT DestPostID FROM master.dbo.PostMigrationMapping)
+        """)
+
+    if _mapping_exists(cursor, 'DepartmentMigrationMapping'):
+        _exec_count(cursor, 'WR DepartmentRef cleared', """
+            UPDATE wr
+            SET wr.DepartmentRef = NULL,
+                wr.LastModificationDate = GETDATE(), wr.LastModifier = 1
+            FROM HCM3.EmployeeWorkRecord wr
+            WHERE wr.DepartmentRef IN (
+                SELECT DestDepartmentID FROM master.dbo.DepartmentMigrationMapping
+            )
+        """)
+        _exec_count(cursor, 'Statute DepartmentRef cleared', """
+            UPDATE s
+            SET s.DepartmentRef = NULL,
+                s.LastModificationDate = GETDATE(), s.LastModifier = 1
+            FROM HCM3.EmployeeStatute s
+            WHERE s.DepartmentRef IN (
+                SELECT DestDepartmentID FROM master.dbo.DepartmentMigrationMapping
+            )
+        """)
+
+    if _mapping_exists(cursor, 'StatuteTypeMigrationMapping'):
+        _exec_count(cursor, 'Statute StatuteTypeRef cleared', """
+            UPDATE s
+            SET s.StatuteTypeRef = NULL,
+                s.LastModificationDate = GETDATE(), s.LastModifier = 1
+            FROM HCM3.EmployeeStatute s
+            WHERE s.StatuteTypeRef IN (
+                SELECT DestStatuteTypeID FROM master.dbo.StatuteTypeMigrationMapping
+            )
+        """)
+
+
+def _delete_relative_insurance_fallback(cursor):
+    """
+    Delete insurance rows tied to migrated relatives if insurance mapping is missing
+    but relative mapping exists (older runs).
+    """
+    if _mapping_exists(cursor, 'RelativeInsuranceMigrationMapping'):
+        return 0
+    if not _mapping_exists(cursor, 'RelativeMigrationMapping'):
+        return 0
+    return _delete_joined(cursor, 'EmployeeRelativeInsurance (via relatives)', """
+        DELETE ins
+        FROM HCM3.EmployeeRelativeInsurance ins
+        INNER JOIN master.dbo.RelativeMigrationMapping m
+            ON ins.EmployeeRelativeRef = m.DestEmployeeRelativeID
     """)
 
 
@@ -171,7 +322,6 @@ def run():
 
     source_cnxn, dest_cnxn = get_connections()
     dest_cursor = dest_cnxn.cursor()
-    # source is unused; close early
     source_cnxn.close()
 
     try:
@@ -181,20 +331,45 @@ def run():
         print("Deleting marriage history created with relatives...")
         _delete_migrated_marriages(dest_cursor)
 
-        print("Deleting mapped child / org records...")
-        # Break self-FK on org structure before delete
-        if _mapping_exists(dest_cursor, 'OrgStructureMigrationMapping'):
-            dest_cursor.execute("""
-                UPDATE os
-                SET os.ParentRef = NULL
-                FROM HCM3.OrganizationalStructure os
-                INNER JOIN master.dbo.OrgStructureMigrationMapping m
-                    ON os.OrganizationalStructureID = m.DestOrganizationalStructureID
-            """)
-            print(f"  -> OrganizationalStructure ParentRef cleared: {dest_cursor.rowcount}")
+        print("Preparing org-structure / description cleanup...")
+        _prepare_org_structure_delete(dest_cursor)
 
+        print("Deleting mapped child records (history / statutes / structure)...")
+        # Delete through OrgStructure in DELETE_BY_MAPPING; stop before masters
+        child_tables = {
+            'WarriorMigrationMapping',
+            'WorkRecordMigrationMapping',
+            'StatuteMigrationMapping',
+            'OrgStructureMigrationMapping',
+            'TrainingMigrationMapping',
+            'RelativeInsuranceMigrationMapping',
+            'RelativeMigrationMapping',
+            'EducationMigrationMapping',
+        }
         for mapping_table, dest_table, dest_pk, mapping_col in DELETE_BY_MAPPING:
-            _delete_by_mapping(dest_cursor, mapping_table, dest_table, dest_pk, mapping_col)
+            if mapping_table in child_tables:
+                if mapping_table == 'RelativeInsuranceMigrationMapping':
+                    _delete_relative_insurance_fallback(dest_cursor)
+                _delete_by_mapping(
+                    dest_cursor, mapping_table, dest_table, dest_pk, mapping_col
+                )
+
+        print("Clearing FKs onto masters before master delete...")
+        _null_master_fks_before_delete(dest_cursor)
+
+        print("Deleting mapped masters (statute type / job / ET / post / dept)...")
+        master_tables = {
+            'StatuteTypeMigrationMapping',
+            'JobMigrationMapping',
+            'EmploymentTypeMigrationMapping',
+            'PostMigrationMapping',
+            'DepartmentMigrationMapping',
+        }
+        for mapping_table, dest_table, dest_pk, mapping_col in DELETE_BY_MAPPING:
+            if mapping_table in master_tables:
+                _delete_by_mapping(
+                    dest_cursor, mapping_table, dest_table, dest_pk, mapping_col
+                )
 
         print("Deleting migrated employees...")
         _delete_migrated_employees(dest_cursor)
@@ -208,7 +383,10 @@ def run():
 
         dest_cnxn.commit()
         print("Success! Migrated destination data and mapping tables cleaned up.")
-        print("Note: SYS3.Lookup values created during sync are left in place.")
+        print(
+            "Note: SYS3.Lookup values (WorkLocation, Rank, EducationDegree, etc.) "
+            "created during sync are left in place."
+        )
 
     except Exception as e:
         dest_cnxn.rollback()
