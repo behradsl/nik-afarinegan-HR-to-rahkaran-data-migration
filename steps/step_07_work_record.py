@@ -2,14 +2,19 @@ import pandas as pd
 import warnings
 from datetime import date
 from db_core import get_connections
-from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
+from utils.data_helpers import clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes
+from utils.org_migration import (
+    ensure_departments,
+    ensure_jobs,
+    ensure_posts,
+    ensure_table_id,
+)
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
 DEFAULT_ORG_NAME = '-'
-DEFAULT_TITLE = '-'
 OPEN_END_SHAMSI = '1499/12/29'
 DEFAULT_DEGREE_CODE = 1
 
@@ -42,15 +47,16 @@ WORK_RECORD_EXTRA2_LOOKUP_VALUES = {
     2: 'دارای حق سرپرستی (نوع ۲)',
 }
 
+# Internal work type (دولتی داخل شرکت)
+WORK_TYPE_INTERNAL = 1
+
 # HRS_EshType → (WorkTypeCode, WorkRelationTypeCode)
-# 1 دولتی(داخل شرکت) → داخلی + مرتبط
-# 2/3/4/5 → خارجی + industry sector relation
 ESH_TYPE_WORK_CODES = {
-    1: (1, WORK_RELATION_RELATED),                 # دولتی داخل شرکت
-    2: (2, WORK_RELATION_GOV_IN_INDUSTRY),          # دولتی داخل صنعت
-    3: (2, WORK_RELATION_GOV_OUT_INDUSTRY),         # دولتی خارج صنعت
-    4: (2, WORK_RELATION_PRIV_OUT_INDUSTRY),        # خصوصی خارج صنعت
-    5: (2, WORK_RELATION_PRIV_IN_INDUSTRY),         # خصوصی داخل صنعت
+    1: (WORK_TYPE_INTERNAL, WORK_RELATION_RELATED),
+    2: (2, WORK_RELATION_GOV_IN_INDUSTRY),
+    3: (2, WORK_RELATION_GOV_OUT_INDUSTRY),
+    4: (2, WORK_RELATION_PRIV_OUT_INDUSTRY),
+    5: (2, WORK_RELATION_PRIV_IN_INDUSTRY),
 }
 
 
@@ -85,57 +91,7 @@ def setup_work_record_mapping_table(cursor):
     cursor.commit()
 
 
-def setup_department_mapping_table(cursor):
-    cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'DepartmentMigrationMapping')
-        BEGIN
-            CREATE TABLE master.dbo.DepartmentMigrationMapping (
-                SourceDepartmentID BIGINT PRIMARY KEY,
-                DestDepartmentID BIGINT NOT NULL,
-                MigrationDate DATETIME DEFAULT GETDATE()
-            )
-        END
-    """)
-    cursor.commit()
-
-
-def setup_post_mapping_table(cursor):
-    cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM master.sys.tables WHERE name = 'PostMigrationMapping')
-        BEGIN
-            CREATE TABLE master.dbo.PostMigrationMapping (
-                SourcePostID BIGINT PRIMARY KEY,
-                DestPostID BIGINT NOT NULL,
-                MigrationDate DATETIME DEFAULT GETDATE()
-            )
-        END
-    """)
-    cursor.commit()
-
-
-def _ensure_table_id(cursor, table_name, default_last_id=0):
-    cursor.execute("""
-        SELECT LastId
-        FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK)
-        WHERE TableName = ?
-    """, (table_name,))
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute(
-            "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES (?, ?)",
-            (table_name, default_last_id),
-        )
-        return default_last_id
-    return int(row[0])
-
-
 def _work_type_and_relation(esh_type):
-    """
-    Map source HRS_EshType to (WorkTypeCode, WorkRelationTypeCode).
-
-    دولتی(داخل شرکت)=1 → داخلی + مرتبط
-    other sector types → خارجی + matching industry WorkRelationType
-    """
     try:
         t = int(esh_type)
     except (TypeError, ValueError):
@@ -144,7 +100,6 @@ def _work_type_and_relation(esh_type):
 
 
 def _extra1_active_code(esh_active):
-    """Map HRS_EshActive → WorkRecordExtra1 (1=فعال, 2=غیرفعال)."""
     try:
         return WORK_RECORD_EXTRA1_ACTIVE if int(esh_active) == 1 else WORK_RECORD_EXTRA1_INACTIVE
     except (TypeError, ValueError):
@@ -152,7 +107,6 @@ def _extra1_active_code(esh_active):
 
 
 def _extra2_heading_code(heading_status):
-    """Map HRS_EshHeadingStatus → WorkRecordExtra2 (0/1/2)."""
     try:
         code = int(heading_status)
     except (TypeError, ValueError):
@@ -177,7 +131,6 @@ def _positive_fk(val):
 
 
 def _positive_score(val):
-    num = None
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     try:
@@ -187,188 +140,12 @@ def _positive_score(val):
     return num if num > 0 else None
 
 
-def _title_and_code(title_raw, code_raw, source_id, title_max=200, code_max=100):
-    title = clean_persian_text(title_raw)
-    if not title:
-        title = DEFAULT_TITLE
-    title = title[:title_max]
-
-    code = clean_value(code_raw)
-    if code is not None:
-        code = str(code).strip() or None
-    if not code or code == '0':
-        code = str(source_id)
-    code = code[:code_max]
-    return title, code
-
-
-def _unique_code_for_title(base_code, title, source_id, used_pairs, code_max=100):
-    """Ensure (Code, Title) is unique for HCM3.Department UIX_HCM3_Department_Code_Title."""
-    code = base_code[:code_max]
-    if (code, title) not in used_pairs:
-        return code
-    suffix = f"-{source_id}"
-    code = f"{base_code[:max(0, code_max - len(suffix))]}{suffix}"
-    if (code, title) not in used_pairs:
-        return code
-    # Last resort: source id alone
-    return str(source_id)[:code_max]
-
-
-def _active_status(active_raw):
-    try:
-        return 1 if int(float(active_raw)) == 1 else 2
-    except (TypeError, ValueError):
-        return 2
-
-
-def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
-    """Migrate TBL_Department -> HCM3.Department. Returns SourceDepartmentID -> DestDepartmentID."""
-    setup_department_mapping_table(dest_cursor)
-
-    source_df = pd.read_sql("""
-        SELECT
-            TBL_DepartmentID AS SourceDepartmentID,
-            TBL_DepartmentName AS DepartmentName,
-            TBL_DepartmentCode AS DepartmentCode,
-            TBL_DepartmentActive AS DepartmentActive
-        FROM dbo.TBL_Department
-        WHERE TBL_DepartmentID > 0
-    """, source_cnxn)
-
-    existing_df = pd.read_sql(
-        "SELECT SourceDepartmentID, DestDepartmentID FROM master.dbo.DepartmentMigrationMapping",
-        dest_cnxn,
-    )
-    result = {
-        int(row['SourceDepartmentID']): int(row['DestDepartmentID'])
-        for _, row in existing_df.iterrows()
-    }
-
-    if source_df.empty:
-        print("  -> No source departments found.")
-        return result
-
-    missing_df = source_df[~source_df['SourceDepartmentID'].isin(result.keys())]
-    if missing_df.empty:
-        print(f"  -> Departments already mapped: {len(result)}.")
-        return result
-
-    existing_pairs_df = pd.read_sql(
-        "SELECT Code, Title FROM HCM3.Department WHERE Code IS NOT NULL",
-        dest_cnxn,
-    )
-    used_pairs = {
-        (str(row['Code']), normalize_persian(str(row['Title'])) if row['Title'] else DEFAULT_TITLE)
-        for _, row in existing_pairs_df.iterrows()
-    }
-
-    last_id = _ensure_table_id(dest_cursor, 'HCM3.Department', 0)
-    insert_sql = """
-        INSERT INTO HCM3.Department (
-            DepartmentID, Code, Title, RegionalDivisionRef, Status,
-            CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, NULL, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    insert_mapping_sql = """
-        INSERT INTO master.dbo.DepartmentMigrationMapping (
-            SourceDepartmentID, DestDepartmentID
-        ) VALUES (?, ?)
-    """
-
-    inserted = 0
-    uniquified = 0
-    for _, row in missing_df.iterrows():
-        source_id = int(row['SourceDepartmentID'])
-        title, base_code = _title_and_code(
-            row['DepartmentName'], row['DepartmentCode'], source_id, title_max=200
-        )
-        code = _unique_code_for_title(base_code, title, source_id, used_pairs)
-        if code != base_code:
-            uniquified += 1
-        status = _active_status(row['DepartmentActive'])
-        last_id += 1
-        dest_cursor.execute(insert_sql, (last_id, code, title, status))
-        dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-        used_pairs.add((code, title))
-        result[source_id] = last_id
-        inserted += 1
-
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
-        (last_id,),
-    )
-    print(
-        f"  -> Departments inserted: {inserted} "
-        f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
-    )
-    return result
-
-
-def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
-    """Migrate TBL_Post -> HCM3.Post. Returns SourcePostID -> DestPostID."""
-    setup_post_mapping_table(dest_cursor)
-
-    source_df = pd.read_sql("""
-        SELECT
-            TBL_PostID AS SourcePostID,
-            TBL_PostTitle AS PostTitle,
-            TBL_PostCode AS PostCode,
-            TBL_PostActive AS PostActive
-        FROM dbo.TBL_Post
-        WHERE TBL_PostID > 0
-    """, source_cnxn)
-
-    existing_df = pd.read_sql(
-        "SELECT SourcePostID, DestPostID FROM master.dbo.PostMigrationMapping",
-        dest_cnxn,
-    )
-    result = {
-        int(row['SourcePostID']): int(row['DestPostID'])
-        for _, row in existing_df.iterrows()
-    }
-
-    if source_df.empty:
-        print("  -> No source posts found.")
-        return result
-
-    missing_df = source_df[~source_df['SourcePostID'].isin(result.keys())]
-    if missing_df.empty:
-        print(f"  -> Posts already mapped: {len(result)}.")
-        return result
-
-    last_id = _ensure_table_id(dest_cursor, 'HCM3.Post', 0)
-    insert_sql = """
-        INSERT INTO HCM3.Post (
-            PostID, Code, Title, TypeCode, RegionalDivisionRef, Status,
-            CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, NULL, NULL, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    insert_mapping_sql = """
-        INSERT INTO master.dbo.PostMigrationMapping (
-            SourcePostID, DestPostID
-        ) VALUES (?, ?)
-    """
-
-    inserted = 0
-    for _, row in missing_df.iterrows():
-        source_id = int(row['SourcePostID'])
-        title, code = _title_and_code(
-            row['PostTitle'], row['PostCode'], source_id, title_max=400
-        )
-        status = _active_status(row['PostActive'])
-        last_id += 1
-        dest_cursor.execute(insert_sql, (last_id, code, title, status))
-        dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-        result[source_id] = last_id
-        inserted += 1
-
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Post'",
-        (last_id,),
-    )
-    print(f"  -> Posts inserted: {inserted}. Total mapped: {len(result)}.")
-    return result
+def _insurance_duration(insurance_raw, duration_raw):
+    """Prefer source insurance duration when >0; otherwise fall back to Duration."""
+    insurance = _as_int_or_none(insurance_raw)
+    if insurance is not None and insurance > 0:
+        return insurance
+    return _as_int_or_none(duration_raw)
 
 
 def _resolve_org_fks(row, dept_map, post_map):
@@ -414,6 +191,7 @@ def run():
                 esh.TBL_DegreeID_fk AS SourceDegreeID,
                 esh.TBL_DepartmentID_fk AS SourceDepartmentID,
                 esh.TBL_PostID_fk AS SourcePostID,
+                esh.TBL_JobID_fk AS SourceJobID,
                 j.TBL_JobName AS JobName,
                 d.TBL_DegreeName AS DegreeName
             FROM dbo.HRS_EmploymentServiceHistory esh
@@ -427,6 +205,13 @@ def run():
             print("No employment service history rows found.")
             dest_cnxn.commit()
             return
+
+        print("Migrating Jobs referenced by ESH...")
+        job_ids = [
+            int(j) for j in source_df['SourceJobID'].dropna().unique()
+            if _positive_fk(j)
+        ]
+        job_map = ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=job_ids)
 
         print("Fetching company titles...")
         company_df = pd.read_sql("""
@@ -499,28 +284,30 @@ def run():
         )
 
         print("Preparing ID generator...")
-        work_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeWorkRecord', 0)
+        work_last_id = ensure_table_id(dest_cursor, 'HCM3.EmployeeWorkRecord', 0)
 
         insert_sql = """
             INSERT INTO HCM3.EmployeeWorkRecord (
                 EmployeeWorkRecordID, EmployeeRef, WorkTypeCode, OrgName, Role,
                 WorkRelationTypeCode, EducationDegreeCode, StartDate, EndDate,
                 EffectiveDate, Duration, InsuranceDuration, Score, Description,
-                PostRef, DepartmentRef, Extra1Code, Extra2Code,
+                PostRef, DepartmentRef, JobRef, Extra1Code, Extra2Code,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
         insert_mapping_sql = """
             INSERT INTO master.dbo.WorkRecordMigrationMapping (
                 SourceEmploymentServiceHistoryID, DestEmployeeWorkRecordID
             ) VALUES (?, ?)
         """
-        update_type_sql = """
+        update_mapped_sql = """
             UPDATE HCM3.EmployeeWorkRecord
             SET WorkTypeCode = ?,
                 WorkRelationTypeCode = ?,
                 Extra1Code = ?,
                 Extra2Code = ?,
+                InsuranceDuration = ?,
+                JobRef = ?,
                 LastModificationDate = GETDATE(),
                 LastModifier = 1
             WHERE EmployeeWorkRecordID = ?
@@ -532,6 +319,7 @@ def run():
         defaulted_org = 0
         defaulted_degree = 0
         defaulted_effective = 0
+        insurance_from_duration = 0
         today_str = date.today().strftime('%Y-%m-%d')
 
         print(f"Inserting EmployeeWorkRecord records ({len(work_df)} candidates)...")
@@ -541,11 +329,31 @@ def run():
             extra1_code = _extra1_active_code(row['EshActive'])
             extra2_code = _extra2_heading_code(row['HeadingStatus'])
 
+            duration = _as_int_or_none(row['Duration'])
+            insurance_raw = _as_int_or_none(row['InsuranceDuration'])
+            insurance_duration = _insurance_duration(row['InsuranceDuration'], row['Duration'])
+            if (
+                (insurance_raw is None or insurance_raw <= 0)
+                and insurance_duration is not None
+            ):
+                insurance_from_duration += 1
+
+            source_job_id = _positive_fk(row.get('SourceJobID'))
+            job_ref = job_map.get(source_job_id) if source_job_id else None
+
             if source_id in already_mapped:
                 dest_wr_id = already_mapped[source_id]
                 dest_cursor.execute(
-                    update_type_sql,
-                    (work_type_code, work_relation_code, extra1_code, extra2_code, dest_wr_id),
+                    update_mapped_sql,
+                    (
+                        work_type_code,
+                        work_relation_code,
+                        extra1_code,
+                        extra2_code,
+                        insurance_duration,
+                        job_ref,
+                        dest_wr_id,
+                    ),
                 )
                 types_corrected += 1
                 skipped_already_mapped += 1
@@ -568,7 +376,11 @@ def run():
 
             start_date = _parse_shamsi_date(row['StartDate'])
             end_raw = row['EndDate']
-            end_text = str(end_raw).strip().split()[0] if end_raw is not None and not (isinstance(end_raw, float) and pd.isna(end_raw)) else ''
+            end_text = (
+                str(end_raw).strip().split()[0]
+                if end_raw is not None and not (isinstance(end_raw, float) and pd.isna(end_raw))
+                else ''
+            )
             if end_text == OPEN_END_SHAMSI:
                 end_date = None
                 open_ended_ends += 1
@@ -580,10 +392,7 @@ def run():
                 effective_date = today_str
                 defaulted_effective += 1
 
-            duration = _as_int_or_none(row['Duration'])
-            insurance_duration = _as_int_or_none(row['InsuranceDuration'])
             score = _positive_score(row['Score'])
-
             description = clean_persian_text(row['Note'])
 
             degree_code = DEFAULT_DEGREE_CODE
@@ -614,6 +423,7 @@ def run():
                 description,
                 post_ref,
                 department_ref,
+                job_ref,
                 extra1_code,
                 extra2_code,
             ))
@@ -629,10 +439,11 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! Work records inserted: {inserted}. "
-            f"Types/Extra corrected: {types_corrected}. "
+            f"Types/insurance/job corrected: {types_corrected}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Open-ended ends: {open_ended_ends}. "
+            f"Insurance from duration: {insurance_from_duration}. "
             f"Defaulted org: {defaulted_org}. "
             f"Defaulted degree: {defaulted_degree}. "
             f"Defaulted effective date: {defaulted_effective}."

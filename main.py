@@ -11,6 +11,10 @@ from steps import (
     step_06_training,
     step_07_work_record,
     step_08_warrior_record,
+    step_09_org_masters,
+    step_10_org_structure,
+    step_11_employee_statute,
+    step_12_work_record_from_statute,
 )
 
 def get_config_path():
@@ -84,6 +88,26 @@ def main():
             step_08_warrior_record.run()
         else:
             print("\n--- Skipping Step 8: Warrior Record Migration ---")
+
+        if steps_to_run.get("9_org_masters", False):
+            step_09_org_masters.run()
+        else:
+            print("\n--- Skipping Step 9: Organization Masters Migration ---")
+
+        if steps_to_run.get("10_org_structure", False):
+            step_10_org_structure.run()
+        else:
+            print("\n--- Skipping Step 10: Organizational Structure Migration ---")
+
+        if steps_to_run.get("11_employee_statute", False):
+            step_11_employee_statute.run()
+        else:
+            print("\n--- Skipping Step 11: Employee Statute Migration ---")
+
+        if steps_to_run.get("12_work_record_from_statute", False):
+            step_12_work_record_from_statute.run()
+        else:
+            print("\n--- Skipping Step 12: Work Record from Statute Propagation ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")

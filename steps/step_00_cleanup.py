@@ -12,12 +12,18 @@ from db_core import get_connections
 warnings.filterwarnings('ignore', category=UserWarning)
 
 # Mapping table name -> (dest schema.table, dest PK, mapping dest-ID column)
+# Children before parents (statutes before structure; WR before masters they reference).
 DELETE_BY_MAPPING = (
     ('WarriorMigrationMapping', 'HCM3.EmployeeWarriorRecord', 'EmployeeWarriorRecordID', 'DestEmployeeWarriorRecordID'),
     ('WorkRecordMigrationMapping', 'HCM3.EmployeeWorkRecord', 'EmployeeWorkRecordID', 'DestEmployeeWorkRecordID'),
+    ('StatuteMigrationMapping', 'HCM3.EmployeeStatute', 'EmployeeStatuteID', 'DestEmployeeStatuteID'),
+    ('OrgStructureMigrationMapping', 'HCM3.OrganizationalStructure', 'OrganizationalStructureID', 'DestOrganizationalStructureID'),
     ('TrainingMigrationMapping', 'HCM3.EmployeeTraining', 'EmployeeTrainingID', 'DestEmployeeTrainingID'),
     ('RelativeMigrationMapping', 'HCM3.EmployeeRelative', 'EmployeeRelativeID', 'DestEmployeeRelativeID'),
     ('EducationMigrationMapping', 'HCM3.EmployeeEducation', 'EmployeeEducationID', 'DestEmployeeEducationID'),
+    ('StatuteTypeMigrationMapping', 'HCM3.StatuteType', 'StatuteTypeID', 'DestStatuteTypeID'),
+    ('JobMigrationMapping', 'HCM3.Job', 'JobID', 'DestJobID'),
+    ('EmploymentTypeMigrationMapping', 'HCM3.EmploymentType', 'EmploymentTypeID', 'DestEmploymentTypeID'),
     ('PostMigrationMapping', 'HCM3.Post', 'PostID', 'DestPostID'),
     ('DepartmentMigrationMapping', 'HCM3.Department', 'DepartmentID', 'DestDepartmentID'),
 )
@@ -25,10 +31,16 @@ DELETE_BY_MAPPING = (
 MAPPING_TABLES_TO_CLEAR = (
     'WarriorMigrationMapping',
     'WorkRecordMigrationMapping',
+    'StatuteMigrationMapping',
+    'OrgStructureMigrationMapping',
+    'StatuteTypeMigrationMapping',
     'TrainingMigrationMapping',
     'RelativeMigrationMapping',
     'EducationMigrationMapping',
     'MilitaryMigrationMapping',
+    'JobMigrationMapping',
+    'EmploymentTypeMigrationMapping',
+    'PlaceMigrationMapping',
     'PostMigrationMapping',
     'DepartmentMigrationMapping',
     'PartyMigrationMapping',
@@ -170,6 +182,17 @@ def run():
         _delete_migrated_marriages(dest_cursor)
 
         print("Deleting mapped child / org records...")
+        # Break self-FK on org structure before delete
+        if _mapping_exists(dest_cursor, 'OrgStructureMigrationMapping'):
+            dest_cursor.execute("""
+                UPDATE os
+                SET os.ParentRef = NULL
+                FROM HCM3.OrganizationalStructure os
+                INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                    ON os.OrganizationalStructureID = m.DestOrganizationalStructureID
+            """)
+            print(f"  -> OrganizationalStructure ParentRef cleared: {dest_cursor.rowcount}")
+
         for mapping_table, dest_table, dest_pk, mapping_col in DELETE_BY_MAPPING:
             _delete_by_mapping(dest_cursor, mapping_table, dest_table, dest_pk, mapping_col)
 
