@@ -45,6 +45,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'ResearchMigrationMapping',
     'RewardPunishMigrationMapping',
     'AppraisalMigrationMapping',
+    'AddressMigrationMapping',
     'TrainingMigrationMapping',
     'RelativeInsuranceMigrationMapping',
     'RelativeMigrationMapping',
@@ -133,6 +134,26 @@ def _delete_by_mapping(cursor, mapping_table, dest_table, dest_pk, mapping_col):
         INNER JOIN master.dbo.{mapping_table} m
             ON d.{dest_pk} = m.{mapping_col}
     """)
+
+
+def _delete_migrated_addresses(cursor):
+    """Delete PartyAddress then Address created by address migration."""
+    if not _mapping_exists(cursor, 'AddressMigrationMapping'):
+        print("  -> AddressMigrationMapping not found, skip addresses.")
+        return 0
+    pa = _delete_joined(cursor, 'PartyAddress (migrated)', """
+        DELETE pa
+        FROM GNR3.PartyAddress pa
+        INNER JOIN master.dbo.AddressMigrationMapping m
+            ON pa.PartyAddressID = m.DestPartyAddressID
+    """)
+    addr = _delete_joined(cursor, 'Address (migrated)', """
+        DELETE a
+        FROM GNR3.Address a
+        INNER JOIN master.dbo.AddressMigrationMapping m
+            ON a.AddressID = m.DestAddressID
+    """)
+    return pa + addr
 
 
 def _prepare_org_structure_delete(cursor):
@@ -363,6 +384,9 @@ def run():
                 _delete_by_mapping(
                     dest_cursor, mapping_table, dest_table, dest_pk, mapping_col
                 )
+
+        print("Deleting migrated party addresses...")
+        _delete_migrated_addresses(dest_cursor)
 
         print("Clearing FKs onto masters before master delete...")
         _null_master_fks_before_delete(dest_cursor)

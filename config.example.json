@@ -17,6 +17,7 @@
         "12_work_record_from_statute": true,
         "13_employee_research": true,
         "14_employee_reward_punish": true,
-        "15_employee_appraisal": true
+        "15_employee_appraisal": true,
+        "16_party_address": true
     }
 }

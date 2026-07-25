@@ -18,6 +18,7 @@ from steps import (
     step_13_employee_research,
     step_14_employee_reward_punish,
     step_15_employee_appraisal,
+    step_16_party_address,
 )
 
 def get_config_path():
@@ -126,6 +127,11 @@ def main():
             step_15_employee_appraisal.run()
         else:
             print("\n--- Skipping Step 15: Evaluation → EmployeeAppraisal ---")
+
+        if steps_to_run.get("16_party_address", False):
+            step_16_party_address.run()
+        else:
+            print("\n--- Skipping Step 16: Party Address Migration ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
