@@ -18,6 +18,7 @@
         "13_employee_research": true,
         "14_employee_reward_punish": true,
         "15_employee_appraisal": true,
-        "16_party_address": true
+        "16_party_address": true,
+        "17_statute_factor": true
     }
 }

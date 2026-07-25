@@ -29,6 +29,7 @@ DELETE_BY_MAPPING = (
     ('RelativeMigrationMapping', 'HCM3.EmployeeRelative', 'EmployeeRelativeID', 'DestEmployeeRelativeID'),
     ('EducationMigrationMapping', 'HCM3.EmployeeEducation', 'EmployeeEducationID', 'DestEmployeeEducationID'),
     ('StatuteTypeMigrationMapping', 'HCM3.StatuteType', 'StatuteTypeID', 'DestStatuteTypeID'),
+    ('StatuteFactorMigrationMapping', 'HCM3.StatuteFactor', 'StatuteFactorID', 'DestStatuteFactorID'),
     ('JobMigrationMapping', 'HCM3.Job', 'JobID', 'DestJobID'),
     ('EmploymentTypeMigrationMapping', 'HCM3.EmploymentType', 'EmploymentTypeID', 'DestEmploymentTypeID'),
     ('PostMigrationMapping', 'HCM3.Post', 'PostID', 'DestPostID'),
@@ -42,6 +43,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'OrgStructureMigrationMapping',
     'OrgStructureDescriptionMigrationMapping',
     'StatuteTypeMigrationMapping',
+    'StatuteFactorMigrationMapping',
     'ResearchMigrationMapping',
     'RewardPunishMigrationMapping',
     'AppraisalMigrationMapping',
@@ -154,6 +156,52 @@ def _delete_migrated_addresses(cursor):
             ON a.AddressID = m.DestAddressID
     """)
     return pa + addr
+
+
+def _delete_migrated_statute_factors(cursor):
+    """
+    Delete dependents of migrated StatuteFactors, then the factors themselves.
+    Safe when property/value steps are added later.
+    """
+    if not _mapping_exists(cursor, 'StatuteFactorMigrationMapping'):
+        print("  -> StatuteFactorMigrationMapping not found, skip statute factors.")
+        return 0
+
+    for label, sql in (
+        ('EmployeeStatuteFactor (migrated factors)', """
+            DELETE esf
+            FROM HCM3.EmployeeStatuteFactor esf
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON esf.StatuteFactorRef = m.DestStatuteFactorID
+        """),
+        ('StatuteTypeFactor (migrated factors)', """
+            DELETE stf
+            FROM HCM3.StatuteTypeFactor stf
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON stf.StatuteFactorRef = m.DestStatuteFactorID
+        """),
+        ('StatuteFactorProperty (migrated factors)', """
+            DELETE sfp
+            FROM HCM3.StatuteFactorProperty sfp
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON sfp.StatuteFactorRef = m.DestStatuteFactorID
+        """),
+        ('StatuteFactorDisplayOrder (migrated factors)', """
+            DELETE o
+            FROM HCM3.StatuteFactorDisplayOrder o
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON o.StatuteFactorRef = m.DestStatuteFactorID
+        """),
+    ):
+        _delete_joined(cursor, label, sql)
+
+    return _delete_by_mapping(
+        cursor,
+        'StatuteFactorMigrationMapping',
+        'HCM3.StatuteFactor',
+        'StatuteFactorID',
+        'DestStatuteFactorID',
+    )
 
 
 def _prepare_org_structure_delete(cursor):
@@ -390,6 +438,9 @@ def run():
 
         print("Clearing FKs onto masters before master delete...")
         _null_master_fks_before_delete(dest_cursor)
+
+        print("Deleting migrated statute factors...")
+        _delete_migrated_statute_factors(dest_cursor)
 
         print("Deleting mapped masters (statute type / job / ET / post / dept)...")
         master_tables = {
