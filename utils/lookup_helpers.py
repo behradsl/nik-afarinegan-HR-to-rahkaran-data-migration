@@ -1,6 +1,14 @@
 import pandas as pd
 from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 
+# Matches destination app / SYS3.tableIdGen key (Version is SQL timestamp — never insert it).
+LOOKUP_IDGEN_TABLE = 'Sys3.Lookup'
+LOOKUP_INSERT_SQL = """
+    INSERT INTO SYS3.Lookup (
+        LookupID, Type, Code, Value, DisplayOrder, Extra, System, CanEdit, CanDelete
+    ) VALUES (?, ?, ?, ?, ?, N'', 'HCM3', 1, 1)
+"""
+
 
 def setup_degree_mapping_table(cursor):
     """Creates DegreeMigrationMapping in master if it does not exist."""
@@ -18,21 +26,73 @@ def setup_degree_mapping_table(cursor):
     cursor.commit()
 
 
+def repair_lookup_extra(dest_cursor, lookup_type=None):
+    """
+    App UI inserts Extra as empty string; NULL Extra can break lookup screens.
+    Version is rowversion/timestamp — left untouched.
+    """
+    if lookup_type:
+        dest_cursor.execute(
+            """
+            UPDATE SYS3.Lookup
+            SET Extra = N''
+            WHERE Extra IS NULL AND Type = ?
+            """,
+            (lookup_type,),
+        )
+    else:
+        dest_cursor.execute(
+            """
+            UPDATE SYS3.Lookup
+            SET Extra = N''
+            WHERE Extra IS NULL AND System = N'HCM3'
+            """
+        )
+    repaired = dest_cursor.rowcount if dest_cursor.rowcount is not None else 0
+    if repaired:
+        print(f"  -> Repaired Extra on {repaired} Lookup row(s).")
+    return repaired
+
+
+def _next_lookup_id(dest_cursor):
+    dest_cursor.execute(
+        """
+        SELECT LastId
+        FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK)
+        WHERE TableName = ?
+        """,
+        (LOOKUP_IDGEN_TABLE,),
+    )
+    id_row = dest_cursor.fetchone()
+    current_last_id = int(id_row[0]) if id_row else 10000
+    return current_last_id, id_row is not None
+
+
+def _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists):
+    if idgen_exists:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
+            (current_last_id, LOOKUP_IDGEN_TABLE),
+        )
+    else:
+        dest_cursor.execute(
+            "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES (?, ?)",
+            (LOOKUP_IDGEN_TABLE, current_last_id),
+        )
+
+
 def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
     """
     Ensure fixed Code→Value pairs exist in SYS3.Lookup for lookup_type.
     Inserts any missing Code with IF NOT EXISTS (does not overwrite existing).
     Returns dict: code (int) -> value (str) for the requested codes after ensure.
     """
+    repair_lookup_extra(dest_cursor, lookup_type)
+
     result = {}
     inserted = 0
 
-    dest_cursor.execute(
-        "SELECT LastId FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK) WHERE TableName = 'sys3.lookup'"
-    )
-    id_row = dest_cursor.fetchone()
-    current_last_id = int(id_row[0]) if id_row else 10000
-    idgen_exists = id_row is not None
+    current_last_id, idgen_exists = _next_lookup_id(dest_cursor)
 
     for code, value in sorted((int(c), v) for c, v in code_to_value.items()):
         value = normalize_persian(value) if value else value
@@ -51,11 +111,7 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
 
         current_last_id += 1
         dest_cursor.execute(
-            """
-            INSERT INTO SYS3.Lookup (
-                LookupID, Type, Code, Value, DisplayOrder, System, CanEdit, CanDelete
-            ) VALUES (?, ?, ?, ?, ?, 'HCM3', 1, 1)
-            """,
+            LOOKUP_INSERT_SQL,
             (current_last_id, lookup_type, code, value, max(code - 1, 0)),
         )
         result[code] = value
@@ -63,16 +119,7 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
 
     if inserted:
         print(f"  -> Added {inserted} missing {lookup_type} code(s).")
-        if idgen_exists:
-            dest_cursor.execute(
-                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'sys3.lookup'",
-                (current_last_id,),
-            )
-        else:
-            dest_cursor.execute(
-                "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES ('sys3.lookup', ?)",
-                (current_last_id,),
-            )
+        _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists)
     elif not result:
         # Nothing inserted and nothing found — still return requested defaults
         result = {int(c): normalize_persian(v) for c, v in code_to_value.items()}
@@ -85,6 +132,8 @@ def sync_lookup(dest_cnxn, dest_cursor, lookup_type, unique_values):
     Ensures each value exists in SYS3.Lookup for the given Type.
     Returns dict: normalized name -> Code (int).
     """
+    repair_lookup_extra(dest_cursor, lookup_type)
+
     lookup_df = pd.read_sql(
         f"SELECT Code, Value FROM SYS3.Lookup WHERE Type = '{lookup_type}'",
         dest_cnxn,
@@ -99,38 +148,18 @@ def sync_lookup(dest_cnxn, dest_cursor, lookup_type, unique_values):
     if missing_values:
         print(f"  -> Found {len(missing_values)} missing {lookup_type}s. Adding to SYS3.Lookup...")
 
-        dest_cursor.execute(
-            "SELECT LastId FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK) WHERE TableName = 'sys3.lookup'"
-        )
-        id_row = dest_cursor.fetchone()
-
-        current_last_id = int(id_row[0]) if id_row else 10000
+        current_last_id, idgen_exists = _next_lookup_id(dest_cursor)
         max_code = int(lookup_df['Code'].max()) if not lookup_df.empty else 0
-
-        insert_lookup_sql = """
-            INSERT INTO SYS3.Lookup (
-                LookupID, Type, Code, Value, DisplayOrder, System, CanEdit, CanDelete
-            ) VALUES (?, ?, ?, ?, ?, 'HCM3', 1, 1)
-        """
 
         for val in missing_values:
             current_last_id += 1
             max_code += 1
-            dest_cursor.execute(insert_lookup_sql, (
+            dest_cursor.execute(LOOKUP_INSERT_SQL, (
                 current_last_id, lookup_type, max_code, val, max_code - 1
             ))
             existing_map[val] = max_code
 
-        if id_row:
-            dest_cursor.execute(
-                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'sys3.lookup'",
-                (current_last_id,),
-            )
-        else:
-            dest_cursor.execute(
-                "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES ('sys3.lookup', ?)",
-                (current_last_id,),
-            )
+        _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists)
 
     return existing_map
 
