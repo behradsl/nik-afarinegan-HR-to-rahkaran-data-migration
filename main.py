@@ -15,6 +15,8 @@ from steps import (
     step_10_org_structure,
     step_11_employee_statute,
     step_12_work_record_from_statute,
+    step_13_employee_research,
+    step_14_employee_reward_punish,
 )
 
 def get_config_path():
@@ -108,6 +110,16 @@ def main():
             step_12_work_record_from_statute.run()
         else:
             print("\n--- Skipping Step 12: Work Record from Statute Propagation ---")
+
+        if steps_to_run.get("13_employee_research", False):
+            step_13_employee_research.run()
+        else:
+            print("\n--- Skipping Step 13: Other Extras → EmployeeResearch ---")
+
+        if steps_to_run.get("14_employee_reward_punish", False):
+            step_14_employee_reward_punish.run()
+        else:
+            print("\n--- Skipping Step 14: Abet → EmployeeRewardPunish ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
