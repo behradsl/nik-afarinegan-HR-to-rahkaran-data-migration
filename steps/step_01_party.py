@@ -41,6 +41,7 @@ def run():
             TBL_PersonnelBirthDate AS BirthDate,
             TBL_PersonnelMobileNo AS Mobile,
             TBL_PersonnelTelNo AS Tel,
+            TBL_PersonnelIdentifyNo AS IDNumber,
             TBL_PersonnelIdentifySerialNo AS IDSerial,
             TBL_PersonnelBirthPLace AS BirthPlace,
             TBL_PersonnelExportPlace AS ExportPlace,
@@ -51,10 +52,15 @@ def run():
     source_df = pd.read_sql(source_query, source_cnxn)
 
     print("Fetching Destination Deduplication Keys...")
-    mapped_ids = set(
-        int(x) for x in
-        pd.read_sql("SELECT SourceID FROM master.dbo.PartyMigrationMapping", dest_cnxn)['SourceID'].tolist()
+    mapped_df = pd.read_sql(
+        "SELECT SourceID, DestPartyID FROM master.dbo.PartyMigrationMapping",
+        dest_cnxn,
     )
+    already_map = {
+        int(r['SourceID']): int(r['DestPartyID'])
+        for _, r in mapped_df.iterrows()
+    }
+    mapped_ids = set(already_map.keys())
     dest_party_df = pd.read_sql("""
         SELECT
             PartyID,
@@ -90,10 +96,20 @@ def run():
 
     to_insert = []
     to_link = []  # (SourceID, DestPartyID)
+    to_backfill_idnumber = []  # (IDNumber, DestPartyID)
 
     for _, row in source_df.iterrows():
         source_id = int(row['SourceID'])
-        if source_id in mapped_ids:
+        id_number = clean_value(row['IDNumber'])
+        if id_number is not None:
+            id_number = str(id_number).strip() or None
+            if id_number and len(id_number) > 20:
+                id_number = id_number[:20]
+
+        # Already mapped: backfill IDNumber on re-run
+        if source_id in already_map:
+            if id_number:
+                to_backfill_idnumber.append((id_number, already_map[source_id]))
             continue
 
         first_name = clean_persian_text(row['FirstName'])
@@ -114,6 +130,8 @@ def run():
 
         if existing_party_id is not None:
             to_link.append((source_id, existing_party_id))
+            if id_number:
+                to_backfill_idnumber.append((id_number, existing_party_id))
             mapped_ids.add(source_id)
             continue
 
@@ -139,12 +157,13 @@ def run():
             'IssuancePlaceRef': city_map.get(export_place) if export_place else None,
             'Mobile': clean_value(row['Mobile']),
             'Tel': clean_value(row['Tel']),
+            'IDNumber': id_number,
             'IDSerial': clean_value(row['IDSerial']),
             'Gender': gender,
             'MaritalStatus': marital_status,
         })
 
-    if not to_insert and not to_link:
+    if not to_insert and not to_link and not to_backfill_idnumber:
         print("No new Party records to migrate.")
         source_cnxn.close()
         dest_cnxn.close()
@@ -154,6 +173,13 @@ def run():
         insert_mapping_sql = """
             INSERT INTO master.dbo.PartyMigrationMapping (SourceID, DestPartyID)
             VALUES (?, ?)
+        """
+        update_idnumber_sql = """
+            UPDATE GNR3.Party
+            SET IDNumber = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE PartyID = ?
         """
 
         linked = 0
@@ -175,9 +201,10 @@ def run():
             insert_party_sql = """
                 INSERT INTO GNR3.Party (
                     PartyID, FirstName, LastName, NationalID, FatherName, BirthDate,
-                    BirthPlaceRef, IssuancePlaceRef, Mobile, Tel, IDSerial, Gender, MaritalStatus,
+                    BirthPlaceRef, IssuancePlaceRef, Mobile, Tel, IDNumber, IDSerial,
+                    Gender, MaritalStatus,
                     CreationDate, Creator, LastModificationDate, LastModifier, Type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
             """
 
             for record in to_insert:
@@ -188,7 +215,7 @@ def run():
                     new_party_id, record['FirstName'], record['LastName'], record['NationalID'],
                     record['FatherName'], record['BirthDate'], record['BirthPlaceRef'],
                     record['IssuancePlaceRef'], record['Mobile'], record['Tel'],
-                    record['IDSerial'], record['Gender'], record['MaritalStatus'],
+                    record['IDNumber'], record['IDSerial'], record['Gender'], record['MaritalStatus'],
                 ))
                 dest_cursor.execute(insert_mapping_sql, (record['SourceID'], new_party_id))
                 inserted += 1
@@ -199,10 +226,16 @@ def run():
                 WHERE TableName = 'gnr3.party'
             """, (current_last_id,))
 
+        backfilled = 0
+        for id_number, dest_party_id in to_backfill_idnumber:
+            dest_cursor.execute(update_idnumber_sql, (id_number, dest_party_id))
+            backfilled += 1
+
         dest_cnxn.commit()
         print(
             f"Success! Party inserted: {inserted}. "
-            f"Linked existing parties: {linked}."
+            f"Linked existing parties: {linked}. "
+            f"IDNumber backfilled: {backfilled}."
             + (f" New Party LastId is {current_last_id}." if current_last_id is not None else "")
         )
 
