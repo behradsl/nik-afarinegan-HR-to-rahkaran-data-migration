@@ -17,6 +17,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 # Mapping table -> (dest table, dest PK, mapping dest-ID column)
 # Children / dependents before parents / masters.
 DELETE_BY_MAPPING = (
+    ('PersonnelImageMigrationMapping', 'HCM3.EmployeeSupplementary', 'EmployeeSupplementaryID', 'DestEmployeeSupplementaryID'),
     ('WarriorMigrationMapping', 'HCM3.EmployeeWarriorRecord', 'EmployeeWarriorRecordID', 'DestEmployeeWarriorRecordID'),
     ('WorkRecordMigrationMapping', 'HCM3.EmployeeWorkRecord', 'EmployeeWorkRecordID', 'DestEmployeeWorkRecordID'),
     ('StatuteMigrationMapping', 'HCM3.EmployeeStatute', 'EmployeeStatuteID', 'DestEmployeeStatuteID'),
@@ -48,6 +49,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'RewardPunishMigrationMapping',
     'AppraisalMigrationMapping',
     'AddressMigrationMapping',
+    'PersonnelImageMigrationMapping',
     'TrainingMigrationMapping',
     'RelativeInsuranceMigrationMapping',
     'RelativeMigrationMapping',
@@ -413,6 +415,7 @@ def run():
         print("Deleting mapped child records (history / statutes / structure)...")
         # Delete through OrgStructure in DELETE_BY_MAPPING; stop before masters
         child_tables = {
+            'PersonnelImageMigrationMapping',
             'WarriorMigrationMapping',
             'WorkRecordMigrationMapping',
             'StatuteMigrationMapping',

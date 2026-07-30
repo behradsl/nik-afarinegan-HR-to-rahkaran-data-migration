@@ -20,6 +20,7 @@ from steps import (
     step_15_employee_appraisal,
     step_16_party_address,
     step_17_statute_factor,
+    step_18_employee_photo,
 )
 
 def get_config_path():
@@ -138,6 +139,11 @@ def main():
             step_17_statute_factor.run()
         else:
             print("\n--- Skipping Step 17: Statute Factor Migration ---")
+
+        if steps_to_run.get("18_employee_photo", False):
+            step_18_employee_photo.run()
+        else:
+            print("\n--- Skipping Step 18: Personnel Photo Migration ---")
             
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
