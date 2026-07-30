@@ -81,16 +81,18 @@ def _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists):
         )
 
 
-def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
+def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, overwrite_values=False):
     """
     Ensure fixed Code→Value pairs exist in SYS3.Lookup for lookup_type.
-    Inserts any missing Code with IF NOT EXISTS (does not overwrite existing).
+    Inserts missing codes. When overwrite_values=True, also updates Value on
+    existing codes when it differs (after Persian normalize).
     Returns dict: code (int) -> value (str) for the requested codes after ensure.
     """
     repair_lookup_extra(dest_cursor, lookup_type)
 
     result = {}
     inserted = 0
+    updated = 0
 
     current_last_id, idgen_exists = _next_lookup_id(dest_cursor)
 
@@ -106,7 +108,24 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
         )
         row = dest_cursor.fetchone()
         if row:
-            result[code] = row[1]
+            existing_value = row[1]
+            if (
+                overwrite_values
+                and value is not None
+                and normalize_persian(existing_value or '') != value
+            ):
+                dest_cursor.execute(
+                    """
+                    UPDATE SYS3.Lookup
+                    SET Value = ?, Extra = N''
+                    WHERE Type = ? AND Code = ?
+                    """,
+                    (value, lookup_type, code),
+                )
+                updated += 1
+                result[code] = value
+            else:
+                result[code] = existing_value
             continue
 
         current_last_id += 1
@@ -120,6 +139,8 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value):
     if inserted:
         print(f"  -> Added {inserted} missing {lookup_type} code(s).")
         _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists)
+    if updated:
+        print(f"  -> Updated Value on {updated} existing {lookup_type} code(s).")
     elif not result:
         # Nothing inserted and nothing found — still return requested defaults
         result = {int(c): normalize_persian(v) for c, v in code_to_value.items()}

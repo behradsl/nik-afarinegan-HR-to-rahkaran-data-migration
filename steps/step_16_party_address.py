@@ -1,9 +1,13 @@
 """
 Step 16: Migrate TBL_Personnel home addresses into GNR3.Address + PartyAddress.
 
-Only personnel with TBL_PersonnelAddressHome.
-Name = منزل, Phone = '-', city from first word of address (Type=city RD),
-fallback RegionalDivision = کرمانشاه city.
+1) Personnel with TBL_PersonnelAddressHome:
+   Name=منزل, Phone='-', city from first word of address (Type=city RD),
+   fallback RegionalDivision = کرمانشاه city; Zip from postal when present.
+
+2) Personnel with postal code but no home address:
+   Name=منزل, Details='-', Phone='-', RegionalDivision = ایران (country),
+   ZipCode = postal code.
 """
 import pandas as pd
 import warnings
@@ -14,8 +18,11 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 ADDRESS_NAME = 'منزل'
 DEFAULT_PHONE = '-'
+DEFAULT_DETAILS = '-'
 DEFAULT_CITY_NAME = 'کرمانشاه'
+DEFAULT_COUNTRY_NAME = 'ایران'
 RD_TYPE_CITY = 3
+RD_TYPE_COUNTRY = 1
 
 
 def setup_address_mapping_table(cursor):
@@ -61,6 +68,18 @@ def _first_word(address_text):
     return parts[0] if parts else None
 
 
+def _clean_postal(raw):
+    zip_code = clean_persian_text(raw)
+    if zip_code in (None, '0'):
+        return None
+    return zip_code[:32] if zip_code else None
+
+
+def _has_home_address(raw):
+    text = clean_persian_text(raw)
+    return bool(text) and text != '0'
+
+
 def _load_city_name_map(dest_cnxn):
     """normalized city name -> smallest RegionalDivisionID (Type=city)."""
     cities = pd.read_sql(f"""
@@ -96,6 +115,55 @@ def _default_kermanshah_city_id(dest_cursor, city_map):
     return int(row[0])
 
 
+def _iran_country_id(dest_cursor):
+    dest_cursor.execute("""
+        SELECT TOP 1 RegionalDivisionID
+        FROM GNR3.RegionalDivision
+        WHERE Type = ?
+          AND (Name = ? OR Name LIKE N'%' + ? + N'%')
+        ORDER BY
+            CASE WHEN Name = ? THEN 0 ELSE 1 END,
+            RegionalDivisionID
+    """, (RD_TYPE_COUNTRY, DEFAULT_COUNTRY_NAME, DEFAULT_COUNTRY_NAME, DEFAULT_COUNTRY_NAME))
+    row = dest_cursor.fetchone()
+    if not row:
+        raise RuntimeError("Country RegionalDivision ایران (Type=country) not found.")
+    return int(row[0])
+
+
+def _insert_party_address(
+    dest_cursor,
+    *,
+    address_last_id,
+    party_address_last_id,
+    source_id,
+    party_id,
+    details,
+    zip_code,
+    regional_division_id,
+    insert_address_sql,
+    insert_party_address_sql,
+    insert_mapping_sql,
+):
+    dest_cursor.execute(insert_address_sql, (
+        address_last_id,
+        ADDRESS_NAME,
+        details,
+        zip_code,
+        DEFAULT_PHONE,
+        int(regional_division_id),
+    ))
+    dest_cursor.execute(insert_party_address_sql, (
+        party_address_last_id,
+        int(party_id),
+        address_last_id,
+    ))
+    dest_cursor.execute(
+        insert_mapping_sql,
+        (source_id, address_last_id, party_address_last_id),
+    )
+
+
 def run():
     print("\n--- Running Step 16: Party Address Migration ---")
 
@@ -105,12 +173,16 @@ def run():
     try:
         setup_address_mapping_table(dest_cursor)
 
-        print("Loading destination city RegionalDivisions...")
+        print("Loading destination RegionalDivisions...")
         city_map = _load_city_name_map(dest_cnxn)
         default_city_id = _default_kermanshah_city_id(dest_cursor, city_map)
-        print(f"  -> Cities loaded: {len(city_map)}. Default city ID={default_city_id}.")
+        iran_id = _iran_country_id(dest_cursor)
+        print(
+            f"  -> Cities loaded: {len(city_map)}. "
+            f"Default city ID={default_city_id}. Iran country ID={iran_id}."
+        )
 
-        print("Fetching personnel with home address + party mapping...")
+        print("Fetching personnel + party mapping...")
         party_map_df = pd.read_sql("""
             SELECT SourceID AS SourcePersonnelID, DestPartyID AS PartyID
             FROM master.dbo.PartyMigrationMapping
@@ -122,24 +194,15 @@ def run():
                 TBL_PersonnelPostalCode AS PostalCode
             FROM dbo.TBL_Personnel
             WHERE TBL_PersonnelID > 0
-              AND TBL_PersonnelAddressHome IS NOT NULL
-              AND LTRIM(RTRIM(TBL_PersonnelAddressHome)) <> N''
-              AND LTRIM(RTRIM(TBL_PersonnelAddressHome)) <> N'0'
         """, source_cnxn)
 
         if source_df.empty or party_map_df.empty:
-            print("No personnel with home address found among mapped parties.")
+            print("No mapped personnel found.")
             return
 
         source_df = pd.merge(source_df, party_map_df, on='SourcePersonnelID', how='inner')
         if source_df.empty:
-            print("No personnel with home address found among mapped parties.")
-            return
-
-        source_df['Details'] = source_df['AddressHome'].apply(clean_persian_text)
-        source_df = source_df[source_df['Details'].notna()].copy()
-        if source_df.empty:
-            print("No usable home address text after cleaning.")
+            print("No mapped personnel found.")
             return
 
         mapped_df = pd.read_sql(
@@ -171,13 +234,20 @@ def run():
             ) VALUES (?, ?, ?)
         """
 
-        inserted = 0
+        # --- Pass 1: home address text ---
+        home_df = source_df.copy()
+        home_df['Details'] = home_df['AddressHome'].apply(clean_persian_text)
+        home_df = home_df[
+            home_df['Details'].notna() & (home_df['Details'] != '0')
+        ].copy()
+
+        inserted_home = 0
         skipped_already_mapped = 0
         city_matched = 0
         city_defaulted = 0
 
-        print(f"Inserting Address + PartyAddress ({len(source_df)} candidates)...")
-        for _, row in source_df.iterrows():
+        print(f"Inserting home-text addresses ({len(home_df)} candidates)...")
+        for _, row in home_df.iterrows():
             source_id = int(row['SourcePersonnelID'])
             if source_id in already_mapped:
                 skipped_already_mapped += 1
@@ -192,34 +262,62 @@ def run():
             else:
                 city_matched += 1
 
-            zip_code = clean_persian_text(row['PostalCode'])
-            if zip_code in (None, '0'):
-                zip_code = None
-            elif zip_code:
-                zip_code = zip_code[:32]
+            zip_code = _clean_postal(row['PostalCode'])
 
             address_last_id += 1
             party_address_last_id += 1
-
-            dest_cursor.execute(insert_address_sql, (
-                address_last_id,
-                ADDRESS_NAME,
-                details,
-                zip_code,
-                DEFAULT_PHONE,
-                int(city_id),
-            ))
-            dest_cursor.execute(insert_party_address_sql, (
-                party_address_last_id,
-                int(row['PartyID']),
-                address_last_id,
-            ))
-            dest_cursor.execute(
-                insert_mapping_sql,
-                (source_id, address_last_id, party_address_last_id),
+            _insert_party_address(
+                dest_cursor,
+                address_last_id=address_last_id,
+                party_address_last_id=party_address_last_id,
+                source_id=source_id,
+                party_id=row['PartyID'],
+                details=details,
+                zip_code=zip_code,
+                regional_division_id=city_id,
+                insert_address_sql=insert_address_sql,
+                insert_party_address_sql=insert_party_address_sql,
+                insert_mapping_sql=insert_mapping_sql,
             )
             already_mapped.add(source_id)
-            inserted += 1
+            inserted_home += 1
+
+        # --- Pass 2: postal only (no home address) ---
+        postal_df = source_df.copy()
+        postal_df['ZipCode'] = postal_df['PostalCode'].apply(_clean_postal)
+        postal_df = postal_df[postal_df['ZipCode'].notna()].copy()
+        postal_df = postal_df[
+            ~postal_df['AddressHome'].apply(_has_home_address)
+        ].copy()
+        postal_df = postal_df[
+            ~postal_df['SourcePersonnelID'].isin(already_mapped)
+        ].copy()
+
+        inserted_postal = 0
+        print(f"Inserting postal-only addresses ({len(postal_df)} candidates)...")
+        for _, row in postal_df.iterrows():
+            source_id = int(row['SourcePersonnelID'])
+            if source_id in already_mapped:
+                skipped_already_mapped += 1
+                continue
+
+            address_last_id += 1
+            party_address_last_id += 1
+            _insert_party_address(
+                dest_cursor,
+                address_last_id=address_last_id,
+                party_address_last_id=party_address_last_id,
+                source_id=source_id,
+                party_id=row['PartyID'],
+                details=DEFAULT_DETAILS,
+                zip_code=row['ZipCode'],
+                regional_division_id=iran_id,
+                insert_address_sql=insert_address_sql,
+                insert_party_address_sql=insert_party_address_sql,
+                insert_mapping_sql=insert_mapping_sql,
+            )
+            already_mapped.add(source_id)
+            inserted_postal += 1
 
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'GNR3.Address'",
@@ -232,8 +330,9 @@ def run():
 
         dest_cnxn.commit()
         print(
-            f"Success! Addresses inserted: {inserted}. "
-            f"City matched: {city_matched}. City defaulted to کرمانشاه: {city_defaulted}. "
+            f"Success! Home-text addresses: {inserted_home} "
+            f"(city matched: {city_matched}, defaulted کرمانشاه: {city_defaulted}). "
+            f"Postal-only addresses: {inserted_postal} (RegionalDivision=ایران). "
             f"Skipped (already mapped): {skipped_already_mapped}."
         )
 

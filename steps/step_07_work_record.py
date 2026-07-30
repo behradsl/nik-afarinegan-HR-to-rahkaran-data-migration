@@ -18,19 +18,40 @@ DEFAULT_ORG_NAME = '-'
 OPEN_END_SHAMSI = '1499/12/29'
 DEFAULT_DEGREE_CODE = 1
 
-# WorkRelationType codes (SYS3.Lookup Type = WorkRelationType)
-WORK_RELATION_RELATED = 1          # مرتبط
-WORK_RELATION_GOV_IN_INDUSTRY = 3  # دولتی داخل صنعت
-WORK_RELATION_GOV_OUT_INDUSTRY = 4  # دولتی خارج از صنعت
-WORK_RELATION_PRIV_IN_INDUSTRY = 5  # خصوصی داخل صنعت
-WORK_RELATION_PRIV_OUT_INDUSTRY = 6  # خصوصی خارج از صنعت
+# WorkType codes = HRS_EshType (SYS3.Lookup Type = WorkType)
+WORK_TYPE_LOOKUP_VALUES = {
+    1: 'دولتی(داخل شرکت)',
+    2: 'دولتی (داخل صنعت)',
+    3: 'دولتی (خارج صنعت)',
+    4: 'خصوصی(خارج صنعت)',
+    5: 'خصوصی(داخل صنعت)',
+}
+DEFAULT_WORK_TYPE_CODE = 1
+
+# WorkRelationType codes from HRS_JobRelationID_fk / HRS_PayBase parent 30
+WORK_RELATION_RELATED = 1              # مرتبط (source 300001 مرتبط کامل)
+WORK_RELATION_UNRELATED = 2            # غیر مرتبط (300002)
+WORK_RELATION_SIMILAR = 3              # مشابه (300003)
+WORK_RELATION_YEARS_ONLY = 4           # محاسبه فقط در سنوات (300004)
+WORK_RELATION_UNSPECIFIED = 5          # هنوز مشخص نشده است (300005)
 
 WORK_RELATION_LOOKUP_VALUES = {
-    WORK_RELATION_GOV_IN_INDUSTRY: 'دولتی داخل صنعت',
-    WORK_RELATION_GOV_OUT_INDUSTRY: 'دولتی خارج از صنعت',
-    WORK_RELATION_PRIV_IN_INDUSTRY: 'خصوصی داخل صنعت',
-    WORK_RELATION_PRIV_OUT_INDUSTRY: 'خصوصی خارج از صنعت',
+    WORK_RELATION_RELATED: 'مرتبط',
+    WORK_RELATION_UNRELATED: 'غیر مرتبط',
+    WORK_RELATION_SIMILAR: 'مشابه',
+    WORK_RELATION_YEARS_ONLY: 'محاسبه فقط در سنوات',
+    WORK_RELATION_UNSPECIFIED: 'هنوز مشخص نشده است',
 }
+
+# Source HRS_JobRelationID_fk → dest WorkRelationTypeCode
+JOB_RELATION_TO_WORK_RELATION = {
+    300001: WORK_RELATION_RELATED,
+    300002: WORK_RELATION_UNRELATED,
+    300003: WORK_RELATION_SIMILAR,
+    300004: WORK_RELATION_YEARS_ONLY,
+    300005: WORK_RELATION_UNSPECIFIED,
+}
+DEFAULT_WORK_RELATION_CODE = WORK_RELATION_RELATED
 
 # WorkRecordExtra1: active flag on EmployeeWorkRecord.Extra1Code
 WORK_RECORD_EXTRA1_ACTIVE = 1      # فعال
@@ -47,17 +68,8 @@ WORK_RECORD_EXTRA2_LOOKUP_VALUES = {
     2: 'دارای حق سرپرستی (نوع ۲)',
 }
 
-# Internal work type (دولتی داخل شرکت)
+# Internal work type used by statute backfill (دولتی داخل شرکت)
 WORK_TYPE_INTERNAL = 1
-
-# HRS_EshType → (WorkTypeCode, WorkRelationTypeCode)
-ESH_TYPE_WORK_CODES = {
-    1: (WORK_TYPE_INTERNAL, WORK_RELATION_RELATED),
-    2: (2, WORK_RELATION_GOV_IN_INDUSTRY),
-    3: (2, WORK_RELATION_GOV_OUT_INDUSTRY),
-    4: (2, WORK_RELATION_PRIV_OUT_INDUSTRY),
-    5: (2, WORK_RELATION_PRIV_IN_INDUSTRY),
-}
 
 
 def _parse_shamsi_date(raw, *, treat_open_end_as_null=False):
@@ -91,12 +103,20 @@ def setup_work_record_mapping_table(cursor):
     cursor.commit()
 
 
-def _work_type_and_relation(esh_type):
+def _work_type_code(esh_type):
     try:
-        t = int(esh_type)
+        code = int(esh_type)
     except (TypeError, ValueError):
-        t = 1
-    return ESH_TYPE_WORK_CODES.get(t, (2, WORK_RELATION_PRIV_OUT_INDUSTRY))
+        return DEFAULT_WORK_TYPE_CODE
+    return code if code in WORK_TYPE_LOOKUP_VALUES else DEFAULT_WORK_TYPE_CODE
+
+
+def _work_relation_code(job_relation_id):
+    try:
+        source_id = int(job_relation_id)
+    except (TypeError, ValueError):
+        return DEFAULT_WORK_RELATION_CODE
+    return JOB_RELATION_TO_WORK_RELATION.get(source_id, DEFAULT_WORK_RELATION_CODE)
 
 
 def _extra1_active_code(esh_active):
@@ -259,12 +279,22 @@ def run():
             work_df[['SourceDegreeID', 'DegreeName']],
         )
 
+        print("Ensuring WorkType lookup values...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'WorkType',
+            WORK_TYPE_LOOKUP_VALUES,
+            overwrite_values=True,
+        )
+
         print("Ensuring WorkRelationType lookup values...")
         ensure_lookup_codes(
             dest_cnxn,
             dest_cursor,
             'WorkRelationType',
             WORK_RELATION_LOOKUP_VALUES,
+            overwrite_values=True,
         )
 
         print("Ensuring WorkRecordExtra1 lookup values...")
@@ -325,7 +355,8 @@ def run():
         print(f"Inserting EmployeeWorkRecord records ({len(work_df)} candidates)...")
         for _, row in work_df.iterrows():
             source_id = int(row['SourceEmploymentServiceHistoryID'])
-            work_type_code, work_relation_code = _work_type_and_relation(row['EshType'])
+            work_type_code = _work_type_code(row['EshType'])
+            work_relation_code = _work_relation_code(row['JobRelationID'])
             extra1_code = _extra1_active_code(row['EshActive'])
             extra2_code = _extra2_heading_code(row['HeadingStatus'])
 
