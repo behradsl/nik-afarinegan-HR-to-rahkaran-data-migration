@@ -19,6 +19,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 DELETE_BY_MAPPING = (
     ('PersonnelImageMigrationMapping', 'HCM3.EmployeeSupplementary', 'EmployeeSupplementaryID', 'DestEmployeeSupplementaryID'),
     ('WarriorMigrationMapping', 'HCM3.EmployeeWarriorRecord', 'EmployeeWarriorRecordID', 'DestEmployeeWarriorRecordID'),
+    ('ServiceLeakageMigrationMapping', 'HCM3.EmployeeWorkRecord', 'EmployeeWorkRecordID', 'DestEmployeeWorkRecordID'),
     ('WorkRecordMigrationMapping', 'HCM3.EmployeeWorkRecord', 'EmployeeWorkRecordID', 'DestEmployeeWorkRecordID'),
     ('StatuteMigrationMapping', 'HCM3.EmployeeStatute', 'EmployeeStatuteID', 'DestEmployeeStatuteID'),
     ('OrgStructureMigrationMapping', 'HCM3.OrganizationalStructure', 'OrganizationalStructureID', 'DestOrganizationalStructureID'),
@@ -39,6 +40,7 @@ DELETE_BY_MAPPING = (
 
 MAPPING_TABLES_TO_CLEAR = (
     'WarriorMigrationMapping',
+    'ServiceLeakageMigrationMapping',
     'WorkRecordMigrationMapping',
     'StatuteMigrationMapping',
     'OrgStructureMigrationMapping',

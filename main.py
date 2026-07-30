@@ -21,6 +21,7 @@ from steps import (
     step_16_party_address,
     step_17_statute_factor,
     step_18_employee_photo,
+    step_19_service_leakage_work_record,
 )
 
 def get_config_path():
@@ -144,7 +145,12 @@ def main():
             step_18_employee_photo.run()
         else:
             print("\n--- Skipping Step 18: Personnel Photo Migration ---")
-            
+
+        if steps_to_run.get("19_service_leakage_work_record", False):
+            step_19_service_leakage_work_record.run()
+        else:
+            print("\n--- Skipping Step 19: Service Leakage → Work Record ---")
+
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")
         print("========================================")

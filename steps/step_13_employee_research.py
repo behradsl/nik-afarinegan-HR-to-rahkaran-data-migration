@@ -59,14 +59,25 @@ def _ensure_table_id(cursor, table_name, default_last_id=0):
     return int(row[0])
 
 
-def _score_value(val):
-    """Use source score as-is when numeric (including 0)."""
+def _numeric_or_none(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     try:
         return float(val)
     except (TypeError, ValueError):
         return None
+
+
+def _pick_score(percent, amount, score):
+    """
+    Dest has a single Score field. Prefer source percent, then amount, then score.
+    Treat null/0 as empty so the next priority can win.
+    """
+    for val in (percent, amount, score):
+        parsed = _numeric_or_none(val)
+        if parsed is not None and parsed != 0:
+            return parsed
+    return None
 
 
 def run():
@@ -86,6 +97,8 @@ def run():
                 o.PAY_PfID_fk AS SourceFactorID,
                 o.HRS_OehStartDate AS StartDate,
                 o.HRS_OehEndDate AS EndDate,
+                o.HRS_OehPercent AS OehPercent,
+                o.HRS_OehAmount AS OehAmount,
                 o.HRS_OehScore AS OehScore,
                 o.HRS_OehNote AS OehNote,
                 pf.PAY_PfName AS FactorName
@@ -136,13 +149,18 @@ def run():
         )
 
         mapped_df = pd.read_sql(
-            "SELECT SourceOtherExtraHistoryID FROM master.dbo.ResearchMigrationMapping",
+            """
+            SELECT SourceOtherExtraHistoryID, DestEmployeeResearchID
+            FROM master.dbo.ResearchMigrationMapping
+            """,
             dest_cnxn,
         )
-        already_mapped = (
-            set(int(x) for x in mapped_df['SourceOtherExtraHistoryID'].tolist())
-            if not mapped_df.empty else set()
-        )
+        already_mapped = {}
+        if not mapped_df.empty:
+            already_mapped = {
+                int(r['SourceOtherExtraHistoryID']): int(r['DestEmployeeResearchID'])
+                for _, r in mapped_df.iterrows()
+            }
 
         print("Preparing ID generator...")
         research_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeResearch', 0)
@@ -159,17 +177,46 @@ def run():
                 SourceOtherExtraHistoryID, DestEmployeeResearchID
             ) VALUES (?, ?)
         """
+        update_sql = """
+            UPDATE HCM3.EmployeeResearch
+            SET Score = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeResearchID = ?
+        """
 
         inserted = 0
+        score_updated = 0
         skipped_already_mapped = 0
         skipped_no_type = 0
         defaulted_effective = 0
+        score_from_percent = 0
+        score_from_amount = 0
+        score_from_score = 0
+        score_null = 0
         today_str = date.today().strftime('%Y-%m-%d')
 
-        print(f"Inserting EmployeeResearch records ({len(work_df)} candidates)...")
+        print(f"Inserting/updating EmployeeResearch records ({len(work_df)} candidates)...")
         for _, row in work_df.iterrows():
             source_id = int(row['SourceOtherExtraHistoryID'])
+
+            percent = _numeric_or_none(row['OehPercent'])
+            amount = _numeric_or_none(row['OehAmount'])
+            raw_score = _numeric_or_none(row['OehScore'])
+            score = _pick_score(percent, amount, raw_score)
+            if score is not None:
+                if percent is not None and percent != 0 and score == percent:
+                    score_from_percent += 1
+                elif amount is not None and amount != 0 and score == amount:
+                    score_from_amount += 1
+                else:
+                    score_from_score += 1
+            else:
+                score_null += 1
+
             if source_id in already_mapped:
+                dest_cursor.execute(update_sql, (score, already_mapped[source_id]))
+                score_updated += 1
                 skipped_already_mapped += 1
                 continue
 
@@ -192,8 +239,6 @@ def run():
                 effective_date = today_str
                 defaulted_effective += 1
 
-            score = _score_value(row['OehScore'])
-
             research_last_id += 1
             dest_cursor.execute(insert_sql, (
                 research_last_id,
@@ -205,7 +250,7 @@ def run():
                 score,
             ))
             dest_cursor.execute(insert_mapping_sql, (source_id, research_last_id))
-            already_mapped.add(source_id)
+            already_mapped[source_id] = research_last_id
             inserted += 1
 
         dest_cursor.execute(
@@ -216,6 +261,11 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! EmployeeResearch inserted: {inserted}. "
+            f"Scores updated: {score_updated}. "
+            f"Score from percent: {score_from_percent}. "
+            f"Score from amount: {score_from_amount}. "
+            f"Score from score: {score_from_score}. "
+            f"Score null: {score_null}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (no factor): {skipped_no_factor}. "
             f"Skipped (no type): {skipped_no_type}. "

@@ -24,7 +24,21 @@ def run():
 
     try:
         print("Loading migrated internal work records...")
-        wr_df = pd.read_sql("""
+        dest_cursor.execute(
+            "SELECT 1 FROM master.sys.tables WHERE name = 'ServiceLeakageMigrationMapping'"
+        )
+        has_leakage_map = dest_cursor.fetchone() is not None
+
+        leakage_clause = ""
+        if has_leakage_map:
+            leakage_clause = """
+                    OR EXISTS (
+                        SELECT 1 FROM master.dbo.ServiceLeakageMigrationMapping m
+                        WHERE m.DestEmployeeWorkRecordID = wr.EmployeeWorkRecordID
+                    )
+            """
+
+        wr_df = pd.read_sql(f"""
             SELECT
                 wr.EmployeeWorkRecordID,
                 wr.EmployeeRef,
@@ -34,12 +48,17 @@ def run():
                 wr.EndDate,
                 wr.WorkTypeCode
             FROM HCM3.EmployeeWorkRecord wr
-            INNER JOIN master.dbo.WorkRecordMigrationMapping m
-                ON m.DestEmployeeWorkRecordID = wr.EmployeeWorkRecordID
             WHERE wr.WorkTypeCode = ?
               AND wr.PostRef IS NOT NULL
               AND wr.DepartmentRef IS NOT NULL
               AND wr.StartDate IS NOT NULL
+              AND (
+                    EXISTS (
+                        SELECT 1 FROM master.dbo.WorkRecordMigrationMapping m
+                        WHERE m.DestEmployeeWorkRecordID = wr.EmployeeWorkRecordID
+                    )
+                    {leakage_clause}
+                  )
         """, dest_cnxn, params=[WORK_TYPE_INTERNAL])
 
         if wr_df.empty:

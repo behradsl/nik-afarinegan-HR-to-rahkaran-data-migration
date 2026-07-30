@@ -20,6 +20,7 @@
         "15_employee_appraisal": true,
         "16_party_address": true,
         "17_statute_factor": true,
-        "18_employee_photo": true
+        "18_employee_photo": true,
+        "19_service_leakage_work_record": true
     }
 }
