@@ -3,7 +3,7 @@ import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
-from utils.lookup_helpers import ensure_lookup_codes
+from utils.lookup_helpers import ensure_lookup_codes, sync_lookup
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -113,10 +113,15 @@ def _as_int(val, default=None):
 
 
 def _status_codes_from_sponsor(sponsor_status_id):
-    """Return (education_state, physical_state, marital_status) from SponserStatus."""
+    """Return (education_state, physical_state, marital_status) from SponserStatus.
+
+    Unset physical state defaults to 1 (سالم).
+    """
     sid = _as_int(sponsor_status_id)
     education = SPONSOR_EDUCATION_STATE.get(sid)
     physical = SPONSOR_PHYSICAL_STATE.get(sid)
+    if physical is None:
+        physical = 1  # سالم
     marital = SPONSOR_MARITAL_STATUS.get(sid)
     return education, physical, marital
 
@@ -261,6 +266,8 @@ def run():
                 ss.TBL_PersonnelID_fk AS SourceID,
                 ss.HRS_SponserRelatedID_fk AS SourceRelatedID,
                 ss.HRS_SponserStatusID_fk AS SponsorStatusID,
+                ss.HRS_CreateStatusID_fk AS CreateStatusID,
+                pb.HRS_PayBaseName AS CreateStatusName,
                 ss.HRS_SponserShipStatus AS SponsorShipStatus,
                 ss.HRS_InsuranceStatusID_fk AS InsuranceStatusID,
                 ss.HRS_SsFirstName AS FirstName,
@@ -277,6 +284,7 @@ def run():
                 ss.HRS_InsuranceDeleteDate AS InsuranceDeleteDate,
                 ss.HRS_SsDeathDate AS DeathDate
             FROM dbo.HRS_SponsorShip ss
+            LEFT JOIN dbo.HRS_PayBase pb ON pb.HRS_PayBaseID = ss.HRS_CreateStatusID_fk
             WHERE ss.TBL_PersonnelID_fk IS NOT NULL
               AND ss.TBL_PersonnelID_fk > 0
               AND ss.HRS_SponserRelatedID_fk IN (30002, 30003, 30004, 30005, 30006)
@@ -315,6 +323,31 @@ def run():
         if work_df.empty:
             print(f"No matching employees found. Skipped (no employee): {skipped_no_employee}.")
             return
+
+        print("Syncing EmployeeRelativeExtra1 from cause of being relative (علت ایجاد تحت تکفل)...")
+        work_df['CreateStatusClean'] = work_df['CreateStatusName'].apply(clean_persian_text)
+        cause_names = [
+            n for n in work_df['CreateStatusClean'].dropna().unique().tolist() if n
+        ]
+        catalog_df = pd.read_sql("""
+            SELECT HRS_PayBaseName
+            FROM dbo.HRS_PayBase
+            WHERE HRS_PayBaseParentID_fk = 77
+        """, source_cnxn)
+        for raw in catalog_df['HRS_PayBaseName'].dropna().unique():
+            name = clean_persian_text(raw)
+            if name and name not in cause_names:
+                cause_names.append(name)
+
+        name_to_extra1 = sync_lookup(
+            dest_cnxn, dest_cursor, 'EmployeeRelativeExtra1', cause_names
+        )
+        id_to_extra1 = {}
+        for _, row in work_df[['CreateStatusID', 'CreateStatusClean']].drop_duplicates().iterrows():
+            cid = _as_int(row['CreateStatusID'])
+            name = row['CreateStatusClean']
+            if cid is not None and name and name in name_to_extra1:
+                id_to_extra1[cid] = name_to_extra1[name]
 
         mapped_df = pd.read_sql("""
             SELECT SourceSponsorID, DestEmployeeRelativeID
@@ -360,15 +393,17 @@ def run():
                 EmployeeRelativeID, EmployeeRef, FirstName, LastName, FatherName,
                 RelationCode, AllegianceCode, NationalID, IDNumber, BirthDate,
                 DegreeCode, EducationStateCode, PhysicalStateCode, MaritalStatusCode,
+                EmployeeRelativeExtra1Code,
                 IsFourthChild, IncludeInSonshipPay, EffectiveDate, RelativeType,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?, 0, 0, ?, 1, GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?, ?, 0, 0, ?, 1, GETDATE(), 1, GETDATE(), 1)
         """
         update_relative_status_sql = """
             UPDATE HCM3.EmployeeRelative
             SET EducationStateCode = ?,
                 PhysicalStateCode = ?,
                 MaritalStatusCode = ?,
+                EmployeeRelativeExtra1Code = ?,
                 LastModificationDate = GETDATE(),
                 LastModifier = 1
             WHERE EmployeeRelativeID = ?
@@ -471,12 +506,18 @@ def run():
             education_code, physical_code, marital_code = _status_codes_from_sponsor(
                 row['SponsorStatusID']
             )
+            create_status_id = _as_int(row.get('CreateStatusID'))
+            extra1_code = id_to_extra1.get(create_status_id) if create_status_id is not None else None
+            if extra1_code is None:
+                cause_name = row.get('CreateStatusClean')
+                if cause_name:
+                    extra1_code = name_to_extra1.get(cause_name)
 
             if source_sponsor_id in already_mapped:
                 dest_rel_id = already_mapped[source_sponsor_id]
                 dest_cursor.execute(
                     update_relative_status_sql,
-                    (education_code, physical_code, marital_code, dest_rel_id),
+                    (education_code, physical_code, marital_code, extra1_code, dest_rel_id),
                 )
                 relatives_status_updated += 1
                 maybe_insert_insurance(source_sponsor_id, dest_rel_id, row)
@@ -520,6 +561,7 @@ def run():
                 education_code,
                 physical_code,
                 marital_code,
+                extra1_code,
                 effective_date,
             ))
             dest_cursor.execute(insert_mapping_sql, (source_sponsor_id, relative_last_id))
