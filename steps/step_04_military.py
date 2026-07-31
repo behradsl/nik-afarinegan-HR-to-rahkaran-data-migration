@@ -3,9 +3,41 @@ import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_value
 from utils.date_helpers import days_between, shamsi_to_gregorian
-from utils.lookup_helpers import ensure_degree_mappings
+from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes
 
 warnings.filterwarnings('ignore', category=UserWarning)
+
+# HRS_MhStatusId_fk (PayBase parent 37 وضعیت خدمت) → MilitaryBranchCode
+MILITARY_BRANCH_RELATED = 1       # مرتبط (3701)
+MILITARY_BRANCH_UNRELATED = 2     # غیر مرتبط (3703)
+MILITARY_BRANCH_SIMILAR = 3       # مشابه (3702)
+
+MILITARY_BRANCH_LOOKUP = {
+    MILITARY_BRANCH_RELATED: 'مرتبط',
+    MILITARY_BRANCH_UNRELATED: 'غیر مرتبط',
+    MILITARY_BRANCH_SIMILAR: 'مشابه',
+}
+
+# Restore default ExemptionType values after earlier mistaken overwrite
+EXEMPTION_TYPE_LOOKUP = {
+    1: 'دائم',
+    2: 'موقت',
+}
+
+MH_STATUS_TO_BRANCH = {
+    3701: MILITARY_BRANCH_RELATED,
+    3703: MILITARY_BRANCH_UNRELATED,
+    3702: MILITARY_BRANCH_SIMILAR,
+}
+
+
+def _military_branch_code(mh_status_id):
+    if mh_status_id is None or (isinstance(mh_status_id, float) and pd.isna(mh_status_id)):
+        return None
+    try:
+        return MH_STATUS_TO_BRANCH.get(int(float(mh_status_id)))
+    except (TypeError, ValueError):
+        return None
 
 
 def setup_military_mapping_table(cursor):
@@ -38,6 +70,26 @@ def run():
     try:
         setup_military_mapping_table(dest_cursor)
 
+        print("Ensuring MilitaryBranch lookup (مرتبط / غیر مرتبط / مشابه)...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'MilitaryBranch',
+            MILITARY_BRANCH_LOOKUP,
+            overwrite_values=True,
+        )
+        # Undo mistaken ExemptionType overwrite from an earlier run
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            'ExemptionType',
+            EXEMPTION_TYPE_LOOKUP,
+            overwrite_values=True,
+        )
+        dest_cursor.execute(
+            "DELETE FROM SYS3.Lookup WHERE Type = 'ExemptionType' AND Code = 3"
+        )
+
         print("Fetching Source Military History...")
         source_df = pd.read_sql("""
             SELECT
@@ -46,7 +98,8 @@ def run():
                 mh.TBL_DegreeID_fk AS SourceDegreeID,
                 d.TBL_DegreeName AS DegreeName,
                 mh.HRS_MhStartDate AS StartDate,
-                mh.HRS_MhEndDate AS EndDate
+                mh.HRS_MhEndDate AS EndDate,
+                mh.HRS_MhStatusId_fk AS MhStatusID
             FROM dbo.HRS_MilitaryHistory mh
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = mh.TBL_DegreeID_fk
             WHERE mh.TBL_PersonnelID_fk IS NOT NULL
@@ -113,14 +166,18 @@ def run():
                 MilitaryEndDate = ?,
                 MilitaryDuration = ?,
                 MilitaryEducationDegreeCode = ?,
+                MilitaryBranchCode = ?,
+                ExemptionTypeCode = NULL,
                 LastModificationDate = GETDATE(),
                 MilitaryServiceStatusCode = 1,
                 LastModifier = 1
             WHERE EmployeeID = ?
         """
-        update_duration_sql = """
+        update_mapped_sql = """
             UPDATE HCM3.Employee
             SET MilitaryDuration = ?,
+                MilitaryBranchCode = ?,
+                ExemptionTypeCode = NULL,
                 LastModificationDate = GETDATE(),
                 LastModifier = 1
             WHERE EmployeeID = ?
@@ -132,7 +189,7 @@ def run():
         """
 
         updated = 0
-        duration_corrected = 0
+        mapped_refreshed = 0
         skipped_already_mapped = 0
         skipped_bad_dates = 0
 
@@ -142,6 +199,7 @@ def run():
             end_date = shamsi_to_gregorian(clean_value(row['EndDate']))
             # Dest MilitaryDuration is day count between start and end
             duration = days_between(start_date, end_date)
+            branch_code = _military_branch_code(row.get('MhStatusID'))
 
             if start_date is None and end_date is None:
                 skipped_bad_dates += 1
@@ -150,10 +208,12 @@ def run():
             employee_id = int(row['EmployeeID'])
 
             if source_id in already_mapped:
-                # Refresh duration in days for previously migrated rows
-                if duration is not None:
-                    dest_cursor.execute(update_duration_sql, (duration, employee_id))
-                    duration_corrected += 1
+                # Refresh duration + MilitaryBranch; clear mistaken ExemptionType
+                dest_cursor.execute(
+                    update_mapped_sql,
+                    (duration, branch_code, employee_id),
+                )
+                mapped_refreshed += 1
                 skipped_already_mapped += 1
                 continue
 
@@ -170,6 +230,7 @@ def run():
                 end_date,
                 duration,
                 degree_code,
+                branch_code,
                 employee_id,
             ))
             dest_cursor.execute(
@@ -182,7 +243,7 @@ def run():
         dest_cnxn.commit()
         print(
             f"Success! Updated {updated} Employee military records. "
-            f"Duration corrected (days): {duration_corrected}. "
+            f"Mapped refreshed (duration/branch): {mapped_refreshed}. "
             f"Source people: {total_source_people}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "
             f"Skipped (no employee): {skipped_no_employee}. "

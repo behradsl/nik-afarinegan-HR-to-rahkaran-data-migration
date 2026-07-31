@@ -101,6 +101,8 @@ def _clear_military_fields(cursor):
             e.MilitaryDuration = NULL,
             e.MilitaryEducationDegreeCode = NULL,
             e.MilitaryServiceStatusCode = NULL,
+            e.MilitaryBranchCode = NULL,
+            e.ExemptionTypeCode = NULL,
             e.LastModificationDate = GETDATE(),
             e.LastModifier = 1
         FROM HCM3.Employee e
