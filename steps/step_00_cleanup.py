@@ -30,6 +30,7 @@ DELETE_BY_MAPPING = (
     ('RelativeInsuranceMigrationMapping', 'HCM3.EmployeeRelativeInsurance', 'EmployeeRelativeInsuranceID', 'DestEmployeeRelativeInsuranceID'),
     ('RelativeMigrationMapping', 'HCM3.EmployeeRelative', 'EmployeeRelativeID', 'DestEmployeeRelativeID'),
     ('EducationMigrationMapping', 'HCM3.EmployeeEducation', 'EmployeeEducationID', 'DestEmployeeEducationID'),
+    ('EmploymentNumberMigrationMapping', 'HCM3.EmployeeEmploymentNumber', 'EmployeeEmploymentNumberID', 'DestEmployeeEmploymentNumberID'),
     ('StatuteTypeMigrationMapping', 'HCM3.StatuteType', 'StatuteTypeID', 'DestStatuteTypeID'),
     ('StatuteFactorMigrationMapping', 'HCM3.StatuteFactor', 'StatuteFactorID', 'DestStatuteFactorID'),
     ('JobMigrationMapping', 'HCM3.Job', 'JobID', 'DestJobID'),
@@ -56,6 +57,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'RelativeInsuranceMigrationMapping',
     'RelativeMigrationMapping',
     'EducationMigrationMapping',
+    'EmploymentNumberMigrationMapping',
     'MilitaryMigrationMapping',
     'JobMigrationMapping',
     'EmploymentTypeMigrationMapping',
@@ -108,6 +110,24 @@ def _clear_military_fields(cursor):
         FROM HCM3.Employee e
         INNER JOIN master.dbo.MilitaryMigrationMapping m
             ON e.EmployeeID = m.DestEmployeeID
+    """)
+
+
+def _clear_employment_number_fields(cursor):
+    """Clear Employee.EmploymentNumber for employees touched by employment-number migration."""
+    if not _mapping_exists(cursor, 'EmploymentNumberMigrationMapping'):
+        print("  -> EmploymentNumberMigrationMapping not found, skip EmploymentNumber clear.")
+        return 0
+    return _exec_count(cursor, 'EmploymentNumber cleared on Employee', """
+        UPDATE e
+        SET e.EmploymentNumber = NULL,
+            e.LastModificationDate = GETDATE(),
+            e.LastModifier = 1
+        FROM HCM3.Employee e
+        WHERE e.EmployeeID IN (
+            SELECT DISTINCT DestEmployeeID
+            FROM master.dbo.EmploymentNumberMigrationMapping
+        )
     """)
 
 
@@ -410,6 +430,9 @@ def run():
         print("Clearing military fields updated by migration...")
         _clear_military_fields(dest_cursor)
 
+        print("Clearing EmploymentNumber on employees before history delete...")
+        _clear_employment_number_fields(dest_cursor)
+
         print("Deleting marriage history created with relatives...")
         _delete_migrated_marriages(dest_cursor)
 
@@ -431,6 +454,7 @@ def run():
             'RelativeInsuranceMigrationMapping',
             'RelativeMigrationMapping',
             'EducationMigrationMapping',
+            'EmploymentNumberMigrationMapping',
         }
         for mapping_table, dest_table, dest_pk, mapping_col in DELETE_BY_MAPPING:
             if mapping_table in child_tables:
