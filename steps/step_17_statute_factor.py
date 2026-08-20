@@ -2,14 +2,20 @@
 Step 17: Migrate PAY_PayrollFactor (used on rule docs) → HCM3.StatuteFactor,
 plus StatuteFactorProperty + Formula from PAY_PayrollBackFormula / PAY_PfFormula.
 
-EmploymentTypeRef is left NULL so Rahkaran applies the property to all employment types.
+Source has no separate formula-per-employment-type rows (ET branching is inside
+SQL helpers like FxPAY_PersonnelKind). Rahkaran requires non-null EmploymentTypeRef
+on StatuteFactorProperty, so each dated formula is applied to all destination
+employment types (one property row per ET, shared FormulaRef).
+
 IssueYearMonth / ApplyYearMonth come from PAY_MonthID (Shamsi YYYYMM).
 
 Source formulas are SQL; Rahkaran expects C#. We store a safe stub body
-(`return 0;`) and keep the original SQL in Formula.Description for rebuild.
+(`return 0;`) plus a designer UIObject template so the formula editor can open,
+and keep the original SQL in Formula.Description for rebuild.
 """
 import pandas as pd
 import warnings
+from pathlib import Path
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text
 
@@ -23,7 +29,21 @@ RELATED_IN_SERVICE = 1
 
 PROPERTY_STATUS_ACTIVE = 1
 FORMULA_MODULE_STAFF = 'Staff'
-FORMULA_STUB_BODY = 'return 0;'
+# Match Rahkaran designer stub used by utils/formula_uiobject_return0.bin
+FORMULA_STUB_BODY = ' return 0;'
+FORMULA_UIOBJECT_TEMPLATE = Path(__file__).resolve().parent.parent / (
+    'utils' / 'formula_uiobject_return0.bin'
+)
+
+
+def _load_formula_uiobject_template():
+    if not FORMULA_UIOBJECT_TEMPLATE.exists():
+        raise FileNotFoundError(
+            f"Missing formula UIObject template: {FORMULA_UIOBJECT_TEMPLATE}. "
+            "Export a Staff 'return 0;' UIObject blob from a working Rahkaran DB."
+        )
+    return FORMULA_UIOBJECT_TEMPLATE.read_bytes()
+
 
 
 def setup_statute_factor_mapping_table(cursor):
@@ -42,7 +62,26 @@ def setup_statute_factor_mapping_table(cursor):
     cursor.commit()
 
 
-def setup_statute_factor_property_mapping_table(cursor):
+def setup_statute_factor_property_mapping_table(cursor, *, recreate_if_legacy=True):
+    """
+    Mapping includes DestEmploymentTypeID. Older schema (factor+month only) is
+    replaced so we can expand one source formula version across all ETs.
+    """
+    if recreate_if_legacy:
+        cursor.execute("""
+            IF EXISTS (
+                SELECT * FROM master.sys.tables
+                WHERE name = 'StatuteFactorPropertyMigrationMapping'
+            )
+            AND NOT EXISTS (
+                SELECT * FROM master.sys.columns
+                WHERE object_id = OBJECT_ID('master.dbo.StatuteFactorPropertyMigrationMapping')
+                  AND name = 'DestEmploymentTypeID'
+            )
+            BEGIN
+                DROP TABLE master.dbo.StatuteFactorPropertyMigrationMapping
+            END
+        """)
     cursor.execute("""
         IF NOT EXISTS (
             SELECT * FROM master.sys.tables
@@ -52,33 +91,16 @@ def setup_statute_factor_property_mapping_table(cursor):
             CREATE TABLE master.dbo.StatuteFactorPropertyMigrationMapping (
                 SourcePayrollFactorID INT NOT NULL,
                 SourceMonthID INT NOT NULL,
+                DestEmploymentTypeID BIGINT NOT NULL,
                 SourceBackFormulaID INT NULL,
                 DestStatuteFactorPropertyID BIGINT NOT NULL,
                 DestFormulaID BIGINT NOT NULL,
                 MigrationDate DATETIME DEFAULT GETDATE(),
-                PRIMARY KEY (SourcePayrollFactorID, SourceMonthID)
+                PRIMARY KEY (SourcePayrollFactorID, SourceMonthID, DestEmploymentTypeID)
             )
         END
     """)
     cursor.commit()
-
-
-def _ensure_employment_type_nullable(cursor):
-    """Rahkaran treats NULL EmploymentTypeRef as applying to all employment types."""
-    cursor.execute("""
-        SELECT c.is_nullable
-        FROM sys.columns c
-        WHERE c.object_id = OBJECT_ID('HCM3.StatuteFactorProperty')
-          AND c.name = 'EmploymentTypeRef'
-    """)
-    row = cursor.fetchone()
-    if row and int(row[0]) == 1:
-        return
-    print("  -> Making StatuteFactorProperty.EmploymentTypeRef nullable...")
-    cursor.execute("""
-        ALTER TABLE HCM3.StatuteFactorProperty
-        ALTER COLUMN EmploymentTypeRef bigint NULL
-    """)
 
 
 def _ensure_table_id(cursor, table_name, default_last_id=0):
@@ -125,11 +147,88 @@ def _build_formula_description(source_pf_id, month_id, source_sql, source_kind):
         f"---\n"
     )
     body = source_sql or ''
-    # Keep description bounded for very large scripts
     max_sql = 80000
     if len(body) > max_sql:
         body = body[:max_sql] + '\n...[truncated]'
     return header + body
+
+
+def _dest_employment_type_ids(dest_cnxn):
+    """Prefer mapped ETs; fall back to all HCM3.EmploymentType rows."""
+    mapped = pd.read_sql("""
+        SELECT DestEmploymentTypeID
+        FROM master.dbo.EmploymentTypeMigrationMapping
+        ORDER BY DestEmploymentTypeID
+    """, dest_cnxn)
+    if not mapped.empty:
+        return [int(x) for x in mapped['DestEmploymentTypeID'].tolist()]
+    all_et = pd.read_sql("""
+        SELECT EmploymentTypeID
+        FROM HCM3.EmploymentType
+        ORDER BY EmploymentTypeID
+    """, dest_cnxn)
+    return [int(x) for x in all_et['EmploymentTypeID'].tolist()]
+
+
+def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
+    """
+    Remove prior property/formula migration so we can rebuild with ET expansion.
+    Also clears any null-ET properties hanging off migrated statute factors.
+    """
+    has_prop_map = pd.read_sql("""
+        SELECT CASE WHEN OBJECT_ID('master.dbo.StatuteFactorPropertyMigrationMapping')
+                    IS NOT NULL THEN 1 ELSE 0 END AS HasMap
+    """, dest_cnxn).iloc[0]['HasMap'] == 1
+
+    if has_prop_map:
+        # Delete properties before formulas (FK FormulaRef)
+        dest_cursor.execute("""
+            IF COL_LENGTH(
+                'master.dbo.StatuteFactorPropertyMigrationMapping',
+                'DestStatuteFactorPropertyID'
+            ) IS NOT NULL
+            BEGIN
+                DELETE sfp
+                FROM HCM3.StatuteFactorProperty sfp
+                INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                    ON sfp.StatuteFactorPropertyID = m.DestStatuteFactorPropertyID
+            END
+        """)
+        dest_cursor.execute("""
+            IF COL_LENGTH('master.dbo.StatuteFactorPropertyMigrationMapping', 'DestFormulaID') IS NOT NULL
+            BEGIN
+                DELETE f
+                FROM HCM3.Formula f
+                INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                    ON f.FormulaID = m.DestFormulaID
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM HCM3.StatuteFactorProperty sfp
+                    WHERE sfp.FormulaRef = f.FormulaID
+                )
+            END
+        """)
+        dest_cursor.execute(
+            "DELETE FROM master.dbo.StatuteFactorPropertyMigrationMapping"
+        )
+
+    # Any remaining properties on migrated statute factors
+    dest_cursor.execute("""
+        DELETE sfp
+        FROM HCM3.StatuteFactorProperty sfp
+        INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+            ON sfp.StatuteFactorRef = m.DestStatuteFactorID
+    """)
+    dest_cursor.execute("""
+        DELETE f
+        FROM HCM3.Formula f
+        WHERE f.ModuleName = 'Staff'
+          AND f.Description LIKE N'[Migrated from source%'
+          AND NOT EXISTS (
+              SELECT 1 FROM HCM3.StatuteFactorProperty sfp
+              WHERE sfp.FormulaRef = f.FormulaID
+          )
+    """)
+    print("  -> Cleared previous migrated statute-factor properties/formulas.")
 
 
 def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
@@ -275,7 +374,6 @@ def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
     """, source_cnxn)
 
     if not back_df.empty:
-        # Latest back-formula row wins per factor+month
         back_df = back_df.sort_values(
             ['SourcePayrollFactorID', 'SourceMonthID', 'SourceBackFormulaID']
         )
@@ -343,8 +441,7 @@ def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
 
 
 def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
-    print("Migrating StatuteFactorProperty + Formula...")
-    _ensure_employment_type_nullable(dest_cursor)
+    print("Migrating StatuteFactorProperty + Formula (expand to all employment types)...")
 
     factor_map_df = pd.read_sql("""
         SELECT SourcePayrollFactorID, DestStatuteFactorID
@@ -353,6 +450,16 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
     if factor_map_df.empty:
         print("  -> No mapped statute factors; skip properties.")
         return
+
+    et_ids = _dest_employment_type_ids(dest_cnxn)
+    if not et_ids:
+        print("  -> No destination employment types found; skip properties.")
+        return
+    print(f"  -> Employment types to apply: {len(et_ids)}.")
+
+    _clear_previously_migrated_properties(dest_cursor, dest_cnxn)
+    # Recreate mapping table if legacy schema was dropped during clear/setup
+    setup_statute_factor_property_mapping_table(dest_cursor, recreate_if_legacy=True)
 
     factor_map = {
         int(r['SourcePayrollFactorID']): int(r['DestStatuteFactorID'])
@@ -364,73 +471,32 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
         print("  -> No source formula versions found for mapped factors.")
         return
 
-    prop_map_df = pd.read_sql("""
-        SELECT SourcePayrollFactorID, SourceMonthID,
-               DestStatuteFactorPropertyID, DestFormulaID
-        FROM master.dbo.StatuteFactorPropertyMigrationMapping
-    """, dest_cnxn)
-    already = {}
-    if not prop_map_df.empty:
-        already = {
-            (int(r['SourcePayrollFactorID']), int(r['SourceMonthID'])): (
-                int(r['DestStatuteFactorPropertyID']),
-                int(r['DestFormulaID']),
-            )
-            for _, r in prop_map_df.iterrows()
-        }
-
     formula_last_id = _ensure_table_id(dest_cursor, 'HCM3.Formula', 0)
     property_last_id = _ensure_table_id(dest_cursor, 'HCM3.StatuteFactorProperty', 0)
+    uiobject_blob = _load_formula_uiobject_template()
 
     insert_formula_sql = """
         INSERT INTO HCM3.Formula (
             FormulaID, FormulaBody, UIObject, ModuleName, Description,
             CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, NULL, ?, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    update_formula_sql = """
-        UPDATE HCM3.Formula
-        SET FormulaBody = ?,
-            Description = ?,
-            ModuleName = ?,
-            LastModificationDate = GETDATE(),
-            LastModifier = 1
-        WHERE FormulaID = ?
+        ) VALUES (?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
     """
     insert_property_sql = """
         INSERT INTO HCM3.StatuteFactorProperty (
             StatuteFactorPropertyID, StatuteFactorRef, EmploymentTypeRef,
             IssueYearMonth, ApplyYearMonth, Status, FormulaRef,
             CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, NULL, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    update_property_sql = """
-        UPDATE HCM3.StatuteFactorProperty
-        SET IssueYearMonth = ?,
-            ApplyYearMonth = ?,
-            Status = ?,
-            FormulaRef = ?,
-            EmploymentTypeRef = NULL,
-            LastModificationDate = GETDATE(),
-            LastModifier = 1
-        WHERE StatuteFactorPropertyID = ?
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
     """
     insert_prop_map_sql = """
         INSERT INTO master.dbo.StatuteFactorPropertyMigrationMapping (
-            SourcePayrollFactorID, SourceMonthID, SourceBackFormulaID,
-            DestStatuteFactorPropertyID, DestFormulaID
-        ) VALUES (?, ?, ?, ?, ?)
-    """
-    update_prop_map_sql = """
-        UPDATE master.dbo.StatuteFactorPropertyMigrationMapping
-        SET SourceBackFormulaID = ?,
-            DestFormulaID = ?,
-            DestStatuteFactorPropertyID = ?
-        WHERE SourcePayrollFactorID = ? AND SourceMonthID = ?
+            SourcePayrollFactorID, SourceMonthID, DestEmploymentTypeID,
+            SourceBackFormulaID, DestStatuteFactorPropertyID, DestFormulaID
+        ) VALUES (?, ?, ?, ?, ?, ?)
     """
 
-    inserted = 0
-    updated = 0
+    formulas_inserted = 0
+    properties_inserted = 0
     skipped_no_factor = 0
 
     for _, row in versions_df.iterrows():
@@ -451,48 +517,46 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
         else:
             back_id = None
 
-        key = (source_pf_id, month_id)
-        if key in already:
-            prop_id, formula_id = already[key]
-            dest_cursor.execute(
-                update_formula_sql,
-                (FORMULA_STUB_BODY, description, FORMULA_MODULE_STAFF, formula_id),
-            )
-            dest_cursor.execute(
-                update_property_sql,
-                (month_id, month_id, PROPERTY_STATUS_ACTIVE, formula_id, prop_id),
-            )
-            dest_cursor.execute(
-                update_prop_map_sql,
-                (back_id, formula_id, prop_id, source_pf_id, month_id),
-            )
-            updated += 1
-            continue
-
+        # One shared formula for all employment types of this version
         formula_last_id += 1
         dest_cursor.execute(
             insert_formula_sql,
-            (formula_last_id, FORMULA_STUB_BODY, FORMULA_MODULE_STAFF, description),
-        )
-
-        property_last_id += 1
-        dest_cursor.execute(
-            insert_property_sql,
             (
-                property_last_id,
-                dest_factor_id,
-                month_id,
-                month_id,
-                PROPERTY_STATUS_ACTIVE,
                 formula_last_id,
+                FORMULA_STUB_BODY,
+                uiobject_blob,
+                FORMULA_MODULE_STAFF,
+                description,
             ),
         )
-        dest_cursor.execute(
-            insert_prop_map_sql,
-            (source_pf_id, month_id, back_id, property_last_id, formula_last_id),
-        )
-        already[key] = (property_last_id, formula_last_id)
-        inserted += 1
+        formulas_inserted += 1
+
+        for et_id in et_ids:
+            property_last_id += 1
+            dest_cursor.execute(
+                insert_property_sql,
+                (
+                    property_last_id,
+                    dest_factor_id,
+                    et_id,
+                    month_id,
+                    month_id,
+                    PROPERTY_STATUS_ACTIVE,
+                    formula_last_id,
+                ),
+            )
+            dest_cursor.execute(
+                insert_prop_map_sql,
+                (
+                    source_pf_id,
+                    month_id,
+                    et_id,
+                    back_id,
+                    property_last_id,
+                    formula_last_id,
+                ),
+            )
+            properties_inserted += 1
 
     dest_cursor.execute(
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
@@ -504,10 +568,11 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
     )
 
     print(
-        f"  -> Properties/formulas inserted: {inserted}. "
-        f"Updated: {updated}. "
+        f"  -> Formulas inserted: {formulas_inserted}. "
+        f"Properties inserted: {properties_inserted}. "
         f"Skipped (no factor map): {skipped_no_factor}. "
-        f"Source versions considered: {len(versions_df)}."
+        f"Source versions: {len(versions_df)}. "
+        f"ETs each: {len(et_ids)}."
     )
 
 
@@ -519,7 +584,10 @@ def run():
 
     try:
         setup_statute_factor_mapping_table(dest_cursor)
-        setup_statute_factor_property_mapping_table(dest_cursor)
+        # Keep legacy property mapping until clear can use it to delete old rows
+        setup_statute_factor_property_mapping_table(
+            dest_cursor, recreate_if_legacy=False
+        )
 
         _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor)
         _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor)
