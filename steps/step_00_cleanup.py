@@ -48,6 +48,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'OrgStructureDescriptionMigrationMapping',
     'StatuteTypeMigrationMapping',
     'StatuteFactorMigrationMapping',
+    'StatuteFactorPropertyMigrationMapping',
     'ResearchMigrationMapping',
     'RewardPunishMigrationMapping',
     'AppraisalMigrationMapping',
@@ -187,7 +188,7 @@ def _delete_migrated_addresses(cursor):
 def _delete_migrated_statute_factors(cursor):
     """
     Delete dependents of migrated StatuteFactors, then the factors themselves.
-    Safe when property/value steps are added later.
+    Also removes Formulas created for migrated StatuteFactorProperty rows.
     """
     if not _mapping_exists(cursor, 'StatuteFactorMigrationMapping'):
         print("  -> StatuteFactorMigrationMapping not found, skip statute factors.")
@@ -206,6 +207,12 @@ def _delete_migrated_statute_factors(cursor):
             INNER JOIN master.dbo.StatuteFactorMigrationMapping m
                 ON stf.StatuteFactorRef = m.DestStatuteFactorID
         """),
+        ('Formula (migrated statute factor properties)', """
+            DELETE f
+            FROM HCM3.Formula f
+            INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                ON f.FormulaID = m.DestFormulaID
+        """),
         ('StatuteFactorProperty (migrated factors)', """
             DELETE sfp
             FROM HCM3.StatuteFactorProperty sfp
@@ -219,6 +226,11 @@ def _delete_migrated_statute_factors(cursor):
                 ON o.StatuteFactorRef = m.DestStatuteFactorID
         """),
     ):
+        if 'StatuteFactorPropertyMigrationMapping' in sql and not _mapping_exists(
+            cursor, 'StatuteFactorPropertyMigrationMapping'
+        ):
+            print("  -> StatuteFactorPropertyMigrationMapping not found, skip Formula cleanup.")
+            continue
         _delete_joined(cursor, label, sql)
 
     return _delete_by_mapping(
