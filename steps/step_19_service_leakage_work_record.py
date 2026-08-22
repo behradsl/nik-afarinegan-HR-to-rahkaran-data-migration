@@ -13,6 +13,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes, sync_lookup
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 from utils.org_migration import ensure_table_id
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -229,6 +230,7 @@ def run():
             'WorkRecordExtra1',
             WORK_RECORD_EXTRA1_LOOKUP_VALUES,
         )
+        ensure_hcm_extra_fields(dest_cursor, ('WorkRecordExtra1',))
 
         print("Fetching Service Leakage rows...")
         source_df = pd.read_sql("""

@@ -4,6 +4,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_lookup_codes, sync_lookup
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -328,6 +329,7 @@ def run():
             return
 
         print("Syncing EmployeeRelativeExtra1 from cause of being relative (علت ایجاد تحت تکفل)...")
+        ensure_hcm_extra_fields(dest_cursor, ('EmployeeRelativeExtra1',))
         work_df['CreateStatusClean'] = work_df['CreateStatusName'].apply(clean_persian_text)
         cause_names = [
             n for n in work_df['CreateStatusClean'].dropna().unique().tolist() if n

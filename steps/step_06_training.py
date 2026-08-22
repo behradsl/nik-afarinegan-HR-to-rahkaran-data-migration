@@ -18,6 +18,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_lookup_codes, sync_lookup
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -173,6 +174,9 @@ def run():
             'EmployeeTrainingExtra2',
             EMPLOYEE_TRAINING_EXTRA2_LOOKUP,
             overwrite_values=True,
+        )
+        ensure_hcm_extra_fields(
+            dest_cursor, ('EmployeeTrainingExtra1', 'EmployeeTrainingExtra2')
         )
 
         print("Fetching Source Education / Training History...")

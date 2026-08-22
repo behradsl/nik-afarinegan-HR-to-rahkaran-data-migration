@@ -2,6 +2,7 @@
 import pandas as pd
 from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
 from utils.lookup_helpers import sync_lookup, ensure_lookup_codes, ensure_lookup_info
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 
 DEFAULT_TITLE = '-'
 DEFAULT_JOB_CLASS_CODE = 1
@@ -702,8 +703,7 @@ def _load_post_extra_maps(source_cnxn, dest_cnxn, dest_cursor):
     plus per-post source values.
     Returns (extra1_by_post, extra2_by_post) where values are dest lookup codes.
     """
-    ensure_lookup_info(dest_cursor, POST_EXTRA1_LOOKUP, POST_EXTRA1_TITLE)
-    ensure_lookup_info(dest_cursor, POST_EXTRA2_LOOKUP, POST_EXTRA2_TITLE)
+    ensure_hcm_extra_fields(dest_cursor, (POST_EXTRA1_LOOKUP, POST_EXTRA2_LOOKUP))
 
     org_df = pd.read_sql("""
         SELECT

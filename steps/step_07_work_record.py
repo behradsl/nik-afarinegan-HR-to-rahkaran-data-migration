@@ -5,6 +5,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 from utils.org_migration import (
     ensure_departments,
     ensure_jobs,
@@ -311,6 +312,9 @@ def run():
             dest_cursor,
             'WorkRecordExtra2',
             WORK_RECORD_EXTRA2_LOOKUP_VALUES,
+        )
+        ensure_hcm_extra_fields(
+            dest_cursor, ('WorkRecordExtra1', 'WorkRecordExtra2')
         )
 
         print("Preparing ID generator...")
