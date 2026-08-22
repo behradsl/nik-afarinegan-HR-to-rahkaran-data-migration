@@ -81,6 +81,61 @@ def _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists):
         )
 
 
+LOOKUP_INFO_IDGEN_TABLE = 'SYS3.LookupInfo'
+
+
+def ensure_lookup_info(dest_cursor, lookup_type, title, *, is_dynamic=True):
+    """
+    Ensure a SYS3.LookupInfo row exists for lookup_type.
+    Updates Title when the row already exists and title differs.
+    """
+    dest_cursor.execute(
+        "SELECT LookupInfoID, Title FROM SYS3.LookupInfo WHERE Type = ?",
+        (lookup_type,),
+    )
+    row = dest_cursor.fetchone()
+    if row:
+        existing_title = row[1]
+        if title and existing_title != title:
+            dest_cursor.execute(
+                "UPDATE SYS3.LookupInfo SET Title = ? WHERE Type = ?",
+                (title, lookup_type),
+            )
+            print(f"  -> LookupInfo title updated for {lookup_type}: {title}")
+        return int(row[0])
+
+    dest_cursor.execute(
+        """
+        SELECT LastId
+        FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK)
+        WHERE TableName = ?
+        """,
+        (LOOKUP_INFO_IDGEN_TABLE,),
+    )
+    id_row = dest_cursor.fetchone()
+    last_id = int(id_row[0]) if id_row else 0
+    last_id += 1
+    dest_cursor.execute(
+        """
+        INSERT INTO SYS3.LookupInfo (LookupInfoID, Type, Title, IsDynamic)
+        VALUES (?, ?, ?, ?)
+        """,
+        (last_id, lookup_type, title, 1 if is_dynamic else 0),
+    )
+    if id_row:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
+            (last_id, LOOKUP_INFO_IDGEN_TABLE),
+        )
+    else:
+        dest_cursor.execute(
+            "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES (?, ?)",
+            (LOOKUP_INFO_IDGEN_TABLE, last_id),
+        )
+    print(f"  -> LookupInfo created for {lookup_type}: {title}")
+    return last_id
+
+
 def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, overwrite_values=False):
     """
     Ensure fixed Code→Value pairs exist in SYS3.Lookup for lookup_type.

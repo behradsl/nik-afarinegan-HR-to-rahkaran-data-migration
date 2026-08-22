@@ -68,6 +68,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'DepartmentMigrationMapping',
     'PartyMigrationMapping',
     'DegreeMigrationMapping',
+    'PerformancePeriodYearMigrationMapping',
 )
 
 
@@ -132,24 +133,45 @@ def _clear_employment_number_fields(cursor):
     """)
 
 
+def _migrated_employee_filter_sql(employee_alias='e'):
+    """
+    SQL predicate: employee was created by this migration
+    (same rules as _delete_migrated_employees).
+    """
+    return f"""
+        EXISTS (
+            SELECT 1
+            FROM master.dbo.PartyMigrationMapping m
+            INNER JOIN GNR3.Party p ON p.PartyID = m.DestPartyID
+            WHERE m.DestPartyID = {employee_alias}.PartyRef
+              AND (
+                    (
+                        p.CreationDate >= DATEADD(HOUR, -12, m.MigrationDate)
+                    AND p.CreationDate <= DATEADD(HOUR, 12, m.MigrationDate)
+                    )
+                 OR (
+                        {employee_alias}.CreationDate >= DATEADD(HOUR, -12, m.MigrationDate)
+                    AND {employee_alias}.CreationDate <= DATEADD(HOUR, 12, m.MigrationDate)
+                    )
+              )
+        )
+    """
+
+
 def _delete_migrated_marriages(cursor):
-    """Remove marriage rows created alongside migrated spouse relatives."""
-    if not _mapping_exists(cursor, 'RelativeMigrationMapping'):
-        print("  -> RelativeMigrationMapping not found, skip marriage cleanup.")
+    """
+    Remove EmployeeMarriage for employees that cleanup will delete.
+    Broader than relative-mapping alone so leftover single/married rows
+    cannot block Employee DELETE.
+    """
+    if not _mapping_exists(cursor, 'PartyMigrationMapping'):
+        print("  -> PartyMigrationMapping not found, skip marriage cleanup.")
         return 0
-    return _delete_joined(cursor, 'EmployeeMarriage (migrated)', """
+    return _delete_joined(cursor, 'EmployeeMarriage (migrated employees)', f"""
         DELETE mar
         FROM HCM3.EmployeeMarriage mar
-        WHERE mar.EmployeeRef IN (
-            SELECT DISTINCT r.EmployeeRef
-            FROM HCM3.EmployeeRelative r
-            INNER JOIN master.dbo.RelativeMigrationMapping m
-                ON m.DestEmployeeRelativeID = r.EmployeeRelativeID
-        )
-        AND mar.CreationDate >= (
-            SELECT MIN(MigrationDate)
-            FROM master.dbo.RelativeMigrationMapping
-        )
+        INNER JOIN HCM3.Employee e ON e.EmployeeID = mar.EmployeeRef
+        WHERE {_migrated_employee_filter_sql('e')}
     """)
 
 
@@ -189,6 +211,7 @@ def _delete_migrated_statute_factors(cursor):
     """
     Delete dependents of migrated StatuteFactors, then the factors themselves.
     Also removes Formulas created for migrated StatuteFactorProperty rows.
+    Order: clear/delete properties first (they FK Formula), then formulas, then factors.
     """
     if not _mapping_exists(cursor, 'StatuteFactorMigrationMapping'):
         print("  -> StatuteFactorMigrationMapping not found, skip statute factors.")
@@ -207,18 +230,6 @@ def _delete_migrated_statute_factors(cursor):
             INNER JOIN master.dbo.StatuteFactorMigrationMapping m
                 ON stf.StatuteFactorRef = m.DestStatuteFactorID
         """),
-        ('Formula (migrated statute factor properties)', """
-            DELETE f
-            FROM HCM3.Formula f
-            INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
-                ON f.FormulaID = m.DestFormulaID
-        """),
-        ('StatuteFactorProperty (migrated factors)', """
-            DELETE sfp
-            FROM HCM3.StatuteFactorProperty sfp
-            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
-                ON sfp.StatuteFactorRef = m.DestStatuteFactorID
-        """),
         ('StatuteFactorDisplayOrder (migrated factors)', """
             DELETE o
             FROM HCM3.StatuteFactorDisplayOrder o
@@ -226,12 +237,37 @@ def _delete_migrated_statute_factors(cursor):
                 ON o.StatuteFactorRef = m.DestStatuteFactorID
         """),
     ):
-        if 'StatuteFactorPropertyMigrationMapping' in sql and not _mapping_exists(
-            cursor, 'StatuteFactorPropertyMigrationMapping'
-        ):
-            print("  -> StatuteFactorPropertyMigrationMapping not found, skip Formula cleanup.")
-            continue
         _delete_joined(cursor, label, sql)
+
+    if _mapping_exists(cursor, 'StatuteFactorPropertyMigrationMapping'):
+        # Detach then delete properties before formulas (FormulaRef FK)
+        _exec_count(cursor, 'StatuteFactorProperty.FormulaRef cleared', """
+            UPDATE sfp
+            SET sfp.FormulaRef = NULL
+            FROM HCM3.StatuteFactorProperty sfp
+            INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                ON sfp.StatuteFactorPropertyID = m.DestStatuteFactorPropertyID
+        """)
+        _delete_joined(cursor, 'StatuteFactorProperty (migrated)', """
+            DELETE sfp
+            FROM HCM3.StatuteFactorProperty sfp
+            INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                ON sfp.StatuteFactorPropertyID = m.DestStatuteFactorPropertyID
+        """)
+        _delete_joined(cursor, 'Formula (migrated statute factor properties)', """
+            DELETE f
+            FROM HCM3.Formula f
+            INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
+                ON f.FormulaID = m.DestFormulaID
+        """)
+    else:
+        print("  -> StatuteFactorPropertyMigrationMapping not found, skip property/formula cleanup.")
+        _delete_joined(cursor, 'StatuteFactorProperty (by factor map)', """
+            DELETE sfp
+            FROM HCM3.StatuteFactorProperty sfp
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON sfp.StatuteFactorRef = m.DestStatuteFactorID
+        """)
 
     return _delete_by_mapping(
         cursor,
@@ -240,6 +276,33 @@ def _delete_migrated_statute_factors(cursor):
         'StatuteFactorID',
         'DestStatuteFactorID',
     )
+
+
+def _prepare_statute_delete(cursor):
+    """Remove EmployeeStatute children that would block statute DELETE."""
+    if not _mapping_exists(cursor, 'StatuteMigrationMapping'):
+        return
+    for label, sql in (
+        ('EmployeeStatuteFactor (migrated statutes)', """
+            DELETE esf
+            FROM HCM3.EmployeeStatuteFactor esf
+            INNER JOIN master.dbo.StatuteMigrationMapping m
+                ON esf.EmployeeStatuteRef = m.DestEmployeeStatuteID
+        """),
+        ('EmployeeStatuteStateHistory (migrated statutes)', """
+            DELETE h
+            FROM HCM3.EmployeeStatuteStateHistory h
+            INNER JOIN master.dbo.StatuteMigrationMapping m
+                ON h.EmployeeStatuteRef = m.DestEmployeeStatuteID
+        """),
+        ('EmployeeStatuteTempPost (migrated statutes)', """
+            DELETE t
+            FROM HCM3.EmployeeStatuteTempPost t
+            INNER JOIN master.dbo.StatuteMigrationMapping m
+                ON t.EmployeeStatuteRef = m.DestEmployeeStatuteID
+        """),
+    ):
+        _delete_joined(cursor, label, sql)
 
 
 def _prepare_org_structure_delete(cursor):
@@ -319,6 +382,10 @@ def _null_master_fks_before_delete(cursor):
         """)
 
     if _mapping_exists(cursor, 'PostMigrationMapping'):
+        _exec_count(cursor, 'PostJob for migrated posts cleared', """
+            DELETE FROM HCM3.PostJob
+            WHERE PostRef IN (SELECT DestPostID FROM master.dbo.PostMigrationMapping)
+        """)
         _exec_count(cursor, 'WR/Statute PostRef cleared', """
             UPDATE wr
             SET wr.PostRef = NULL,
@@ -387,21 +454,18 @@ def _delete_migrated_employees(cursor):
     """
     Delete employees created for mapped parties:
     - party inserted by migration, or
-    - employee created at/after the party mapping time (linked party, new employee).
+    - employee created near the party mapping time (linked party, new employee).
     Pre-existing employees on linked parties are kept.
     """
     if not _mapping_exists(cursor, 'PartyMigrationMapping'):
         print("  -> PartyMigrationMapping not found, skip Employee cleanup.")
         return 0
-    return _delete_joined(cursor, 'HCM3.Employee (migrated)', """
+    # Final sweep: any remaining marriages for these employees
+    _delete_migrated_marriages(cursor)
+    return _delete_joined(cursor, 'HCM3.Employee (migrated)', f"""
         DELETE e
         FROM HCM3.Employee e
-        INNER JOIN master.dbo.PartyMigrationMapping m
-            ON e.PartyRef = m.DestPartyID
-        INNER JOIN GNR3.Party p
-            ON p.PartyID = m.DestPartyID
-        WHERE p.CreationDate >= DATEADD(MINUTE, -10, m.MigrationDate)
-           OR e.CreationDate >= DATEADD(MINUTE, -10, m.MigrationDate)
+        WHERE {_migrated_employee_filter_sql('e')}
     """)
 
 
@@ -415,8 +479,8 @@ def _delete_migrated_parties(cursor):
         FROM GNR3.Party p
         INNER JOIN master.dbo.PartyMigrationMapping m
             ON p.PartyID = m.DestPartyID
-        WHERE p.CreationDate >= DATEADD(MINUTE, -10, m.MigrationDate)
-          AND p.CreationDate <= DATEADD(MINUTE, 10, m.MigrationDate)
+        WHERE p.CreationDate >= DATEADD(HOUR, -12, m.MigrationDate)
+          AND p.CreationDate <= DATEADD(HOUR, 12, m.MigrationDate)
     """)
 
 
@@ -451,11 +515,15 @@ def run():
         print("Preparing org-structure / description cleanup...")
         _prepare_org_structure_delete(dest_cursor)
 
+        print("Preparing statute child cleanup...")
+        _prepare_statute_delete(dest_cursor)
+
         print("Deleting mapped child records (history / statutes / structure)...")
         # Delete through OrgStructure in DELETE_BY_MAPPING; stop before masters
         child_tables = {
             'PersonnelImageMigrationMapping',
             'WarriorMigrationMapping',
+            'ServiceLeakageMigrationMapping',
             'WorkRecordMigrationMapping',
             'StatuteMigrationMapping',
             'OrgStructureMigrationMapping',
@@ -512,8 +580,8 @@ def run():
         dest_cnxn.commit()
         print("Success! Migrated destination data and mapping tables cleaned up.")
         print(
-            "Note: SYS3.Lookup values (WorkLocation, Rank, EducationDegree, etc.) "
-            "created during sync are left in place."
+            "Note: SYS3.Lookup values (WorkLocation, Rank, EducationDegree, PostExtra*, "
+            "RegionalDivisionType, etc.) created during sync are left in place."
         )
 
     except Exception as e:

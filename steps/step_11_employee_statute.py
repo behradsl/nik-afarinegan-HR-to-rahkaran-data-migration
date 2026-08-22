@@ -7,6 +7,7 @@ from utils.date_helpers import shamsi_to_gregorian
 from utils.org_migration import (
     ensure_departments,
     ensure_employment_types,
+    ensure_jobs,
     ensure_places_as_work_locations,
     ensure_posts,
     ensure_rank_codes_from_grades,
@@ -255,8 +256,24 @@ def run():
         print("Ensuring masters...")
         dept_map = ensure_departments(source_cnxn, dest_cnxn, dest_cursor)
         post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
+        job_map = ensure_jobs(source_cnxn, dest_cnxn, dest_cursor)
         et_map = ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor)
         place_map = ensure_places_as_work_locations(source_cnxn, dest_cnxn, dest_cursor)
+
+        # RuleDocument has no Job FK — resolve via post's TBL_JobID_fk
+        post_job_df = pd.read_sql("""
+            SELECT
+                TBL_PostID AS SourcePostID,
+                TBL_JobID_fk AS SourceJobID
+            FROM dbo.TBL_Post
+            WHERE TBL_PostID > 0
+              AND TBL_JobID_fk IS NOT NULL
+              AND TBL_JobID_fk > 0
+        """, source_cnxn)
+        post_to_job = {
+            int(r['SourcePostID']): int(r['SourceJobID'])
+            for _, r in post_job_df.iterrows()
+        }
 
         print("Ensuring Statute Types from RuleType...")
         statute_type_map = ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor)
@@ -314,6 +331,7 @@ def run():
                 rd.HRS_RdExportDate AS ExportDate,
                 rd.HRS_RdExcuteDate AS ExecuteDate,
                 rd.HRS_RdEndDate AS EndDate,
+                rd.HRS_RdContractEndDate AS ContractEndDate,
                 rd.HRS_RdPersonalGrade AS PersonalGrade,
                 rd.HRS_RdNote AS Note,
                 rd.HRS_RdTitle AS Title,
@@ -359,11 +377,11 @@ def run():
             INSERT INTO HCM3.EmployeeStatute (
                 EmployeeStatuteID, EmployeeRef, EmploymentTypeRef, StatuteTypeRef,
                 Number, IssueDate, ApplyDate, ExpiryDate,
-                OrganizationalStructureRef, PostRef, DepartmentRef,
+                OrganizationalStructureRef, PostRef, DepartmentRef, JobRef,
                 WorkLocationCode, RankCode, Description, Status,
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 GETDATE(), 1, GETDATE(), 1
             )
         """
@@ -375,15 +393,15 @@ def run():
 
         inserted = 0
         skipped_already = 0
+        expiry_updated = 0
+        job_updated = 0
         with_structure = 0
         without_structure = 0
+        with_job = 0
 
         print(f"Inserting EmployeeStatute records ({len(work_df)} candidates)...")
         for _, row in work_df.iterrows():
             source_rd_id = int(row['SourceRuleDocumentID'])
-            if source_rd_id in already:
-                skipped_already += 1
-                continue
 
             employee_id = int(row['EmployeeID'])
             source_et = _positive_fk(row['SourceEmploymentTypeID'])
@@ -398,6 +416,11 @@ def run():
             post_ref = post_map.get(source_post) if source_post else None
             statute_type_ref = statute_type_map.get(source_rt) if source_rt else None
 
+            source_job = post_to_job.get(source_post) if source_post else None
+            job_ref = job_map.get(source_job) if source_job else None
+            if job_ref:
+                with_job += 1
+
             number = clean_persian_text(row['RuleNo'])
             if number:
                 number = number[:200]
@@ -405,8 +428,45 @@ def run():
             issue_date = _parse_shamsi_date(row['ExportDate'])
             apply_date = _parse_shamsi_date(row['ExecuteDate'])
             expiry_date = _parse_shamsi_date(row['EndDate'], treat_open_end_as_null=True)
+            if expiry_date is None:
+                # جاری: use تاریخ خاتمه قرارداد when EndDate empty/open
+                expiry_date = _parse_shamsi_date(
+                    row['ContractEndDate'], treat_open_end_as_null=True
+                )
 
             rank_code = _positive_fk(row['PersonalGrade'])
+
+            if source_rd_id in already:
+                dest_statute_id = already[source_rd_id]
+                dest_cursor.execute(
+                    """
+                    UPDATE HCM3.EmployeeStatute
+                    SET ExpiryDate = ?,
+                        JobRef = ?,
+                        LastModificationDate = GETDATE(),
+                        LastModifier = 1
+                    WHERE EmployeeStatuteID = ?
+                      AND (
+                        (ExpiryDate IS NULL AND ? IS NOT NULL)
+                        OR (ExpiryDate IS NOT NULL AND ? IS NULL)
+                        OR (ExpiryDate IS NOT NULL AND ? IS NOT NULL AND ExpiryDate <> ?)
+                        OR ISNULL(JobRef, -1) <> ISNULL(?, -1)
+                      )
+                    """,
+                    (
+                        expiry_date, job_ref, dest_statute_id,
+                        expiry_date, expiry_date, expiry_date, expiry_date,
+                        job_ref,
+                    ),
+                )
+                if dest_cursor.rowcount:
+                    # Count job fill separately when JobRef was previously null
+                    if job_ref is not None:
+                        job_updated += 1
+                    else:
+                        expiry_updated += 1
+                skipped_already += 1
+                continue
 
             structure_ref = _resolve_structure_ref(
                 source_post,
@@ -446,6 +506,7 @@ def run():
                     structure_ref,
                     post_ref,
                     dept_ref,
+                    job_ref,
                     place_code,
                     rank_code,
                     description,
@@ -465,9 +526,12 @@ def run():
         print(
             f"Success! Statutes inserted: {inserted}. "
             f"Skipped (already mapped): {skipped_already}. "
+            f"ExpiryDate/JobRef updated: {expiry_updated + job_updated} "
+            f"(job fills: {job_updated}). "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"With structure ref: {with_structure}. "
-            f"Without structure ref: {without_structure}."
+            f"Without structure ref: {without_structure}. "
+            f"With JobRef (candidates): {with_job}."
         )
 
     except Exception as e:

@@ -71,6 +71,7 @@ def _resolve_marriage_start(row):
         ('WelfareCreateDate', False),
         ('InsuranceCreateDate', False),
         ('RegisterDate', True),
+        ('EmployeDate', False),  # fallback: employee hire date when no marriage date
     ):
         parsed = _parse_shamsi_date(row.get(col), reject_mass_register=reject_mass)
         if parsed:
@@ -282,9 +283,11 @@ def run():
                 ss.HRS_SsRegisterDate AS RegisterDate,
                 ss.HRS_SsWelfareDeleteDate AS WelfareDeleteDate,
                 ss.HRS_InsuranceDeleteDate AS InsuranceDeleteDate,
-                ss.HRS_SsDeathDate AS DeathDate
+                ss.HRS_SsDeathDate AS DeathDate,
+                p.TBL_PersonnelEmployeDate AS EmployeDate
             FROM dbo.HRS_SponsorShip ss
             LEFT JOIN dbo.HRS_PayBase pb ON pb.HRS_PayBaseID = ss.HRS_CreateStatusID_fk
+            LEFT JOIN dbo.TBL_Personnel p ON p.TBL_PersonnelID = ss.TBL_PersonnelID_fk
             WHERE ss.TBL_PersonnelID_fk IS NOT NULL
               AND ss.TBL_PersonnelID_fk > 0
               AND ss.HRS_SponserRelatedID_fk IN (30002, 30003, 30004, 30005, 30006)

@@ -31,8 +31,8 @@ PROPERTY_STATUS_ACTIVE = 1
 FORMULA_MODULE_STAFF = 'Staff'
 # Match Rahkaran designer stub used by utils/formula_uiobject_return0.bin
 FORMULA_STUB_BODY = ' return 0;'
-FORMULA_UIOBJECT_TEMPLATE = Path(__file__).resolve().parent.parent / (
-    'utils' / 'formula_uiobject_return0.bin'
+FORMULA_UIOBJECT_TEMPLATE = (
+    Path(__file__).resolve().parent.parent / 'utils' / 'formula_uiobject_return0.bin'
 )
 
 

@@ -265,7 +265,8 @@ def run():
             SELECT
                 TBL_PostID AS SourcePostID,
                 TBL_OcID_fk AS SourceOcID,
-                TBL_DepartmentID_fk AS SourceDepartmentID
+                TBL_DepartmentID_fk AS SourceDepartmentID,
+                TBL_PostParentID_fk AS SourceParentPostID
             FROM dbo.TBL_Post
             WHERE TBL_PostID > 0
               AND TBL_OcID_fk IS NOT NULL
@@ -376,6 +377,9 @@ def run():
             dept_nodes += d_ins
             skipped_no_dept_master += d_skip
 
+            post_local = {}  # SourcePostID -> DestOrganizationalStructureID
+            pending_parent = []  # (dest_os_id, source_parent_post_id)
+
             for _, prow in oc_posts.iterrows():
                 source_post_id = int(prow['SourcePostID'])
                 dest_post = post_map.get(source_post_id)
@@ -406,6 +410,10 @@ def run():
                     insert_map_sql,
                     (oc_id, NODE_POST, source_post_id, structure_last_id),
                 )
+                post_local[source_post_id] = structure_last_id
+                source_parent_post = _positive_fk(prow['SourceParentPostID'])
+                if source_parent_post and source_parent_post != source_post_id:
+                    pending_parent.append((structure_last_id, source_parent_post))
                 post_nodes += 1
 
                 item_last_id += 1
@@ -420,6 +428,26 @@ def run():
                     ),
                 )
                 items_inserted += 1
+
+            # Prefer post→post parent when parent post is on the same chart
+            parent_linked = 0
+            for dest_os_id, source_parent_post in pending_parent:
+                parent_os = post_local.get(source_parent_post)
+                if not parent_os:
+                    continue
+                dest_cursor.execute(
+                    """
+                    UPDATE HCM3.OrganizationalStructure
+                    SET ParentRef = ?
+                    WHERE OrganizationalStructureID = ?
+                      AND ISNULL(ParentRef, -1) <> ?
+                    """,
+                    (parent_os, dest_os_id, parent_os),
+                )
+                if dest_cursor.rowcount:
+                    parent_linked += 1
+            if parent_linked:
+                print(f"    -> Post→post parents linked: {parent_linked}.")
 
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? "

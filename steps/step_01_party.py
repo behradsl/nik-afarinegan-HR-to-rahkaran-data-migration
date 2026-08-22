@@ -22,6 +22,42 @@ def setup_mapping_table(cursor):
     cursor.commit()
 
 
+def _party_fields_from_row(row, city_map):
+    first_name = clean_persian_text(row['FirstName'])
+    last_name = clean_persian_text(row['LastName'])
+    national_no = clean_value(row['NationalNo'])
+    id_number = clean_value(row['IDNumber'])
+    if id_number is not None:
+        id_number = str(id_number).strip() or None
+        if id_number and len(id_number) > 20:
+            id_number = id_number[:20]
+
+    gender = 1 if row['SexID'] == 10001 else (2 if row['SexID'] == 10002 else None)
+    marital_status = (
+        1 if row['MaritalStatusID'] == 20001
+        else (2 if row['MaritalStatusID'] == 20002
+              else (3 if row['MaritalStatusID'] == 20003 else None))
+    )
+    birth_place = clean_persian_text(row['BirthPlace'])
+    export_place = clean_persian_text(row['ExportPlace'])
+
+    return {
+        'FirstName': first_name,
+        'LastName': last_name,
+        'NationalID': national_no,
+        'FatherName': clean_persian_text(row['FatherName']),
+        'BirthDate': shamsi_to_gregorian(row['BirthDate']),
+        'BirthPlaceRef': city_map.get(birth_place) if birth_place else None,
+        'IssuancePlaceRef': city_map.get(export_place) if export_place else None,
+        'Mobile': clean_value(row['Mobile']),
+        'Tel': clean_value(row['Tel']),
+        'IDNumber': id_number,
+        'IDSerial': clean_value(row['IDSerial']),
+        'Gender': gender,
+        'MaritalStatus': marital_status,
+    }
+
+
 def run():
     print("\n--- Running Step 1: Base Party Migration ---")
 
@@ -60,7 +96,6 @@ def run():
         int(r['SourceID']): int(r['DestPartyID'])
         for _, r in mapped_df.iterrows()
     }
-    mapped_ids = set(already_map.keys())
     dest_party_df = pd.read_sql("""
         SELECT
             PartyID,
@@ -84,7 +119,6 @@ def run():
             mobile_to_party.setdefault(str(mobile).strip(), party_id)
         full_name = prow['FullName']
         if pd.notna(full_name) and str(full_name).strip():
-            # Normalize for comparison with cleaned source names
             fullname_to_party.setdefault(normalize_persian(str(full_name).strip()), party_id)
 
     cities_df = pd.read_sql("SELECT Name, RegionalDivisionID FROM GNR3.RegionalDivision", dest_cnxn)
@@ -95,76 +129,38 @@ def run():
     }
 
     to_insert = []
-    to_link = []  # (SourceID, DestPartyID)
-    to_backfill_idnumber = []  # (IDNumber, DestPartyID)
+    to_link = []  # (SourceID, DestPartyID, fields)
+    to_update = []  # (DestPartyID, fields)
 
     for _, row in source_df.iterrows():
         source_id = int(row['SourceID'])
-        id_number = clean_value(row['IDNumber'])
-        if id_number is not None:
-            id_number = str(id_number).strip() or None
-            if id_number and len(id_number) > 20:
-                id_number = id_number[:20]
+        fields = _party_fields_from_row(row, city_map)
 
-        # Already mapped: backfill IDNumber on re-run
         if source_id in already_map:
-            if id_number:
-                to_backfill_idnumber.append((id_number, already_map[source_id]))
+            to_update.append((already_map[source_id], fields))
             continue
 
-        first_name = clean_persian_text(row['FirstName'])
-        last_name = clean_persian_text(row['LastName'])
-
         existing_party_id = None
-        national_no = clean_value(row['NationalNo'])
+        national_no = fields['NationalID']
         if national_no and str(national_no).strip() in national_to_party:
             existing_party_id = national_to_party[str(national_no).strip()]
         else:
-            mobile = clean_value(row['Mobile'])
+            mobile = fields['Mobile']
             if mobile and str(mobile).strip() in mobile_to_party:
                 existing_party_id = mobile_to_party[str(mobile).strip()]
             else:
-                full_name = f"{first_name or ''}{last_name or ''}"
+                full_name = f"{fields['FirstName'] or ''}{fields['LastName'] or ''}"
                 if full_name and full_name in fullname_to_party:
                     existing_party_id = fullname_to_party[full_name]
 
         if existing_party_id is not None:
-            to_link.append((source_id, existing_party_id))
-            if id_number:
-                to_backfill_idnumber.append((id_number, existing_party_id))
-            mapped_ids.add(source_id)
+            to_link.append((source_id, existing_party_id, fields))
             continue
 
-        gregorian_birthdate = shamsi_to_gregorian(row['BirthDate'])
-        gender = 1 if row['SexID'] == 10001 else (2 if row['SexID'] == 10002 else None)
-        marital_status = (
-            1 if row['MaritalStatusID'] == 20001
-            else (2 if row['MaritalStatusID'] == 20002
-                  else (3 if row['MaritalStatusID'] == 20003 else None))
-        )
+        to_insert.append({'SourceID': source_id, **fields})
 
-        birth_place = clean_persian_text(row['BirthPlace'])
-        export_place = clean_persian_text(row['ExportPlace'])
-
-        to_insert.append({
-            'SourceID': source_id,
-            'FirstName': first_name,
-            'LastName': last_name,
-            'NationalID': national_no,
-            'FatherName': clean_persian_text(row['FatherName']),
-            'BirthDate': gregorian_birthdate,
-            'BirthPlaceRef': city_map.get(birth_place) if birth_place else None,
-            'IssuancePlaceRef': city_map.get(export_place) if export_place else None,
-            'Mobile': clean_value(row['Mobile']),
-            'Tel': clean_value(row['Tel']),
-            'IDNumber': id_number,
-            'IDSerial': clean_value(row['IDSerial']),
-            'Gender': gender,
-            'MaritalStatus': marital_status,
-        })
-
-    if not to_insert and not to_link and not to_backfill_idnumber:
-        print("No new Party records to migrate.")
+    if not to_insert and not to_link and not to_update:
+        print("No Party records to migrate or update.")
         source_cnxn.close()
         dest_cnxn.close()
         return
@@ -174,18 +170,35 @@ def run():
             INSERT INTO master.dbo.PartyMigrationMapping (SourceID, DestPartyID)
             VALUES (?, ?)
         """
-        update_idnumber_sql = """
+        update_party_sql = """
             UPDATE GNR3.Party
-            SET IDNumber = ?,
-                LastModificationDate = GETDATE(),
-                LastModifier = 1
+            SET FirstName = ?, LastName = ?, NationalID = ?, FatherName = ?,
+                BirthDate = ?, BirthPlaceRef = ?, IssuancePlaceRef = ?,
+                Mobile = ?, Tel = ?, IDNumber = ?, IDSerial = ?,
+                Gender = ?, MaritalStatus = ?,
+                LastModificationDate = GETDATE(), LastModifier = 1
             WHERE PartyID = ?
         """
 
+        def apply_update(dest_party_id, fields):
+            dest_cursor.execute(update_party_sql, (
+                fields['FirstName'], fields['LastName'], fields['NationalID'],
+                fields['FatherName'], fields['BirthDate'], fields['BirthPlaceRef'],
+                fields['IssuancePlaceRef'], fields['Mobile'], fields['Tel'],
+                fields['IDNumber'], fields['IDSerial'], fields['Gender'],
+                fields['MaritalStatus'], dest_party_id,
+            ))
+            return 1 if dest_cursor.rowcount else 0
+
         linked = 0
-        for source_id, dest_party_id in to_link:
+        updated = 0
+        for source_id, dest_party_id, fields in to_link:
             dest_cursor.execute(insert_mapping_sql, (source_id, dest_party_id))
+            updated += apply_update(dest_party_id, fields)
             linked += 1
+
+        for dest_party_id, fields in to_update:
+            updated += apply_update(dest_party_id, fields)
 
         inserted = 0
         current_last_id = None
@@ -226,16 +239,11 @@ def run():
                 WHERE TableName = 'gnr3.party'
             """, (current_last_id,))
 
-        backfilled = 0
-        for id_number, dest_party_id in to_backfill_idnumber:
-            dest_cursor.execute(update_idnumber_sql, (id_number, dest_party_id))
-            backfilled += 1
-
         dest_cnxn.commit()
         print(
             f"Success! Party inserted: {inserted}. "
             f"Linked existing parties: {linked}. "
-            f"IDNumber backfilled: {backfilled}."
+            f"Parties updated from source: {updated}."
             + (f" New Party LastId is {current_last_id}." if current_last_id is not None else "")
         )
 

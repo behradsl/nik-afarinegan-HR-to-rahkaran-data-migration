@@ -7,6 +7,7 @@ from utils.org_migration import (
     ensure_employment_types,
     ensure_jobs,
     ensure_places_as_work_locations,
+    ensure_post_jobs,
     ensure_posts,
     ensure_rank_codes_from_grades,
 )
@@ -25,10 +26,15 @@ def run():
         ensure_departments(source_cnxn, dest_cnxn, dest_cursor)
 
         print("Migrating all Posts...")
-        ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
+        post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
 
         print("Migrating all Jobs...")
-        ensure_jobs(source_cnxn, dest_cnxn, dest_cursor)
+        job_map = ensure_jobs(source_cnxn, dest_cnxn, dest_cursor)
+
+        print("Linking Post → Job (PostJob)...")
+        ensure_post_jobs(
+            source_cnxn, dest_cnxn, dest_cursor, post_map=post_map, job_map=job_map
+        )
 
         print("Migrating Employment Types...")
         ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor)
