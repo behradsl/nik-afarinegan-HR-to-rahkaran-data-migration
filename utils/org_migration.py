@@ -1,10 +1,21 @@
 """Shared org master migration helpers (Department, Post, Job, EmploymentType, Place)."""
 import pandas as pd
 from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
-from utils.lookup_helpers import sync_lookup, ensure_lookup_codes
+from utils.lookup_helpers import sync_lookup, ensure_lookup_codes, ensure_lookup_info
 
 DEFAULT_TITLE = '-'
 DEFAULT_JOB_CLASS_CODE = 1
+
+# Post Extra lookups (SYS3.Lookup Type / LookupInfo)
+POST_EXTRA1_LOOKUP = 'PostExtra1'  # کد توانیر / کد سازمانی پست
+POST_EXTRA2_LOOKUP = 'PostExtra2'  # شناسه HRS
+POST_EXTRA1_TITLE = 'کد توانیر'
+POST_EXTRA2_TITLE = 'شناسه HRS'
+
+# PayBase: حوزه جغرافيايي پست values live under parent 70 (شهرستانی/استانی/ملی + levels)
+GEO_DOMAIN_ROOT_PARENT = 70
+POST_GEO_DOMAIN_PAYBASE = 9513  # حوزه جغرافيايي پست
+POST_HRIS_PAYBASE = 9505        # شناسه HRS
 
 
 def ensure_table_id(cursor, table_name, default_last_id=0):
@@ -387,6 +398,23 @@ def _active_status(active_raw):
         return 2
 
 
+def _dept_unique_and_abbr(row, source_id, used_unique_codes):
+    """UniqueCode = شناسه یکتای واحد سازمانی; AbbrSign = کد سیستمی توانیر."""
+    unique_code = clean_value(row['DepartmentCode'])
+    if unique_code is not None:
+        unique_code = str(unique_code).strip()[:100] or None
+    if unique_code:
+        base = unique_code
+        if unique_code in used_unique_codes:
+            suffix = f"-{source_id}"
+            unique_code = f"{base[:max(0, 100 - len(suffix))]}{suffix}"
+        used_unique_codes.add(unique_code)
+    abbr = clean_value(row['DepartmentSysCode'])
+    if abbr is not None:
+        abbr = str(abbr).strip()[:50] or None
+    return unique_code, abbr
+
+
 def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
     """Migrate TBL_Department -> HCM3.Department. Returns SourceDepartmentID -> DestDepartmentID."""
     setup_department_mapping_table(dest_cursor)
@@ -396,6 +424,7 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
             TBL_DepartmentID AS SourceDepartmentID,
             TBL_DepartmentName AS DepartmentName,
             TBL_DepartmentCode AS DepartmentCode,
+            TBL_DepartmentSysCode AS DepartmentSysCode,
             TBL_DepartmentActive AS DepartmentActive
         FROM dbo.TBL_Department
         WHERE TBL_DepartmentID > 0
@@ -414,11 +443,6 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
         print("  -> No source departments found.")
         return result
 
-    missing_df = source_df[~source_df['SourceDepartmentID'].isin(result.keys())]
-    if missing_df.empty:
-        print(f"  -> Departments already mapped: {len(result)}.")
-        return result
-
     existing_pairs_df = pd.read_sql(
         "SELECT Code, Title FROM HCM3.Department WHERE Code IS NOT NULL",
         dest_cnxn,
@@ -428,53 +452,120 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
         for _, row in existing_pairs_df.iterrows()
     }
 
-    last_id = ensure_table_id(dest_cursor, 'HCM3.Department', 0)
-    insert_sql = """
-        INSERT INTO HCM3.Department (
-            DepartmentID, Code, Title, RegionalDivisionRef, Status,
-            CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, NULL, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    insert_mapping_sql = """
-        INSERT INTO master.dbo.DepartmentMigrationMapping (
-            SourceDepartmentID, DestDepartmentID
-        ) VALUES (?, ?)
-    """
+    # UniqueCode index is unique when set — reserve codes already on unmapped + mapped depts
+    used_unique_df = pd.read_sql(
+        "SELECT UniqueCode FROM HCM3.Department WHERE NULLIF(LTRIM(RTRIM(UniqueCode)), N'') IS NOT NULL",
+        dest_cnxn,
+    )
+    used_unique_codes = {
+        str(r['UniqueCode']).strip() for _, r in used_unique_df.iterrows()
+    }
 
+    # Drop UniqueCodes currently held by mapped depts so we can re-assign cleanly
+    mapped_dest_ids = set(result.values())
+    if mapped_dest_ids:
+        held_df = pd.read_sql(
+            """
+            SELECT DepartmentID, UniqueCode FROM HCM3.Department
+            WHERE NULLIF(LTRIM(RTRIM(UniqueCode)), N'') IS NOT NULL
+            """,
+            dest_cnxn,
+        )
+        for _, r in held_df.iterrows():
+            if int(r['DepartmentID']) in mapped_dest_ids:
+                used_unique_codes.discard(str(r['UniqueCode']).strip())
+
+    missing_df = source_df[~source_df['SourceDepartmentID'].isin(result.keys())]
     inserted = 0
     uniquified = 0
-    for _, row in missing_df.iterrows():
+    if not missing_df.empty:
+        last_id = ensure_table_id(dest_cursor, 'HCM3.Department', 0)
+        insert_sql = """
+            INSERT INTO HCM3.Department (
+                DepartmentID, Code, UniqueCode, Title, AbbrSign, RegionalDivisionRef, Status,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, GETDATE(), 1, GETDATE(), 1)
+        """
+        insert_mapping_sql = """
+            INSERT INTO master.dbo.DepartmentMigrationMapping (
+                SourceDepartmentID, DestDepartmentID
+            ) VALUES (?, ?)
+        """
+
+        for _, row in missing_df.iterrows():
+            source_id = int(row['SourceDepartmentID'])
+            title, base_code = _title_and_code(
+                row['DepartmentName'], row['DepartmentCode'], source_id, title_max=200
+            )
+            code = _unique_code_for_title(base_code, title, source_id, used_pairs)
+            if code != base_code:
+                uniquified += 1
+            status = _active_status(row['DepartmentActive'])
+            unique_code, abbr = _dept_unique_and_abbr(row, source_id, used_unique_codes)
+            last_id += 1
+            dest_cursor.execute(
+                insert_sql, (last_id, code, unique_code, title, abbr, status)
+            )
+            dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
+            used_pairs.add((code, title))
+            result[source_id] = last_id
+            inserted += 1
+
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
+            (last_id,),
+        )
+        print(
+            f"  -> Departments inserted: {inserted} "
+            f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
+        )
+    else:
+        print(f"  -> Departments already mapped: {len(result)}.")
+
+    update_sql = """
+        UPDATE HCM3.Department
+        SET Title = ?, UniqueCode = ?, AbbrSign = ?, Status = ?,
+            LastModificationDate = GETDATE(), LastModifier = 1
+        WHERE DepartmentID = ?
+          AND (
+            ISNULL(Title, N'') <> ISNULL(?, N'')
+            OR ISNULL(UniqueCode, N'') <> ISNULL(?, N'')
+            OR ISNULL(AbbrSign, N'') <> ISNULL(?, N'')
+            OR ISNULL(Status, -1) <> ISNULL(?, -1)
+          )
+    """
+    updated = 0
+    for _, row in source_df.iterrows():
         source_id = int(row['SourceDepartmentID'])
-        title, base_code = _title_and_code(
+        dest_id = result.get(source_id)
+        if dest_id is None:
+            continue
+        title, _ = _title_and_code(
             row['DepartmentName'], row['DepartmentCode'], source_id, title_max=200
         )
-        code = _unique_code_for_title(base_code, title, source_id, used_pairs)
-        if code != base_code:
-            uniquified += 1
         status = _active_status(row['DepartmentActive'])
-        last_id += 1
-        dest_cursor.execute(insert_sql, (last_id, code, title, status))
-        dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-        used_pairs.add((code, title))
-        result[source_id] = last_id
-        inserted += 1
+        unique_code, abbr = _dept_unique_and_abbr(row, source_id, used_unique_codes)
+        dest_cursor.execute(
+            update_sql,
+            (
+                title, unique_code, abbr, status, dest_id,
+                title, unique_code, abbr, status,
+            ),
+        )
+        if dest_cursor.rowcount:
+            updated += 1
+    if updated:
+        print(f"  -> Departments updated: {updated}.")
 
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
-        (last_id,),
-    )
-    print(
-        f"  -> Departments inserted: {inserted} "
-        f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
-    )
     return result
 
 
 def ensure_post_levels_from_job_grades(source_cnxn, dest_cnxn, dest_cursor):
     """
-    Sync TBL_JobGrade titles into SYS3.Lookup PostLevel.
+    Sync TBL_JobGrade (رتبه شغلی) titles into SYS3.Lookup PostLevel.
     Returns SourceJobGradeID -> DestLevelCode.
     """
+    ensure_lookup_info(dest_cursor, 'PostLevel', 'رتبه شغلی')
     source_df = pd.read_sql("""
         SELECT
             TBL_JgID AS SourceJobGradeID,
@@ -507,8 +598,429 @@ def ensure_post_levels_from_job_grades(source_cnxn, dest_cnxn, dest_cursor):
             continue
         result[int(row['SourceJobGradeID'])] = int(code)
 
-    print(f"  -> PostLevel codes ready for {len(result)} job grade(s).")
+    print(f"  -> PostLevel (رتبه شغلی) codes ready for {len(result)} job grade(s).")
     return result
+
+
+def ensure_regional_division_types_from_geo_domain(source_cnxn, dest_cnxn, dest_cursor):
+    """
+    Replace/extend RegionalDivisionType with source حوزه جغرافیایی combinations
+    (PayBase under parent 70: شهرستانی/استانی/ملی × سطح یک/دو/سه).
+    Returns PayBaseID (int) -> Dest Lookup Code (same PayBaseID).
+    """
+    ensure_lookup_info(
+        dest_cursor, 'RegionalDivisionType', 'حوزه جغرافیایی', is_dynamic=True
+    )
+
+    tree_df = pd.read_sql("""
+        SELECT
+            HRS_PayBaseID AS PayBaseID,
+            HRS_PayBaseParentID_fk AS ParentID,
+            HRS_PayBaseName AS Name
+        FROM dbo.HRS_PayBase
+        WHERE HRS_PayBaseID = ?
+           OR HRS_PayBaseParentID_fk = ?
+           OR HRS_PayBaseParentID_fk IN (
+                SELECT HRS_PayBaseID FROM dbo.HRS_PayBase WHERE HRS_PayBaseParentID_fk = ?
+           )
+    """, source_cnxn, params=[GEO_DOMAIN_ROOT_PARENT, GEO_DOMAIN_ROOT_PARENT, GEO_DOMAIN_ROOT_PARENT])
+
+    if tree_df.empty:
+        print("  -> No حوزه جغرافیایی PayBase tree found.")
+        return {}
+
+    by_id = {}
+    for _, row in tree_df.iterrows():
+        pb_id = int(row['PayBaseID'])
+        name = clean_persian_text(row['Name']) or str(pb_id)
+        parent_raw = row['ParentID']
+        parent_id = int(parent_raw) if pd.notna(parent_raw) else None
+        by_id[pb_id] = {'name': name, 'parent': parent_id}
+
+    def composed_title(pb_id):
+        node = by_id.get(pb_id)
+        if not node:
+            return str(pb_id)
+        parent_id = node['parent']
+        if parent_id and parent_id in by_id and parent_id != GEO_DOMAIN_ROOT_PARENT:
+            parent_name = by_id[parent_id]['name']
+            return f"{parent_name} - {node['name']}"
+        return node['name']
+
+    # All mid/leaf nodes under root (exclude the root "سطح شغلي" itself)
+    code_to_value = {
+        pb_id: composed_title(pb_id)
+        for pb_id, node in by_id.items()
+        if pb_id != GEO_DOMAIN_ROOT_PARENT
+    }
+
+    # Also include any pei values under 9513 not already in the tree
+    pei_df = pd.read_sql("""
+        SELECT DISTINCT LTRIM(RTRIM(CAST(TBL_PeiValue AS nvarchar(50)))) AS Val
+        FROM dbo.TBL_PostExtraInfo
+        WHERE HRS_PayBaseID_fk = ?
+          AND NULLIF(LTRIM(RTRIM(CAST(TBL_PeiValue AS nvarchar(50)))), N'') IS NOT NULL
+    """, source_cnxn, params=[POST_GEO_DOMAIN_PAYBASE])
+    for _, row in pei_df.iterrows():
+        raw = str(row['Val']).strip()
+        try:
+            code = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if code <= 0:
+            continue
+        if code not in code_to_value:
+            # resolve name from PayBase if present
+            name_df = pd.read_sql("""
+                SELECT HRS_PayBaseName, HRS_PayBaseParentID_fk
+                FROM dbo.HRS_PayBase WHERE HRS_PayBaseID = ?
+            """, source_cnxn, params=[code])
+            if not name_df.empty:
+                nm = clean_persian_text(name_df.iloc[0]['HRS_PayBaseName']) or str(code)
+                parent_raw = name_df.iloc[0]['HRS_PayBaseParentID_fk']
+                if pd.notna(parent_raw) and int(parent_raw) in by_id:
+                    code_to_value[code] = f"{by_id[int(parent_raw)]['name']} - {nm}"
+                else:
+                    code_to_value[code] = nm
+            else:
+                code_to_value[code] = raw
+
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        'RegionalDivisionType',
+        code_to_value,
+        overwrite_values=True,
+    )
+    print(f"  -> RegionalDivisionType (حوزه جغرافیایی) codes ready: {len(code_to_value)}.")
+    return {int(c): int(c) for c in code_to_value}
+
+
+def _load_post_extra_maps(source_cnxn, dest_cnxn, dest_cursor):
+    """
+    Build Extra1 (کد توانیر) and Extra2 (شناسه HRS) value→code maps,
+    plus per-post source values.
+    Returns (extra1_by_post, extra2_by_post) where values are dest lookup codes.
+    """
+    ensure_lookup_info(dest_cursor, POST_EXTRA1_LOOKUP, POST_EXTRA1_TITLE)
+    ensure_lookup_info(dest_cursor, POST_EXTRA2_LOOKUP, POST_EXTRA2_TITLE)
+
+    org_df = pd.read_sql("""
+        SELECT
+            TBL_PostID AS SourcePostID,
+            LTRIM(RTRIM(CAST(TBL_PostOrganazationPostCode AS nvarchar(100)))) AS OrgCode
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+          AND NULLIF(LTRIM(RTRIM(CAST(TBL_PostOrganazationPostCode AS nvarchar(100)))), N'') IS NOT NULL
+          AND LTRIM(RTRIM(CAST(TBL_PostOrganazationPostCode AS nvarchar(100)))) NOT IN (N'0', N'0.0')
+    """, source_cnxn)
+
+    hris_df = pd.read_sql("""
+        SELECT
+            pe.TBL_PostID_fk AS SourcePostID,
+            LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(100)))) AS HrisValue
+        FROM dbo.TBL_PostExtraInfo pe
+        WHERE pe.HRS_PayBaseID_fk = ?
+          AND pe.TBL_PostID_fk > 0
+          AND NULLIF(LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(100)))), N'') IS NOT NULL
+    """, source_cnxn, params=[POST_HRIS_PAYBASE])
+
+    org_values = [
+        normalize_persian(str(v).strip())
+        for v in org_df['OrgCode'].tolist()
+        if v is not None and str(v).strip()
+    ]
+    hris_values = [
+        normalize_persian(str(v).strip())
+        for v in hris_df['HrisValue'].tolist()
+        if v is not None and str(v).strip()
+    ]
+
+    org_name_to_code = sync_lookup(
+        dest_cnxn, dest_cursor, POST_EXTRA1_LOOKUP, list(dict.fromkeys(org_values))
+    ) if org_values else {}
+    hris_name_to_code = sync_lookup(
+        dest_cnxn, dest_cursor, POST_EXTRA2_LOOKUP, list(dict.fromkeys(hris_values))
+    ) if hris_values else {}
+
+    extra1_by_post = {}
+    for _, row in org_df.iterrows():
+        val = normalize_persian(str(row['OrgCode']).strip())
+        code = org_name_to_code.get(val)
+        if code is not None:
+            extra1_by_post[int(row['SourcePostID'])] = int(code)
+
+    extra2_by_post = {}
+    for _, row in hris_df.iterrows():
+        val = normalize_persian(str(row['HrisValue']).strip())
+        code = hris_name_to_code.get(val)
+        if code is not None:
+            # Prefer first non-null; later rows overwrite (last wins)
+            extra2_by_post[int(row['SourcePostID'])] = int(code)
+
+    print(
+        f"  -> Post Extra1 (کد توانیر) mapped for {len(extra1_by_post)} post(s); "
+        f"Extra2 (شناسه HRS) for {len(extra2_by_post)} post(s)."
+    )
+    return extra1_by_post, extra2_by_post
+
+
+def _load_post_geo_domain_codes(source_cnxn):
+    """SourcePostID -> PayBaseID used as RegionalDivisionTypeCode."""
+    pei_df = pd.read_sql("""
+        SELECT
+            pe.TBL_PostID_fk AS SourcePostID,
+            LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))) AS Val
+        FROM dbo.TBL_PostExtraInfo pe
+        WHERE pe.HRS_PayBaseID_fk = ?
+          AND pe.TBL_PostID_fk > 0
+          AND NULLIF(LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))), N'') IS NOT NULL
+    """, source_cnxn, params=[POST_GEO_DOMAIN_PAYBASE])
+
+    result = {}
+    for _, row in pei_df.iterrows():
+        try:
+            code = int(float(str(row['Val']).strip()))
+        except (TypeError, ValueError):
+            continue
+        if code > 0:
+            result[int(row['SourcePostID'])] = code
+    return result
+
+
+def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
+    """Migrate TBL_Post -> HCM3.Post. Returns SourcePostID -> DestPostID."""
+    setup_post_mapping_table(dest_cursor)
+
+    jg_to_level = ensure_post_levels_from_job_grades(source_cnxn, dest_cnxn, dest_cursor)
+    type_to_code = ensure_post_types_from_paybase(source_cnxn, dest_cnxn, dest_cursor)
+    place_to_rd = ensure_places_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor)
+    ensure_regional_division_types_from_geo_domain(source_cnxn, dest_cnxn, dest_cursor)
+    extra1_by_post, extra2_by_post = _load_post_extra_maps(
+        source_cnxn, dest_cnxn, dest_cursor
+    )
+    geo_by_post = _load_post_geo_domain_codes(source_cnxn)
+
+    source_df = pd.read_sql("""
+        SELECT
+            TBL_PostID AS SourcePostID,
+            TBL_PostTitle AS PostTitle,
+            TBL_PostCode AS PostCode,
+            TBL_PostActive AS PostActive,
+            TBL_JgID_fk AS SourceJobGradeID,
+            TBL_PlaceID_fk AS SourcePlaceID,
+            TBL_PostTypeID_fk AS SourcePostTypeID,
+            TBL_JobID_fk AS SourceJobID
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+    """, source_cnxn)
+
+    existing_df = pd.read_sql(
+        "SELECT SourcePostID, DestPostID FROM master.dbo.PostMigrationMapping",
+        dest_cnxn,
+    )
+    result = {
+        int(row['SourcePostID']): int(row['DestPostID'])
+        for _, row in existing_df.iterrows()
+    }
+
+    if source_df.empty:
+        print("  -> No source posts found.")
+        return result
+
+    def _lookup_code(row, column, mapping):
+        raw = row[column]
+        if pd.isna(raw):
+            return None
+        try:
+            key = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if key <= 0:
+            return None
+        return mapping.get(key)
+
+    def _level_code(row):
+        return _lookup_code(row, 'SourceJobGradeID', jg_to_level)
+
+    def _type_code(row):
+        return _lookup_code(row, 'SourcePostTypeID', type_to_code)
+
+    def _regional_ref(row):
+        return _lookup_code(row, 'SourcePlaceID', place_to_rd)
+
+    def _extra_fields(source_id):
+        return (
+            extra1_by_post.get(source_id),
+            extra2_by_post.get(source_id),
+            geo_by_post.get(source_id),
+        )
+
+    missing_df = source_df[~source_df['SourcePostID'].isin(result.keys())]
+    inserted = 0
+    if not missing_df.empty:
+        last_id = ensure_table_id(dest_cursor, 'HCM3.Post', 0)
+        insert_sql = """
+            INSERT INTO HCM3.Post (
+                PostID, Code, Title, LevelCode, TypeCode,
+                RegionalDivisionTypeCode, RegionalDivisionRef,
+                Extra1Code, Extra2Code, Status,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        """
+        insert_mapping_sql = """
+            INSERT INTO master.dbo.PostMigrationMapping (
+                SourcePostID, DestPostID
+            ) VALUES (?, ?)
+        """
+
+        for _, row in missing_df.iterrows():
+            source_id = int(row['SourcePostID'])
+            title, code = _title_and_code(
+                row['PostTitle'], row['PostCode'], source_id, title_max=400
+            )
+            status = _active_status(row['PostActive'])
+            level_code = _level_code(row)
+            type_code = _type_code(row)
+            regional_ref = _regional_ref(row)
+            extra1, extra2, rd_type = _extra_fields(source_id)
+            last_id += 1
+            dest_cursor.execute(
+                insert_sql,
+                (
+                    last_id, code, title, level_code, type_code,
+                    rd_type, regional_ref, extra1, extra2, status,
+                ),
+            )
+            dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
+            result[source_id] = last_id
+            inserted += 1
+
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Post'",
+            (last_id,),
+        )
+        print(f"  -> Posts inserted: {inserted}. Total mapped: {len(result)}.")
+    else:
+        print(f"  -> Posts already mapped: {len(result)}.")
+
+    # Backfill / upsert fields on already-mapped posts.
+    updated = 0
+    update_sql = """
+        UPDATE HCM3.Post
+        SET Title = ?, LevelCode = ?, TypeCode = ?,
+            RegionalDivisionTypeCode = ?, RegionalDivisionRef = ?,
+            Extra1Code = ?, Extra2Code = ?, Status = ?,
+            LastModificationDate = GETDATE(), LastModifier = 1
+        WHERE PostID = ?
+          AND (
+            ISNULL(Title, N'') <> ISNULL(?, N'')
+            OR ISNULL(LevelCode, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(TypeCode, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(RegionalDivisionTypeCode, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(RegionalDivisionRef, -1) <> ISNULL(?, -1)
+            OR ISNULL(Extra1Code, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(Extra2Code, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(Status, -1) <> ISNULL(?, -1)
+          )
+    """
+    for _, row in source_df.iterrows():
+        source_id = int(row['SourcePostID'])
+        dest_id = result.get(source_id)
+        if dest_id is None:
+            continue
+        title, _ = _title_and_code(
+            row['PostTitle'], row['PostCode'], source_id, title_max=400
+        )
+        status = _active_status(row['PostActive'])
+        level_code = _level_code(row)
+        type_code = _type_code(row)
+        regional_ref = _regional_ref(row)
+        extra1, extra2, rd_type = _extra_fields(source_id)
+        dest_cursor.execute(
+            update_sql,
+            (
+                title, level_code, type_code, rd_type, regional_ref,
+                extra1, extra2, status, dest_id,
+                title, level_code, type_code, rd_type, regional_ref,
+                extra1, extra2, status,
+            ),
+        )
+        if dest_cursor.rowcount:
+            updated += 1
+    if updated:
+        print(f"  -> Posts updated: {updated}.")
+
+    return result
+
+
+def ensure_post_jobs(source_cnxn, dest_cnxn, dest_cursor, post_map=None, job_map=None):
+    """
+    Migrate TBL_Post.TBL_JobID_fk -> HCM3.PostJob.
+    """
+    if post_map is None:
+        post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
+    if job_map is None:
+        job_map = ensure_jobs(source_cnxn, dest_cnxn, dest_cursor)
+
+    source_df = pd.read_sql("""
+        SELECT
+            TBL_PostID AS SourcePostID,
+            TBL_JobID_fk AS SourceJobID
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+          AND TBL_JobID_fk IS NOT NULL
+          AND TBL_JobID_fk > 0
+    """, source_cnxn)
+
+    if source_df.empty:
+        print("  -> No Post→Job links in source.")
+        return 0
+
+    existing_df = pd.read_sql(
+        "SELECT PostRef, JobRef FROM HCM3.PostJob",
+        dest_cnxn,
+    )
+    existing_pairs = {
+        (int(r['PostRef']), int(r['JobRef']))
+        for _, r in existing_df.iterrows()
+    }
+
+    last_id = ensure_table_id(dest_cursor, 'HCM3.PostJob', 0)
+    insert_sql = """
+        INSERT INTO HCM3.PostJob (
+            PostJobID, PostRef, JobRef,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        ) VALUES (?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+    """
+    inserted = 0
+    skipped = 0
+    for _, row in source_df.iterrows():
+        source_post = int(row['SourcePostID'])
+        source_job = int(row['SourceJobID'])
+        dest_post = post_map.get(source_post)
+        dest_job = job_map.get(source_job)
+        if not dest_post or not dest_job:
+            skipped += 1
+            continue
+        pair = (dest_post, dest_job)
+        if pair in existing_pairs:
+            continue
+        last_id += 1
+        dest_cursor.execute(insert_sql, (last_id, dest_post, dest_job))
+        existing_pairs.add(pair)
+        inserted += 1
+
+    if inserted:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.PostJob'",
+            (last_id,),
+        )
+    print(
+        f"  -> PostJob inserted: {inserted}. "
+        f"Skipped (unmapped post/job): {skipped}."
+    )
+    return inserted
 
 
 def ensure_post_types_from_paybase(source_cnxn, dest_cnxn, dest_cursor):
@@ -553,156 +1065,9 @@ def ensure_post_types_from_paybase(source_cnxn, dest_cnxn, dest_cursor):
     return result
 
 
-def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
-    """Migrate TBL_Post -> HCM3.Post. Returns SourcePostID -> DestPostID."""
-    setup_post_mapping_table(dest_cursor)
-
-    jg_to_level = ensure_post_levels_from_job_grades(source_cnxn, dest_cnxn, dest_cursor)
-    type_to_code = ensure_post_types_from_paybase(source_cnxn, dest_cnxn, dest_cursor)
-    place_to_rd = ensure_places_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor)
-
-    source_df = pd.read_sql("""
-        SELECT
-            TBL_PostID AS SourcePostID,
-            TBL_PostTitle AS PostTitle,
-            TBL_PostCode AS PostCode,
-            TBL_PostActive AS PostActive,
-            TBL_JgID_fk AS SourceJobGradeID,
-            TBL_PlaceID_fk AS SourcePlaceID,
-            TBL_PostTypeID_fk AS SourcePostTypeID
-        FROM dbo.TBL_Post
-        WHERE TBL_PostID > 0
-    """, source_cnxn)
-
-    existing_df = pd.read_sql(
-        "SELECT SourcePostID, DestPostID FROM master.dbo.PostMigrationMapping",
-        dest_cnxn,
-    )
-    result = {
-        int(row['SourcePostID']): int(row['DestPostID'])
-        for _, row in existing_df.iterrows()
-    }
-
-    if source_df.empty:
-        print("  -> No source posts found.")
-        return result
-
-    def _lookup_code(row, column, mapping):
-        raw = row[column]
-        if pd.isna(raw):
-            return None
-        try:
-            key = int(raw)
-        except (TypeError, ValueError):
-            return None
-        if key <= 0:
-            return None
-        return mapping.get(key)
-
-    def _level_code(row):
-        return _lookup_code(row, 'SourceJobGradeID', jg_to_level)
-
-    def _type_code(row):
-        return _lookup_code(row, 'SourcePostTypeID', type_to_code)
-
-    def _regional_ref(row):
-        return _lookup_code(row, 'SourcePlaceID', place_to_rd)
-
-    missing_df = source_df[~source_df['SourcePostID'].isin(result.keys())]
-    inserted = 0
-    if not missing_df.empty:
-        last_id = ensure_table_id(dest_cursor, 'HCM3.Post', 0)
-        insert_sql = """
-            INSERT INTO HCM3.Post (
-                PostID, Code, Title, LevelCode, TypeCode, RegionalDivisionRef, Status,
-                CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
-        """
-        insert_mapping_sql = """
-            INSERT INTO master.dbo.PostMigrationMapping (
-                SourcePostID, DestPostID
-            ) VALUES (?, ?)
-        """
-
-        for _, row in missing_df.iterrows():
-            source_id = int(row['SourcePostID'])
-            title, code = _title_and_code(
-                row['PostTitle'], row['PostCode'], source_id, title_max=400
-            )
-            status = _active_status(row['PostActive'])
-            level_code = _level_code(row)
-            type_code = _type_code(row)
-            regional_ref = _regional_ref(row)
-            last_id += 1
-            dest_cursor.execute(
-                insert_sql,
-                (last_id, code, title, level_code, type_code, regional_ref, status),
-            )
-            dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-            result[source_id] = last_id
-            inserted += 1
-
-        dest_cursor.execute(
-            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Post'",
-            (last_id,),
-        )
-        print(f"  -> Posts inserted: {inserted}. Total mapped: {len(result)}.")
-    else:
-        print(f"  -> Posts already mapped: {len(result)}.")
-
-    # Backfill LevelCode / TypeCode / RegionalDivisionRef on already-mapped posts.
-    updated_level = 0
-    updated_type = 0
-    updated_rd = 0
-    update_level_sql = """
-        UPDATE HCM3.Post
-        SET LevelCode = ?, LastModificationDate = GETDATE(), LastModifier = 1
-        WHERE PostID = ?
-          AND ISNULL(LevelCode, -2147483648) <> ISNULL(?, -2147483648)
-    """
-    update_type_sql = """
-        UPDATE HCM3.Post
-        SET TypeCode = ?, LastModificationDate = GETDATE(), LastModifier = 1
-        WHERE PostID = ?
-          AND ISNULL(TypeCode, -2147483648) <> ISNULL(?, -2147483648)
-    """
-    update_rd_sql = """
-        UPDATE HCM3.Post
-        SET RegionalDivisionRef = ?, LastModificationDate = GETDATE(), LastModifier = 1
-        WHERE PostID = ?
-          AND ISNULL(RegionalDivisionRef, -1) <> ISNULL(?, -1)
-    """
-    for _, row in source_df.iterrows():
-        source_id = int(row['SourcePostID'])
-        dest_id = result.get(source_id)
-        if dest_id is None:
-            continue
-        level_code = _level_code(row)
-        dest_cursor.execute(update_level_sql, (level_code, dest_id, level_code))
-        if dest_cursor.rowcount:
-            updated_level += 1
-        type_code = _type_code(row)
-        dest_cursor.execute(update_type_sql, (type_code, dest_id, type_code))
-        if dest_cursor.rowcount:
-            updated_type += 1
-        regional_ref = _regional_ref(row)
-        dest_cursor.execute(update_rd_sql, (regional_ref, dest_id, regional_ref))
-        if dest_cursor.rowcount:
-            updated_rd += 1
-
-    if updated_level:
-        print(f"  -> Posts LevelCode updated: {updated_level}.")
-    if updated_type:
-        print(f"  -> Posts TypeCode updated: {updated_type}.")
-    if updated_rd:
-        print(f"  -> Posts RegionalDivisionRef updated: {updated_rd}.")
-
-    return result
-
-
 def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
     """
-    Migrate TBL_Job -> HCM3.Job.
+    Migrate TBL_Job -> HCM3.Job (insert missing + update mapped).
     If source_job_ids is provided, only those IDs (plus already mapped) are considered for insert.
     Returns SourceJobID -> DestJobID.
     """
@@ -731,14 +1096,13 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         print("  -> No source jobs found.")
         return result
 
+    work_df = source_df
     if source_job_ids is not None:
         wanted = {int(j) for j in source_job_ids if j is not None and int(j) > 0}
-        source_df = source_df[source_df['SourceJobID'].isin(wanted)]
-
-    missing_df = source_df[~source_df['SourceJobID'].isin(result.keys())]
-    if missing_df.empty:
-        print(f"  -> Jobs already mapped: {len(result)}.")
-        return result
+        # Still update already-mapped jobs even if not in wanted set? Prefer filter for insert only.
+        insert_candidates = source_df[source_df['SourceJobID'].isin(wanted)]
+    else:
+        insert_candidates = source_df
 
     existing_pairs_df = pd.read_sql(
         "SELECT Code, Title FROM HCM3.Job WHERE Code IS NOT NULL",
@@ -749,48 +1113,80 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         for _, row in existing_pairs_df.iterrows()
     }
 
-    last_id = ensure_table_id(dest_cursor, 'HCM3.Job', 0)
-    insert_sql = """
-        INSERT INTO HCM3.Job (
-            JobID, Code, Title, ClassCode, Status,
-            CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
-    """
-    insert_mapping_sql = """
-        INSERT INTO master.dbo.JobMigrationMapping (
-            SourceJobID, DestJobID
-        ) VALUES (?, ?)
-    """
-
+    missing_df = insert_candidates[~insert_candidates['SourceJobID'].isin(result.keys())]
     inserted = 0
     uniquified = 0
-    for _, row in missing_df.iterrows():
+    if not missing_df.empty:
+        last_id = ensure_table_id(dest_cursor, 'HCM3.Job', 0)
+        insert_sql = """
+            INSERT INTO HCM3.Job (
+                JobID, Code, Title, ClassCode, Status,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        """
+        insert_mapping_sql = """
+            INSERT INTO master.dbo.JobMigrationMapping (
+                SourceJobID, DestJobID
+            ) VALUES (?, ?)
+        """
+
+        for _, row in missing_df.iterrows():
+            source_id = int(row['SourceJobID'])
+            title, base_code = _title_and_code(
+                row['JobName'], row['JobCode'], source_id, title_max=400
+            )
+            code = _unique_code_for_title(base_code, title, source_id, used_pairs)
+            if code != base_code:
+                uniquified += 1
+            status = _active_status(row['JobActive'])
+            last_id += 1
+            dest_cursor.execute(
+                insert_sql,
+                (last_id, code, title, DEFAULT_JOB_CLASS_CODE, status),
+            )
+            dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
+            used_pairs.add((code, title))
+            result[source_id] = last_id
+            inserted += 1
+
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
+            (last_id,),
+        )
+        print(
+            f"  -> Jobs inserted: {inserted} "
+            f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
+        )
+    else:
+        print(f"  -> Jobs already mapped: {len(result)}.")
+
+    # Upsert title/status for mapped jobs (رشته‌های شغلی)
+    update_sql = """
+        UPDATE HCM3.Job
+        SET Title = ?, Status = ?,
+            LastModificationDate = GETDATE(), LastModifier = 1
+        WHERE JobID = ?
+          AND (
+            ISNULL(Title, N'') <> ISNULL(?, N'')
+            OR ISNULL(Status, -1) <> ISNULL(?, -1)
+          )
+    """
+    updated = 0
+    for _, row in work_df.iterrows():
         source_id = int(row['SourceJobID'])
-        title, base_code = _title_and_code(
+        dest_id = result.get(source_id)
+        if dest_id is None:
+            continue
+        title, _ = _title_and_code(
             row['JobName'], row['JobCode'], source_id, title_max=400
         )
-        code = _unique_code_for_title(base_code, title, source_id, used_pairs)
-        if code != base_code:
-            uniquified += 1
         status = _active_status(row['JobActive'])
-        last_id += 1
-        dest_cursor.execute(
-            insert_sql,
-            (last_id, code, title, DEFAULT_JOB_CLASS_CODE, status),
-        )
-        dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-        used_pairs.add((code, title))
-        result[source_id] = last_id
-        inserted += 1
+        dest_cursor.execute(update_sql, (title, status, dest_id, title, status))
+        if dest_cursor.rowcount:
+            updated += 1
+    if updated:
+        print(f"  -> Jobs updated: {updated}.")
 
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
-        (last_id,),
-    )
-    print(
-        f"  -> Jobs inserted: {inserted} "
-        f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
-    )
     return result
 
 
