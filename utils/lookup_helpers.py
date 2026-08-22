@@ -1,5 +1,6 @@
 import pandas as pd
 from utils.data_helpers import clean_value, clean_persian_text, normalize_persian
+from utils.rahkaran_cache import invalidate_lookup_cache
 
 # Matches destination app / SYS3.tableIdGen key (Version is SQL timestamp — never insert it).
 LOOKUP_IDGEN_TABLE = 'Sys3.Lookup'
@@ -102,6 +103,7 @@ def ensure_lookup_info(dest_cursor, lookup_type, title, *, is_dynamic=True):
                 (title, lookup_type),
             )
             print(f"  -> LookupInfo title updated for {lookup_type}: {title}")
+            invalidate_lookup_cache()
         return int(row[0])
 
     dest_cursor.execute(
@@ -133,6 +135,7 @@ def ensure_lookup_info(dest_cursor, lookup_type, title, *, is_dynamic=True):
             (LOOKUP_INFO_IDGEN_TABLE, last_id),
         )
     print(f"  -> LookupInfo created for {lookup_type}: {title}")
+    invalidate_lookup_cache()
     return last_id
 
 
@@ -200,6 +203,8 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
         # Nothing inserted and nothing found — still return requested defaults
         result = {int(c): normalize_persian(v) for c, v in code_to_value.items()}
 
+    if inserted or updated:
+        invalidate_lookup_cache()
     return result
 
 
@@ -236,6 +241,7 @@ def sync_lookup(dest_cnxn, dest_cursor, lookup_type, unique_values):
             existing_map[val] = max_code
 
         _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists)
+        invalidate_lookup_cache()
 
     return existing_map
 
