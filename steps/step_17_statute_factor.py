@@ -7,7 +7,10 @@ SQL helpers like FxPAY_PersonnelKind). Rahkaran requires non-null EmploymentType
 on StatuteFactorProperty, so each dated formula is applied to all destination
 employment types (one property row per ET, shared FormulaRef).
 
-IssueYearMonth / ApplyYearMonth come from PAY_MonthID (Shamsi YYYYMM).
+IssueYearMonth / ApplyYearMonth come from PAY_MonthID (Shamsi YYYYMM) for
+BackFormula rows. When a factor has no BackFormula, we fall back to PAY_PfFormula
+and stamp Issue/Apply with the earliest HRS_RuleDocumentScores register month
+so older statute windows still resolve a property.
 
 Source formulas are SQL; Rahkaran expects C#. We store a safe stub body
 (`return 0;`) plus a designer UIObject template so the formula editor can open,
@@ -137,6 +140,75 @@ def _formula_text(raw):
     if not text:
         return None
     return text
+
+
+def _shamsi_to_year_month(raw):
+    """
+    Parse source Shamsi date strings like '1399/10/20' or '1399/10/20 10:36:31'
+    into int YYYYMM (e.g. 139910). Returns None when unusable.
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    date_part = text.split()[0].replace('-', '/')
+    parts = date_part.split('/')
+    if len(parts) < 2:
+        return None
+    try:
+        year = int(parts[0])
+        month = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if year <= 0 or month < 1 or month > 12:
+        return None
+    return year * 100 + month
+
+
+def _earliest_score_year_months(source_cnxn, source_factor_ids):
+    """
+    SourcePayrollFactorID -> earliest HRS_RuleDocumentScores register YYYYMM.
+    """
+    if not source_factor_ids:
+        return {}
+    id_list = ",".join(str(int(x)) for x in sorted(set(int(i) for i in source_factor_ids)))
+    scores_df = pd.read_sql(f"""
+        SELECT
+            PAY_PfID_fk AS SourcePayrollFactorID,
+            MIN(HRS_RdsRegisterDate) AS EarliestRegisterDate
+        FROM dbo.HRS_RuleDocumentScores
+        WHERE PAY_PfID_fk IN ({id_list})
+          AND HRS_RdsRegisterDate IS NOT NULL
+          AND LTRIM(RTRIM(HRS_RdsRegisterDate)) <> N''
+        GROUP BY PAY_PfID_fk
+    """, source_cnxn)
+    result = {}
+    for _, row in scores_df.iterrows():
+        yyyymm = _shamsi_to_year_month(row['EarliestRegisterDate'])
+        if yyyymm is not None:
+            result[int(row['SourcePayrollFactorID'])] = yyyymm
+    return result
+
+
+def _factor_register_year_months(source_cnxn, source_factor_ids):
+    """SourcePayrollFactorID -> PAY_PfRegisetrDate as YYYYMM (secondary fallback)."""
+    if not source_factor_ids:
+        return {}
+    id_list = ",".join(str(int(x)) for x in sorted(set(int(i) for i in source_factor_ids)))
+    pf_df = pd.read_sql(f"""
+        SELECT
+            PAY_PfID AS SourcePayrollFactorID,
+            PAY_PfRegisetrDate AS RegisterDate
+        FROM dbo.PAY_PayrollFactor
+        WHERE PAY_PfID IN ({id_list})
+    """, source_cnxn)
+    result = {}
+    for _, row in pf_df.iterrows():
+        yyyymm = _shamsi_to_year_month(row['RegisterDate'])
+        if yyyymm is not None:
+            result[int(row['SourcePayrollFactorID'])] = yyyymm
+    return result
 
 
 def _build_formula_description(source_pf_id, month_id, source_sql, source_kind):
@@ -387,7 +459,8 @@ def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
     """
     Build one formula version per (SourcePayrollFactorID, MonthID).
     Prefer PAY_PayrollBackFormula; if a factor has none, fall back to PAY_PfFormula
-    with the latest PAY_MonthID.
+    with Issue month = earliest HRS_RuleDocumentScores register YYYYMM
+    (then factor register date, then max PAY_MonthID).
     """
     if not mapped_factor_ids:
         return pd.DataFrame()
@@ -434,6 +507,9 @@ def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
     fallback_rows = []
     if missing:
         miss_list = ",".join(str(int(x)) for x in missing)
+        score_months = _earliest_score_year_months(source_cnxn, missing)
+        register_months = _factor_register_year_months(source_cnxn, missing)
+
         latest_month = pd.read_sql("""
             SELECT MAX(Pay_MonthID) AS MaxMonth
             FROM dbo.PAY_Month
@@ -453,17 +529,38 @@ def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
               AND PAY_PfFormula IS NOT NULL
               AND LTRIM(RTRIM(PAY_PfFormula)) <> ''
         """, source_cnxn)
+
+        used_score = 0
+        used_register = 0
+        used_latest = 0
         for _, row in pf_df.iterrows():
             sql = _formula_text(row['FormulaSql'])
             if sql is None:
                 continue
+            source_id = int(row['SourcePayrollFactorID'])
+            if source_id in score_months:
+                month_id = score_months[source_id]
+                used_score += 1
+            elif source_id in register_months:
+                month_id = register_months[source_id]
+                used_register += 1
+            else:
+                month_id = latest_month
+                used_latest += 1
             fallback_rows.append({
                 'SourceBackFormulaID': None,
-                'SourcePayrollFactorID': int(row['SourcePayrollFactorID']),
-                'SourceMonthID': latest_month,
+                'SourcePayrollFactorID': source_id,
+                'SourceMonthID': month_id,
                 'FormulaSql': sql,
                 'SourceKind': 'PAY_PayrollFactor.PAY_PfFormula',
             })
+        if fallback_rows:
+            print(
+                f"  -> PfFormula fallback IssueYearMonth: "
+                f"earliest score={used_score}, "
+                f"factor register={used_register}, "
+                f"max month={used_latest}."
+            )
 
     if fallback_rows:
         back_df = pd.concat([back_df, pd.DataFrame(fallback_rows)], ignore_index=True)
