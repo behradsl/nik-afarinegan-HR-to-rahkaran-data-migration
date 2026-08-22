@@ -175,6 +175,97 @@ def _delete_migrated_marriages(cursor):
     """)
 
 
+def _prepare_employee_delete(cursor):
+    """
+    Clear every FK pointing at employees about to be deleted:
+    - ownership-style columns (EmployeeRef, …): DELETE child rows
+    - nullable confirmer/auditor columns: SET NULL
+    - remaining non-nullable refs: DELETE child rows
+    Discovered from sys.foreign_keys so new child tables are covered.
+    """
+    if not _mapping_exists(cursor, 'PartyMigrationMapping'):
+        return
+
+    print("  Sweeping FKs onto migrated employees...")
+
+    # Nested: insurance under relatives of migrated employees
+    _delete_joined(cursor, 'EmployeeRelativeInsurance leftover', f"""
+        DELETE ins
+        FROM HCM3.EmployeeRelativeInsurance ins
+        INNER JOIN HCM3.EmployeeRelative r
+            ON r.EmployeeRelativeID = ins.EmployeeRelativeRef
+        INNER JOIN HCM3.Employee e ON e.EmployeeID = r.EmployeeRef
+        WHERE {_migrated_employee_filter_sql('e')}
+    """)
+
+    cursor.execute("""
+        SELECT
+            OBJECT_SCHEMA_NAME(fk.parent_object_id) AS Sch,
+            OBJECT_NAME(fk.parent_object_id) AS Tbl,
+            COL_NAME(fc.parent_object_id, fc.parent_column_id) AS Col,
+            c.is_nullable AS IsNullable
+        FROM sys.foreign_keys fk
+        INNER JOIN sys.foreign_key_columns fc
+            ON fc.constraint_object_id = fk.object_id
+        INNER JOIN sys.columns c
+            ON c.object_id = fc.parent_object_id
+           AND c.column_id = fc.parent_column_id
+        WHERE OBJECT_SCHEMA_NAME(fk.referenced_object_id) = N'HCM3'
+          AND OBJECT_NAME(fk.referenced_object_id) = N'Employee'
+        ORDER BY Sch, Tbl, Col
+    """)
+    fk_rows = cursor.fetchall()
+
+    ownership_cols = {
+        'EmployeeRef', 'ParentEmployeeRef', 'RelativeRef',
+        'AppraiseeRef', 'AppraiserRef',
+    }
+
+    # Pass 1: delete ownership-style children
+    for sch, tbl, col, _nullable in fk_rows:
+        if col not in ownership_cols:
+            continue
+        if sch == 'HCM3' and tbl == 'Employee':
+            continue
+        _delete_joined(cursor, f'{sch}.{tbl}.{col} deleted', f"""
+            DELETE c
+            FROM [{sch}].[{tbl}] c
+            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
+            WHERE {_migrated_employee_filter_sql('e')}
+        """)
+
+    # Pass 2: null nullable confirmer-style refs
+    for sch, tbl, col, is_nullable in fk_rows:
+        if col in ownership_cols:
+            continue
+        if not is_nullable:
+            continue
+        if sch == 'HCM3' and tbl == 'Employee':
+            continue
+        _exec_count(cursor, f'{sch}.{tbl}.{col} nulled', f"""
+            UPDATE c
+            SET c.[{col}] = NULL
+            FROM [{sch}].[{tbl}] c
+            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
+            WHERE {_migrated_employee_filter_sql('e')}
+        """)
+
+    # Pass 3: delete remaining non-nullable refs (cannot null)
+    for sch, tbl, col, is_nullable in fk_rows:
+        if col in ownership_cols:
+            continue
+        if is_nullable:
+            continue
+        if sch == 'HCM3' and tbl == 'Employee':
+            continue
+        _delete_joined(cursor, f'{sch}.{tbl}.{col} force-deleted', f"""
+            DELETE c
+            FROM [{sch}].[{tbl}] c
+            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
+            WHERE {_migrated_employee_filter_sql('e')}
+        """)
+
+
 def _delete_by_mapping(cursor, mapping_table, dest_table, dest_pk, mapping_col):
     if not _mapping_exists(cursor, mapping_table):
         print(f"  -> {mapping_table} not found, skip {dest_table}.")
@@ -460,8 +551,7 @@ def _delete_migrated_employees(cursor):
     if not _mapping_exists(cursor, 'PartyMigrationMapping'):
         print("  -> PartyMigrationMapping not found, skip Employee cleanup.")
         return 0
-    # Final sweep: any remaining marriages for these employees
-    _delete_migrated_marriages(cursor)
+    _prepare_employee_delete(cursor)
     return _delete_joined(cursor, 'HCM3.Employee (migrated)', f"""
         DELETE e
         FROM HCM3.Employee e
