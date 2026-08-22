@@ -31,39 +31,37 @@ def run():
             "SELECT PartyID, FirstName, LastName, FullName FROM GNR3.Party",
             dest_cnxn,
         )
-        existing_emp_df = pd.read_sql("SELECT PartyRef FROM HCM3.Employee", dest_cnxn)
+        existing_emp_df = pd.read_sql(
+            "SELECT EmployeeID, PartyRef, Code FROM HCM3.Employee",
+            dest_cnxn,
+        )
 
         print("Transforming and Joining Data in Memory...")
         merged_df = pd.merge(source_df, mapping_df, on='SourceID', how='inner')
-
-        existing_refs = set(existing_emp_df['PartyRef'].dropna())
-        merged_df = merged_df[~merged_df['DestPartyID'].isin(existing_refs)]
-
         final_df = pd.merge(
             merged_df, party_df, left_on='DestPartyID', right_on='PartyID', how='inner'
         )
 
-        if final_df.empty:
-            print("No new Employee records to migrate.")
-            return
+        party_to_emp = {}
+        code_to_emp = {}
+        for _, row in existing_emp_df.iterrows():
+            emp_id = int(row['EmployeeID'])
+            if pd.notna(row['PartyRef']):
+                party_to_emp.setdefault(int(row['PartyRef']), emp_id)
+            if pd.notna(row['Code']) and str(row['Code']).strip():
+                code_to_emp.setdefault(str(row['Code']).strip(), emp_id)
 
-        print(f"Preparing to insert {len(final_df)} Employee records...")
-
-        dest_cursor.execute("""
-            SELECT LastId
-            FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK)
-            WHERE TableName = 'hcm3.employee'
-        """)
-        id_row = dest_cursor.fetchone()
-
-        if not id_row:
-            dest_cursor.execute(
-                "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES ('hcm3.employee', 1000)"
-            )
-            current_last_id = 1000
-        else:
-            current_last_id = id_row[0]
-
+        update_sql = """
+            UPDATE HCM3.Employee
+            SET FirstName = ?, LastName = ?, DeathDate = ?,
+                LastModificationDate = GETDATE(), LastModifier = 1
+            WHERE EmployeeID = ?
+              AND (
+                ISNULL(FirstName, N'') <> ISNULL(?, N'')
+                OR ISNULL(LastName, N'') <> ISNULL(?, N'')
+                OR ISNULL(DeathDate, '19000101') <> ISNULL(?, '19000101')
+              )
+        """
         insert_employee_sql = """
             INSERT INTO HCM3.Employee (
                 EmployeeID, PartyRef, Code, Status,
@@ -72,40 +70,94 @@ def run():
             ) VALUES (?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
 
+        to_insert = []
+        linked = 0
+        updated = 0
+
         for _, row in final_df.iterrows():
-            current_last_id += 1
-            new_emp_id = current_last_id
-
+            party_ref = int(row['DestPartyID'])
             code_val = str(clean_value(row['Code']))
-            raw_death_date = clean_value(row['DeathDate'])
-
-            gregorian_death_date = None
-            if raw_death_date:
-                gregorian_death_date = shamsi_to_gregorian(raw_death_date)
-
             fname = clean_persian_text(row['FirstName']) or '-'
             lname = clean_persian_text(row['LastName']) or '-'
+            raw_death_date = clean_value(row['DeathDate'])
+            death_date = shamsi_to_gregorian(raw_death_date) if raw_death_date else None
 
-            dest_cursor.execute(insert_employee_sql, (
-                new_emp_id,
-                row['DestPartyID'],
-                code_val,
-                1,
-                fname,
-                lname,
-                gregorian_death_date,
-            ))
+            existing_emp_id = party_to_emp.get(party_ref)
+            if existing_emp_id is None:
+                existing_emp_id = code_to_emp.get(code_val)
 
-        dest_cursor.execute("""
-            UPDATE SYS3.tableIdGen
-            SET LastId = ?
-            WHERE TableName = 'HCM3.Employee'
-        """, (current_last_id,))
+            if existing_emp_id is not None:
+                dest_cursor.execute(
+                    update_sql,
+                    (fname, lname, death_date, existing_emp_id, fname, lname, death_date),
+                )
+                if dest_cursor.rowcount:
+                    updated += 1
+                linked += 1
+                party_to_emp[party_ref] = existing_emp_id
+                code_to_emp[code_val] = existing_emp_id
+                continue
+
+            to_insert.append(
+                {
+                    'PartyRef': party_ref,
+                    'Code': code_val,
+                    'FirstName': fname,
+                    'LastName': lname,
+                    'DeathDate': death_date,
+                }
+            )
+
+        if not to_insert and linked == 0:
+            print("No new Employee records to migrate.")
+            return
+
+        inserted = 0
+        if to_insert:
+            print(f"Preparing to insert {len(to_insert)} Employee records...")
+            dest_cursor.execute("""
+                SELECT LastId
+                FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK)
+                WHERE TableName = 'hcm3.employee'
+            """)
+            id_row = dest_cursor.fetchone()
+
+            if not id_row:
+                dest_cursor.execute(
+                    "INSERT INTO SYS3.tableIdGen (TableName, LastId) VALUES ('hcm3.employee', 1000)"
+                )
+                current_last_id = 1000
+            else:
+                current_last_id = id_row[0]
+
+            for record in to_insert:
+                current_last_id += 1
+                dest_cursor.execute(
+                    insert_employee_sql,
+                    (
+                        current_last_id,
+                        record['PartyRef'],
+                        record['Code'],
+                        1,
+                        record['FirstName'],
+                        record['LastName'],
+                        record['DeathDate'],
+                    ),
+                )
+                party_to_emp[record['PartyRef']] = current_last_id
+                code_to_emp[record['Code']] = current_last_id
+                inserted += 1
+
+            dest_cursor.execute("""
+                UPDATE SYS3.tableIdGen
+                SET LastId = ?
+                WHERE TableName = 'HCM3.Employee'
+            """, (current_last_id,))
 
         dest_cnxn.commit()
         print(
-            f"Success! Migrated {len(final_df)} Employee records. "
-            f"New Employee LastId is {current_last_id}."
+            f"Success! Employees inserted: {inserted}, "
+            f"linked existing: {linked}, updated: {updated}."
         )
 
     except Exception as e:

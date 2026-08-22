@@ -17,7 +17,7 @@ import pandas as pd
 import warnings
 from pathlib import Path
 from db_core import get_connections
-from utils.data_helpers import clean_persian_text
+from utils.data_helpers import clean_persian_text, normalize_persian
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -271,23 +271,44 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
         "FROM master.dbo.StatuteFactorMigrationMapping",
         dest_cnxn,
     )
-    already = set(int(x) for x in mapped_df['SourcePayrollFactorID'].tolist())
-    pending = source_df[~source_df['SourcePayrollFactorID'].isin(already)].copy()
+    already = {
+        int(row['SourcePayrollFactorID']): int(row['DestStatuteFactorID'])
+        for _, row in mapped_df.iterrows()
+    }
+    pending = source_df[~source_df['SourcePayrollFactorID'].isin(already.keys())].copy()
 
     print(
         f"  -> Candidates: {len(source_df)}. "
-        f"Already mapped: {len(already)}. To insert: {len(pending)}."
+        f"Already mapped: {len(already)}. To process: {len(pending)}."
     )
     if pending.empty:
         print("  -> All statute factor masters already mapped.")
         return
 
-    existing_titles = set(
-        pd.read_sql("SELECT Title FROM HCM3.StatuteFactor", dest_cnxn)['Title']
-        .dropna()
-        .tolist()
+    existing_df = pd.read_sql(
+        "SELECT StatuteFactorID, Name, Title FROM HCM3.StatuteFactor",
+        dest_cnxn,
     )
-    used_titles = {str(t) for t in existing_titles}
+    title_buckets = {}
+    for _, row in existing_df.iterrows():
+        if row['Title'] is None or (isinstance(row['Title'], float) and pd.isna(row['Title'])):
+            continue
+        key = normalize_persian(str(row['Title']).strip())
+        if not key:
+            continue
+        title_buckets.setdefault(key, []).append(int(row['StatuteFactorID']))
+    title_index = {k: ids[0] for k, ids in title_buckets.items() if len(ids) == 1}
+
+    claimed = set(already.values())
+    for dest_id in list(claimed):
+        for key, value in list(title_index.items()):
+            if value == dest_id:
+                del title_index[key]
+
+    used_titles = {
+        str(t)
+        for t in existing_df['Title'].dropna().tolist()
+    }
 
     last_id = _ensure_table_id(dest_cursor, 'HCM3.StatuteFactor', 0)
     insert_sql = """
@@ -305,9 +326,22 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
     """
 
     inserted = 0
+    linked = 0
     for _, row in pending.iterrows():
         source_id = int(row['SourcePayrollFactorID'])
-        title = _unique_title(row['FactorName'], source_id, used_titles)
+        base_title = row['FactorName'] or '-'
+        title_key = normalize_persian(str(base_title).strip()) if base_title else ''
+        existing_id = title_index.get(title_key) if title_key else None
+        if existing_id is not None and existing_id not in claimed:
+            dest_cursor.execute(map_sql, (source_id, existing_id))
+            claimed.add(existing_id)
+            for key, value in list(title_index.items()):
+                if value == existing_id:
+                    del title_index[key]
+            linked += 1
+            continue
+
+        title = _unique_title(base_title, source_id, used_titles)
         name = f'Mig_Pf_{source_id}'
         type_code = TYPE_PRIMARY if int(row['InDetail']) == 1 else TYPE_SECONDARY
         note = row['FactorNote']
@@ -335,14 +369,16 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
             ),
         )
         dest_cursor.execute(map_sql, (source_id, last_id))
+        claimed.add(last_id)
         inserted += 1
 
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
-        (last_id, 'HCM3.StatuteFactor'),
-    )
+    if inserted:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
+            (last_id, 'HCM3.StatuteFactor'),
+        )
     print(
-        f"  -> StatuteFactors inserted: {inserted}. "
+        f"  -> StatuteFactors inserted: {inserted}, linked existing: {linked}. "
         f"Skipped (already mapped): {len(already)}."
     )
 

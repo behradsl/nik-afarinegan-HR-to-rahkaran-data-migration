@@ -392,6 +392,57 @@ def _unique_code_for_title(base_code, title, source_id, used_pairs, code_max=100
     return str(source_id)[:code_max]
 
 
+def _norm_match_title(title):
+    if title is None or (isinstance(title, float) and pd.isna(title)):
+        return DEFAULT_TITLE
+    text = normalize_persian(str(title).strip())
+    return text or DEFAULT_TITLE
+
+
+def _code_title_key(code, title):
+    return (str(code).strip(), _norm_match_title(title))
+
+
+def _build_unique_value_index(df, id_col, value_col):
+    """Map non-empty trimmed value -> dest id. Ambiguous values are omitted."""
+    buckets = {}
+    for _, row in df.iterrows():
+        raw = row[value_col]
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        key = str(raw).strip()
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(int(row[id_col]))
+    return {k: ids[0] for k, ids in buckets.items() if len(ids) == 1}
+
+
+def _build_code_title_index(df, id_col, code_col='Code', title_col='Title'):
+    """Map (code, normalized title) -> dest id. Ambiguous pairs are omitted."""
+    buckets = {}
+    for _, row in df.iterrows():
+        code = row[code_col]
+        if code is None or (isinstance(code, float) and pd.isna(code)):
+            continue
+        code_key = str(code).strip()
+        if not code_key:
+            continue
+        key = _code_title_key(code_key, row[title_col])
+        buckets.setdefault(key, []).append(int(row[id_col]))
+    return {k: ids[0] for k, ids in buckets.items() if len(ids) == 1}
+
+
+def _claim_dest(dest_id, claimed_dest_ids, *indexes):
+    """Mark dest as taken and remove it from conceptual-match indexes."""
+    if dest_id is None:
+        return
+    claimed_dest_ids.add(int(dest_id))
+    for index in indexes:
+        for key, value in list(index.items()):
+            if value == dest_id:
+                del index[key]
+
+
 def _active_status(active_raw):
     try:
         return 1 if int(float(active_raw)) == 1 else 2
@@ -444,41 +495,53 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
         print("  -> No source departments found.")
         return result
 
-    existing_pairs_df = pd.read_sql(
-        "SELECT Code, Title FROM HCM3.Department WHERE Code IS NOT NULL",
+    dest_dept_df = pd.read_sql(
+        """
+        SELECT DepartmentID, Code, UniqueCode, Title
+        FROM HCM3.Department
+        """,
         dest_cnxn,
     )
     used_pairs = {
-        (str(row['Code']), normalize_persian(str(row['Title'])) if row['Title'] else DEFAULT_TITLE)
-        for _, row in existing_pairs_df.iterrows()
+        (
+            str(row['Code']).strip(),
+            str(row['Title']) if row['Title'] else DEFAULT_TITLE,
+        )
+        for _, row in dest_dept_df.iterrows()
+        if row['Code'] is not None and str(row['Code']).strip()
     }
+    unique_code_index = _build_unique_value_index(
+        dest_dept_df, 'DepartmentID', 'UniqueCode'
+    )
+    code_title_index = _build_code_title_index(dest_dept_df, 'DepartmentID')
+    claimed_dest_ids = set(result.values())
+    for dest_id in list(claimed_dest_ids):
+        _claim_dest(dest_id, claimed_dest_ids, unique_code_index, code_title_index)
 
     # UniqueCode index is unique when set — reserve codes already on unmapped + mapped depts
-    used_unique_df = pd.read_sql(
-        "SELECT UniqueCode FROM HCM3.Department WHERE NULLIF(LTRIM(RTRIM(UniqueCode)), N'') IS NOT NULL",
-        dest_cnxn,
-    )
     used_unique_codes = {
-        str(r['UniqueCode']).strip() for _, r in used_unique_df.iterrows()
+        str(r['UniqueCode']).strip()
+        for _, r in dest_dept_df.iterrows()
+        if r['UniqueCode'] is not None and str(r['UniqueCode']).strip()
     }
 
     # Drop UniqueCodes currently held by mapped depts so we can re-assign cleanly
-    mapped_dest_ids = set(result.values())
-    if mapped_dest_ids:
-        held_df = pd.read_sql(
-            """
-            SELECT DepartmentID, UniqueCode FROM HCM3.Department
-            WHERE NULLIF(LTRIM(RTRIM(UniqueCode)), N'') IS NOT NULL
-            """,
-            dest_cnxn,
-        )
-        for _, r in held_df.iterrows():
-            if int(r['DepartmentID']) in mapped_dest_ids:
-                used_unique_codes.discard(str(r['UniqueCode']).strip())
+    if claimed_dest_ids:
+        for _, r in dest_dept_df.iterrows():
+            if int(r['DepartmentID']) in claimed_dest_ids:
+                uc = r['UniqueCode']
+                if uc is not None and str(uc).strip():
+                    used_unique_codes.discard(str(uc).strip())
 
     missing_df = source_df[~source_df['SourceDepartmentID'].isin(result.keys())]
     inserted = 0
+    linked = 0
     uniquified = 0
+    insert_mapping_sql = """
+        INSERT INTO master.dbo.DepartmentMigrationMapping (
+            SourceDepartmentID, DestDepartmentID
+        ) VALUES (?, ?)
+    """
     if not missing_df.empty:
         last_id = ensure_table_id(dest_cursor, 'HCM3.Department', 0)
         insert_sql = """
@@ -487,21 +550,44 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (?, ?, ?, ?, ?, NULL, ?, GETDATE(), 1, GETDATE(), 1)
         """
-        insert_mapping_sql = """
-            INSERT INTO master.dbo.DepartmentMigrationMapping (
-                SourceDepartmentID, DestDepartmentID
-            ) VALUES (?, ?)
-        """
 
         for _, row in missing_df.iterrows():
             source_id = int(row['SourceDepartmentID'])
             title, base_code = _title_and_code(
                 row['DepartmentName'], row['DepartmentCode'], source_id, title_max=200
             )
+            status = _active_status(row['DepartmentActive'])
+
+            # Conceptual match: UniqueCode, then (Code, Title)
+            existing_id = None
+            raw_unique = clean_value(row['DepartmentCode'])
+            if raw_unique is not None:
+                raw_unique = str(raw_unique).strip() or None
+            if raw_unique and raw_unique in unique_code_index:
+                existing_id = unique_code_index[raw_unique]
+            if existing_id is None:
+                pair_key = _code_title_key(base_code, title)
+                existing_id = code_title_index.get(pair_key)
+
+            if existing_id is not None and existing_id not in claimed_dest_ids:
+                dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
+                result[source_id] = existing_id
+                if raw_unique:
+                    used_unique_codes.discard(raw_unique)
+                held = dest_dept_df.loc[
+                    dest_dept_df['DepartmentID'] == existing_id, 'UniqueCode'
+                ]
+                if not held.empty and held.iloc[0] is not None and str(held.iloc[0]).strip():
+                    used_unique_codes.discard(str(held.iloc[0]).strip())
+                _claim_dest(
+                    existing_id, claimed_dest_ids, unique_code_index, code_title_index
+                )
+                linked += 1
+                continue
+
             code = _unique_code_for_title(base_code, title, source_id, used_pairs)
             if code != base_code:
                 uniquified += 1
-            status = _active_status(row['DepartmentActive'])
             unique_code, abbr = _dept_unique_and_abbr(row, source_id, used_unique_codes)
             last_id += 1
             dest_cursor.execute(
@@ -510,14 +596,16 @@ def ensure_departments(source_cnxn, dest_cnxn, dest_cursor):
             dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
             used_pairs.add((code, title))
             result[source_id] = last_id
+            claimed_dest_ids.add(last_id)
             inserted += 1
 
-        dest_cursor.execute(
-            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
-            (last_id,),
-        )
+        if inserted:
+            dest_cursor.execute(
+                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
+                (last_id,),
+            )
         print(
-            f"  -> Departments inserted: {inserted} "
+            f"  -> Departments inserted: {inserted}, linked existing: {linked} "
             f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
         )
     else:
@@ -856,8 +944,23 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             geo_by_post.get(source_id),
         )
 
+    dest_post_df = pd.read_sql(
+        "SELECT PostID, Code, Title FROM HCM3.Post",
+        dest_cnxn,
+    )
+    code_title_index = _build_code_title_index(dest_post_df, 'PostID')
+    claimed_dest_ids = set(result.values())
+    for dest_id in list(claimed_dest_ids):
+        _claim_dest(dest_id, claimed_dest_ids, code_title_index)
+
     missing_df = source_df[~source_df['SourcePostID'].isin(result.keys())]
     inserted = 0
+    linked = 0
+    insert_mapping_sql = """
+        INSERT INTO master.dbo.PostMigrationMapping (
+            SourcePostID, DestPostID
+        ) VALUES (?, ?)
+    """
     if not missing_df.empty:
         last_id = ensure_table_id(dest_cursor, 'HCM3.Post', 0)
         insert_sql = """
@@ -867,11 +970,6 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
                 Extra1Code, Extra2Code, Status,
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
-        """
-        insert_mapping_sql = """
-            INSERT INTO master.dbo.PostMigrationMapping (
-                SourcePostID, DestPostID
-            ) VALUES (?, ?)
         """
 
         for _, row in missing_df.iterrows():
@@ -884,6 +982,16 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             type_code = _type_code(row)
             regional_ref = _regional_ref(row)
             extra1, extra2, rd_type = _extra_fields(source_id)
+
+            # Conceptual match: (Code, Title) only — Extra fields are not identity
+            existing_id = code_title_index.get(_code_title_key(code, title))
+            if existing_id is not None and existing_id not in claimed_dest_ids:
+                dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
+                result[source_id] = existing_id
+                _claim_dest(existing_id, claimed_dest_ids, code_title_index)
+                linked += 1
+                continue
+
             last_id += 1
             dest_cursor.execute(
                 insert_sql,
@@ -894,13 +1002,18 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             )
             dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
             result[source_id] = last_id
+            claimed_dest_ids.add(last_id)
             inserted += 1
 
-        dest_cursor.execute(
-            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Post'",
-            (last_id,),
+        if inserted:
+            dest_cursor.execute(
+                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Post'",
+                (last_id,),
+            )
+        print(
+            f"  -> Posts inserted: {inserted}, linked existing: {linked}. "
+            f"Total mapped: {len(result)}."
         )
-        print(f"  -> Posts inserted: {inserted}. Total mapped: {len(result)}.")
     else:
         print(f"  -> Posts already mapped: {len(result)}.")
 
@@ -1105,17 +1218,30 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         insert_candidates = source_df
 
     existing_pairs_df = pd.read_sql(
-        "SELECT Code, Title FROM HCM3.Job WHERE Code IS NOT NULL",
+        "SELECT JobID, Code, Title FROM HCM3.Job WHERE Code IS NOT NULL",
         dest_cnxn,
     )
     used_pairs = {
-        (str(row['Code']), normalize_persian(str(row['Title'])) if row['Title'] else DEFAULT_TITLE)
+        (
+            str(row['Code']).strip(),
+            str(row['Title']) if row['Title'] else DEFAULT_TITLE,
+        )
         for _, row in existing_pairs_df.iterrows()
     }
+    code_title_index = _build_code_title_index(existing_pairs_df, 'JobID')
+    claimed_dest_ids = set(result.values())
+    for dest_id in list(claimed_dest_ids):
+        _claim_dest(dest_id, claimed_dest_ids, code_title_index)
 
     missing_df = insert_candidates[~insert_candidates['SourceJobID'].isin(result.keys())]
     inserted = 0
+    linked = 0
     uniquified = 0
+    insert_mapping_sql = """
+        INSERT INTO master.dbo.JobMigrationMapping (
+            SourceJobID, DestJobID
+        ) VALUES (?, ?)
+    """
     if not missing_df.empty:
         last_id = ensure_table_id(dest_cursor, 'HCM3.Job', 0)
         insert_sql = """
@@ -1124,21 +1250,25 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
-        insert_mapping_sql = """
-            INSERT INTO master.dbo.JobMigrationMapping (
-                SourceJobID, DestJobID
-            ) VALUES (?, ?)
-        """
 
         for _, row in missing_df.iterrows():
             source_id = int(row['SourceJobID'])
             title, base_code = _title_and_code(
                 row['JobName'], row['JobCode'], source_id, title_max=400
             )
+            status = _active_status(row['JobActive'])
+
+            existing_id = code_title_index.get(_code_title_key(base_code, title))
+            if existing_id is not None and existing_id not in claimed_dest_ids:
+                dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
+                result[source_id] = existing_id
+                _claim_dest(existing_id, claimed_dest_ids, code_title_index)
+                linked += 1
+                continue
+
             code = _unique_code_for_title(base_code, title, source_id, used_pairs)
             if code != base_code:
                 uniquified += 1
-            status = _active_status(row['JobActive'])
             last_id += 1
             dest_cursor.execute(
                 insert_sql,
@@ -1147,14 +1277,16 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
             dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
             used_pairs.add((code, title))
             result[source_id] = last_id
+            claimed_dest_ids.add(last_id)
             inserted += 1
 
-        dest_cursor.execute(
-            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
-            (last_id,),
-        )
+        if inserted:
+            dest_cursor.execute(
+                "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
+                (last_id,),
+            )
         print(
-            f"  -> Jobs inserted: {inserted} "
+            f"  -> Jobs inserted: {inserted}, linked existing: {linked} "
             f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
         )
     else:
@@ -1222,6 +1354,24 @@ def ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor):
         print(f"  -> Employment types already mapped: {len(result)}.")
         return result
 
+    dest_et_df = pd.read_sql(
+        "SELECT EmploymentTypeID, Title, RawTitle FROM HCM3.EmploymentType",
+        dest_cnxn,
+    )
+    title_index = {}
+    for _, row in dest_et_df.iterrows():
+        for col in ('Title', 'RawTitle'):
+            key = _norm_match_title(row[col])
+            if key and key != DEFAULT_TITLE:
+                title_index.setdefault(key, [])
+                if int(row['EmploymentTypeID']) not in title_index[key]:
+                    title_index[key].append(int(row['EmploymentTypeID']))
+    title_index = {k: ids[0] for k, ids in title_index.items() if len(ids) == 1}
+
+    claimed_dest_ids = set(result.values())
+    for dest_id in list(claimed_dest_ids):
+        _claim_dest(dest_id, claimed_dest_ids, title_index)
+
     last_id = ensure_table_id(dest_cursor, 'HCM3.EmploymentType', 0)
     insert_sql = """
         INSERT INTO HCM3.EmploymentType (
@@ -1236,21 +1386,37 @@ def ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor):
     """
 
     inserted = 0
+    linked = 0
     for _, row in missing_df.iterrows():
         source_id = int(row['SourceEmploymentTypeID'])
         title = clean_persian_text(row['EtName']) or DEFAULT_TITLE
         title = title[:400]
+        title_key = _norm_match_title(title)
+
+        existing_id = title_index.get(title_key)
+        if existing_id is not None and existing_id not in claimed_dest_ids:
+            dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
+            result[source_id] = existing_id
+            _claim_dest(existing_id, claimed_dest_ids, title_index)
+            linked += 1
+            continue
+
         last_id += 1
         dest_cursor.execute(insert_sql, (last_id, title, title))
         dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
         result[source_id] = last_id
+        claimed_dest_ids.add(last_id)
         inserted += 1
 
-    dest_cursor.execute(
-        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmploymentType'",
-        (last_id,),
+    if inserted:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmploymentType'",
+            (last_id,),
+        )
+    print(
+        f"  -> Employment types inserted: {inserted}, linked existing: {linked}. "
+        f"Total mapped: {len(result)}."
     )
-    print(f"  -> Employment types inserted: {inserted}. Total mapped: {len(result)}.")
     return result
 
 
