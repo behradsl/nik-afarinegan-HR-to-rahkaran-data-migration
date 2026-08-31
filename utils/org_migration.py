@@ -6,6 +6,8 @@ from utils.hcm_extra_settings import ensure_hcm_extra_fields
 
 DEFAULT_TITLE = '-'
 DEFAULT_JOB_CLASS_CODE = 1
+DEFAULT_JOB_GROUP_CODE = 1
+CHILD_JOB_RANK_NUMBER = 1
 
 # Post Extra lookups (SYS3.Lookup Type / LookupInfo)
 POST_EXTRA1_LOOKUP = 'PostExtra1'  # کد توانیر / کد سازمانی پست
@@ -390,6 +392,35 @@ def _unique_code_for_title(base_code, title, source_id, used_pairs, code_max=100
     if (code, title) not in used_pairs:
         return code
     return str(source_id)[:code_max]
+
+
+def _unique_token(base, source_id, used, max_len=100):
+    """
+    Return a value unique within `used` (exact string match).
+    Prefer base; on collision append -{source_id}.
+    """
+    token = (base or str(source_id))[:max_len]
+    if token not in used:
+        used.add(token)
+        return token
+    suffix = f"-{source_id}"
+    token = f"{(base or '')[:max(0, max_len - len(suffix))]}{suffix}"
+    if token not in used:
+        used.add(token)
+        return token
+    token = str(source_id)[:max_len]
+    # Extremely unlikely collision on source_id; still force uniqueness.
+    if token in used:
+        n = 1
+        while True:
+            extra = f"-{source_id}-{n}"
+            candidate = extra[-max_len:]
+            if candidate not in used:
+                token = candidate
+                break
+            n += 1
+    used.add(token)
+    return token
 
 
 def _norm_match_title(title):
@@ -1218,20 +1249,34 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
         insert_candidates = source_df
 
     existing_pairs_df = pd.read_sql(
-        "SELECT JobID, Code, Title FROM HCM3.Job WHERE Code IS NOT NULL",
+        "SELECT JobID, Code, Title FROM HCM3.Job",
         dest_cnxn,
     )
-    used_pairs = {
-        (
-            str(row['Code']).strip(),
-            str(row['Title']) if row['Title'] else DEFAULT_TITLE,
-        )
+    # App UI rejects duplicate Job.Code or Job.Title (even though DB unique is Code+Title).
+    used_codes = {
+        str(row['Code']).strip()
+        for _, row in existing_pairs_df.iterrows()
+        if row['Code'] is not None and str(row['Code']).strip()
+    }
+    used_titles = {
+        str(row['Title']).strip() if row['Title'] else DEFAULT_TITLE
         for _, row in existing_pairs_df.iterrows()
     }
-    code_title_index = _build_code_title_index(existing_pairs_df, 'JobID')
+    code_title_index = _build_code_title_index(
+        existing_pairs_df[existing_pairs_df['Code'].notna()], 'JobID'
+    )
     claimed_dest_ids = set(result.values())
     for dest_id in list(claimed_dest_ids):
         _claim_dest(dest_id, claimed_dest_ids, code_title_index)
+
+    # Free codes/titles held by mapped jobs so we can re-assign cleanly on upsert/repair.
+    if claimed_dest_ids:
+        for _, row in existing_pairs_df.iterrows():
+            if int(row['JobID']) in claimed_dest_ids:
+                if row['Code'] is not None and str(row['Code']).strip():
+                    used_codes.discard(str(row['Code']).strip())
+                title_key = str(row['Title']).strip() if row['Title'] else DEFAULT_TITLE
+                used_titles.discard(title_key)
 
     missing_df = insert_candidates[~insert_candidates['SourceJobID'].isin(result.keys())]
     inserted = 0
@@ -1262,20 +1307,31 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
             if existing_id is not None and existing_id not in claimed_dest_ids:
                 dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
                 result[source_id] = existing_id
+                if existing_id in {
+                    int(r['JobID']) for _, r in existing_pairs_df.iterrows()
+                }:
+                    held = existing_pairs_df.loc[
+                        existing_pairs_df['JobID'] == existing_id
+                    ].iloc[0]
+                    if held['Code'] is not None and str(held['Code']).strip():
+                        used_codes.discard(str(held['Code']).strip())
+                    used_titles.discard(
+                        str(held['Title']).strip() if held['Title'] else DEFAULT_TITLE
+                    )
                 _claim_dest(existing_id, claimed_dest_ids, code_title_index)
                 linked += 1
                 continue
 
-            code = _unique_code_for_title(base_code, title, source_id, used_pairs)
-            if code != base_code:
+            code = _unique_token(base_code, source_id, used_codes, max_len=100)
+            unique_title = _unique_token(title, source_id, used_titles, max_len=400)
+            if code != base_code or unique_title != title:
                 uniquified += 1
             last_id += 1
             dest_cursor.execute(
                 insert_sql,
-                (last_id, code, title, DEFAULT_JOB_CLASS_CODE, status),
+                (last_id, code, unique_title, DEFAULT_JOB_CLASS_CODE, status),
             )
             dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
-            used_pairs.add((code, title))
             result[source_id] = last_id
             claimed_dest_ids.add(last_id)
             inserted += 1
@@ -1287,39 +1343,234 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
             )
         print(
             f"  -> Jobs inserted: {inserted}, linked existing: {linked} "
-            f"(codes uniquified: {uniquified}). Total mapped: {len(result)}."
+            f"(code/title uniquified: {uniquified}). Total mapped: {len(result)}."
         )
     else:
         print(f"  -> Jobs already mapped: {len(result)}.")
 
-    # Upsert title/status for mapped jobs (رشته‌های شغلی)
-    update_sql = """
-        UPDATE HCM3.Job
-        SET Title = ?, Status = ?,
-            LastModificationDate = GETDATE(), LastModifier = 1
-        WHERE JobID = ?
-          AND (
-            ISNULL(Title, N'') <> ISNULL(?, N'')
-            OR ISNULL(Status, -1) <> ISNULL(?, -1)
-          )
-    """
-    updated = 0
+    # Upsert code/title/status for mapped jobs; keep Code and Title globally unique.
+    # Two-phase update avoids UIX_HCM3_Job_Code_Title collisions while rewriting.
+    mapped_rows = []
     for _, row in work_df.iterrows():
         source_id = int(row['SourceJobID'])
         dest_id = result.get(source_id)
         if dest_id is None:
             continue
-        title, _ = _title_and_code(
+        title, base_code = _title_and_code(
             row['JobName'], row['JobCode'], source_id, title_max=400
         )
         status = _active_status(row['JobActive'])
-        dest_cursor.execute(update_sql, (title, status, dest_id, title, status))
+        mapped_rows.append((source_id, dest_id, base_code, title, status))
+
+    for source_id, dest_id, _base_code, _title, _status in mapped_rows:
+        dest_cursor.execute(
+            """
+            UPDATE HCM3.Job
+            SET Code = ?, LastModificationDate = GETDATE(), LastModifier = 1
+            WHERE JobID = ?
+            """,
+            (f"__mig_{dest_id}", dest_id),
+        )
+
+    # Rebuild used sets: unmapped jobs keep their codes/titles reserved.
+    used_codes = set()
+    used_titles = set()
+    live_df = pd.read_sql("SELECT JobID, Code, Title FROM HCM3.Job", dest_cnxn)
+    mapped_dest = {dest_id for _, dest_id, *_ in mapped_rows}
+    for _, row in live_df.iterrows():
+        jid = int(row['JobID'])
+        if jid in mapped_dest:
+            continue
+        if row['Code'] is not None and str(row['Code']).strip():
+            used_codes.add(str(row['Code']).strip())
+        used_titles.add(str(row['Title']).strip() if row['Title'] else DEFAULT_TITLE)
+
+    update_sql = """
+        UPDATE HCM3.Job
+        SET Code = ?, Title = ?, Status = ?,
+            LastModificationDate = GETDATE(), LastModifier = 1
+        WHERE JobID = ?
+          AND (
+            ISNULL(Code, N'') <> ISNULL(?, N'')
+            OR ISNULL(Title, N'') <> ISNULL(?, N'')
+            OR ISNULL(Status, -1) <> ISNULL(?, -1)
+          )
+    """
+    updated = 0
+    for source_id, dest_id, base_code, title, status in mapped_rows:
+        code = _unique_token(base_code, source_id, used_codes, max_len=100)
+        unique_title = _unique_token(title, source_id, used_titles, max_len=400)
+        dest_cursor.execute(
+            update_sql,
+            (
+                code, unique_title, status, dest_id,
+                code, unique_title, status,
+            ),
+        )
         if dest_cursor.rowcount:
             updated += 1
     if updated:
         print(f"  -> Jobs updated: {updated}.")
 
+    # One rank-1 child per migrated parent (ParentRef / GroupCode / ClassCode / Title).
+    # InsuranceCode left empty until source mapping is clarified; re-run can fill later.
+    parent_ids = sorted({dest_id for _, dest_id, *_ in mapped_rows})
+    _ensure_job_rank_children(dest_cnxn, dest_cursor, parent_ids)
+
     return result
+
+
+def _ensure_job_rank_children(dest_cnxn, dest_cursor, parent_dest_ids):
+    """
+    For each parent JobID, ensure exactly one child job with:
+      ParentRef=parent, ClassCode=1, GroupCode=1, JobRankNumber=1,
+      Title=parentTitle + ' ' + JobRankNumber, Code='', Senior=0.
+    Does not write InsuranceCode (pending source clarification).
+    Idempotent on (ParentRef, JobRankNumber=1).
+    """
+    if not parent_dest_ids:
+        return
+
+    parent_set = {int(p) for p in parent_dest_ids}
+    live_df = pd.read_sql(
+        """
+        SELECT JobID, ParentRef, Code, Title, ClassCode, JobRankNumber,
+               GroupCode, Status, Senior
+        FROM HCM3.Job
+        """,
+        dest_cnxn,
+    )
+    if live_df.empty:
+        return
+
+    parents = {
+        int(row['JobID']): row
+        for _, row in live_df.iterrows()
+        if int(row['JobID']) in parent_set
+    }
+    # Prefer existing rank-1 child under each parent (UI samples may already exist).
+    rank1_by_parent = {}
+    for _, row in live_df.iterrows():
+        pref = row['ParentRef']
+        if pref is None or (isinstance(pref, float) and pd.isna(pref)):
+            continue
+        parent_id = int(pref)
+        if parent_id not in parent_set:
+            continue
+        rank = row['JobRankNumber']
+        if rank is None or (isinstance(rank, float) and pd.isna(rank)):
+            continue
+        if int(rank) != CHILD_JOB_RANK_NUMBER:
+            continue
+        # Keep lowest JobID if duplicates
+        existing = rank1_by_parent.get(parent_id)
+        jid = int(row['JobID'])
+        if existing is None or jid < existing:
+            rank1_by_parent[parent_id] = jid
+
+    managed_child_ids = set(rank1_by_parent.values())
+    used_titles = set()
+    for _, row in live_df.iterrows():
+        jid = int(row['JobID'])
+        if jid in managed_child_ids:
+            continue
+        used_titles.add(str(row['Title']).strip() if row['Title'] else DEFAULT_TITLE)
+
+    insert_sql = """
+        INSERT INTO HCM3.Job (
+            JobID, ParentRef, Code, Title, ClassCode, JobRankNumber, GroupCode,
+            Senior, Status, CreationDate, Creator, LastModificationDate, LastModifier
+        ) VALUES (
+            ?, ?, N'', ?, ?, ?, ?, 0, ?, GETDATE(), 1, GETDATE(), 1
+        )
+    """
+    update_sql = """
+        UPDATE HCM3.Job
+        SET ParentRef = ?, Code = N'', Title = ?, ClassCode = ?,
+            JobRankNumber = ?, GroupCode = ?, Senior = 0, Status = ?,
+            LastModificationDate = GETDATE(), LastModifier = 1
+        WHERE JobID = ?
+          AND (
+            ISNULL(ParentRef, -1) <> ISNULL(?, -1)
+            OR ISNULL(Code, N'') <> N''
+            OR ISNULL(Title, N'') <> ISNULL(?, N'')
+            OR ISNULL(ClassCode, -1) <> ISNULL(?, -1)
+            OR ISNULL(JobRankNumber, -1) <> ISNULL(?, -1)
+            OR ISNULL(GroupCode, -1) <> ISNULL(?, -1)
+            OR ISNULL(CAST(Senior AS INT), -1) <> 0
+            OR ISNULL(Status, -1) <> ISNULL(?, -1)
+          )
+    """
+
+    last_id = ensure_table_id(dest_cursor, 'HCM3.Job', 0)
+    inserted = 0
+    updated = 0
+
+    for parent_id in sorted(parent_set):
+        parent_row = parents.get(parent_id)
+        if parent_row is None:
+            continue
+        parent_title = (
+            str(parent_row['Title']).strip() if parent_row['Title'] else DEFAULT_TITLE
+        )
+        status = int(parent_row['Status']) if parent_row['Status'] is not None else 1
+        desired_title = f"{parent_title} {CHILD_JOB_RANK_NUMBER}"
+        # Cap like parent titles (nvarchar 400 on Job.Title).
+        if len(desired_title) > 400:
+            desired_title = desired_title[:400]
+        child_title = _unique_token(
+            desired_title, parent_id, used_titles, max_len=400
+        )
+
+        child_id = rank1_by_parent.get(parent_id)
+        if child_id is None:
+            last_id += 1
+            dest_cursor.execute(
+                insert_sql,
+                (
+                    last_id,
+                    parent_id,
+                    child_title,
+                    DEFAULT_JOB_CLASS_CODE,
+                    CHILD_JOB_RANK_NUMBER,
+                    DEFAULT_JOB_GROUP_CODE,
+                    status,
+                ),
+            )
+            rank1_by_parent[parent_id] = last_id
+            inserted += 1
+        else:
+            dest_cursor.execute(
+                update_sql,
+                (
+                    parent_id,
+                    child_title,
+                    DEFAULT_JOB_CLASS_CODE,
+                    CHILD_JOB_RANK_NUMBER,
+                    DEFAULT_JOB_GROUP_CODE,
+                    status,
+                    child_id,
+                    parent_id,
+                    child_title,
+                    DEFAULT_JOB_CLASS_CODE,
+                    CHILD_JOB_RANK_NUMBER,
+                    DEFAULT_JOB_GROUP_CODE,
+                    status,
+                ),
+            )
+            if dest_cursor.rowcount:
+                updated += 1
+
+    if inserted:
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Job'",
+            (last_id,),
+        )
+
+    print(
+        f"  -> Job rank-1 children inserted: {inserted}, updated: {updated} "
+        f"(parents: {len(parent_set)})."
+    )
 
 
 def ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor):
