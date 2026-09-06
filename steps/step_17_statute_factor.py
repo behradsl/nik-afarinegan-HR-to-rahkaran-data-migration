@@ -1,26 +1,31 @@
 """
-Step 17: Migrate PAY_PayrollFactor (used on rule docs) → HCM3.StatuteFactor,
-plus StatuteFactorProperty + Formula from PAY_PayrollBackFormula / PAY_PfFormula.
+Step 17: Migrate statute factors (PAY_PfParentID_fk = 2) → HCM3.StatuteFactor,
+plus StatuteFactorProperty + Formula stubs.
 
-Source has no separate formula-per-employment-type rows (ET branching is inside
-SQL helpers like FxPAY_PersonnelKind). Rahkaran requires non-null EmploymentTypeRef
-on StatuteFactorProperty, so each dated formula is applied to all destination
-employment types (one property row per ET, shared FormulaRef).
+Formulas come from PAY_PfRollFormula only. Property date × employment-type
+windows are extracted from the scalar UDFs those rolls call
+(FxPAY_PersonnelEmploymentType, FxHRS_RuleDocumentPersonnelCMSL, …).
 
-IssueYearMonth / ApplyYearMonth come from PAY_MonthID (Shamsi YYYYMM) for
-BackFormula rows. When a factor has no BackFormula, we fall back to PAY_PfFormula
-and stamp Issue/Apply with the earliest HRS_RuleDocumentScores register month
-so older statute windows still resolve a property.
-
-Source formulas are SQL; Rahkaran expects C#. We store a safe stub body
-(`return 0;`) plus a designer UIObject template so the formula editor can open,
-and keep the original SQL in Formula.Description for rebuild.
+FormulaBody stays `return 0;`; source SQL for the property is stored in Description.
 """
+import re
 import pandas as pd
 import warnings
 from pathlib import Path
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
+from utils.roll_formula_properties import (
+    STATUTE_PARENT_ID,
+    build_roll_property_targets,
+    load_parent2_factors,
+)
+
+EXPERT_REVIEW_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "analysis"
+    / "statute_factor_parent2_roll"
+    / "out"
+)
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -32,7 +37,6 @@ RELATED_IN_SERVICE = 1
 
 PROPERTY_STATUS_ACTIVE = 1
 FORMULA_MODULE_STAFF = 'Staff'
-# Match Rahkaran designer stub used by utils/formula_uiobject_return0.bin
 FORMULA_STUB_BODY = ' return 0;'
 FORMULA_UIOBJECT_TEMPLATE = (
     Path(__file__).resolve().parent.parent / 'utils' / 'formula_uiobject_return0.bin'
@@ -46,7 +50,6 @@ def _load_formula_uiobject_template():
             "Export a Staff 'return 0;' UIObject blob from a working Rahkaran DB."
         )
     return FORMULA_UIOBJECT_TEMPLATE.read_bytes()
-
 
 
 def setup_statute_factor_mapping_table(cursor):
@@ -67,8 +70,8 @@ def setup_statute_factor_mapping_table(cursor):
 
 def setup_statute_factor_property_mapping_table(cursor, *, recreate_if_legacy=True):
     """
-    Mapping includes DestEmploymentTypeID. Older schema (factor+month only) is
-    replaced so we can expand one source formula version across all ETs.
+    Mapping keyed by (factor, EffectiveFromMonth YYYYMM, DestEmploymentTypeID).
+    Legacy schemas are replaced when required columns are missing.
     """
     if recreate_if_legacy:
         cursor.execute("""
@@ -76,10 +79,19 @@ def setup_statute_factor_property_mapping_table(cursor, *, recreate_if_legacy=Tr
                 SELECT * FROM master.sys.tables
                 WHERE name = 'StatuteFactorPropertyMigrationMapping'
             )
-            AND NOT EXISTS (
-                SELECT * FROM master.sys.columns
-                WHERE object_id = OBJECT_ID('master.dbo.StatuteFactorPropertyMigrationMapping')
-                  AND name = 'DestEmploymentTypeID'
+            AND (
+                COL_LENGTH(
+                    'master.dbo.StatuteFactorPropertyMigrationMapping',
+                    'EffectiveFromMonth'
+                ) IS NULL
+                OR COL_LENGTH(
+                    'master.dbo.StatuteFactorPropertyMigrationMapping',
+                    'SlotCode'
+                ) IS NULL
+                OR COL_LENGTH(
+                    'master.dbo.StatuteFactorPropertyMigrationMapping',
+                    'StatutePure'
+                ) IS NULL
             )
             BEGIN
                 DROP TABLE master.dbo.StatuteFactorPropertyMigrationMapping
@@ -93,13 +105,23 @@ def setup_statute_factor_property_mapping_table(cursor, *, recreate_if_legacy=Tr
         BEGIN
             CREATE TABLE master.dbo.StatuteFactorPropertyMigrationMapping (
                 SourcePayrollFactorID INT NOT NULL,
-                SourceMonthID INT NOT NULL,
+                EffectiveFromMonth INT NOT NULL,
                 DestEmploymentTypeID BIGINT NOT NULL,
+                SlotCode NVARCHAR(10) NULL,
                 SourceBackFormulaID INT NULL,
                 DestStatuteFactorPropertyID BIGINT NOT NULL,
                 DestFormulaID BIGINT NOT NULL,
+                OutputExpr NVARCHAR(MAX) NULL,
+                StatutePure BIT NOT NULL DEFAULT 0,
+                HasSelf BIT NOT NULL DEFAULT 0,
+                NonRdFactorRefs NVARCHAR(200) NULL,
+                DeferredReason NVARCHAR(1000) NULL,
                 MigrationDate DATETIME DEFAULT GETDATE(),
-                PRIMARY KEY (SourcePayrollFactorID, SourceMonthID, DestEmploymentTypeID)
+                PRIMARY KEY (
+                    SourcePayrollFactorID,
+                    EffectiveFromMonth,
+                    DestEmploymentTypeID
+                )
             )
         END
     """)
@@ -133,119 +155,40 @@ def _unique_title(base_title, source_id, used_titles):
     return title
 
 
-def _formula_text(raw):
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    return text
-
-
-def _shamsi_to_year_month(raw):
-    """
-    Parse source Shamsi date strings like '1399/10/20' or '1399/10/20 10:36:31'
-    into int YYYYMM (e.g. 139910). Returns None when unusable.
-    """
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    date_part = text.split()[0].replace('-', '/')
-    parts = date_part.split('/')
-    if len(parts) < 2:
-        return None
-    try:
-        year = int(parts[0])
-        month = int(parts[1])
-    except (TypeError, ValueError):
-        return None
-    if year <= 0 or month < 1 or month > 12:
-        return None
-    return year * 100 + month
-
-
-def _earliest_score_year_months(source_cnxn, source_factor_ids):
-    """
-    SourcePayrollFactorID -> earliest HRS_RuleDocumentScores register YYYYMM.
-    """
-    if not source_factor_ids:
-        return {}
-    id_list = ",".join(str(int(x)) for x in sorted(set(int(i) for i in source_factor_ids)))
-    scores_df = pd.read_sql(f"""
-        SELECT
-            PAY_PfID_fk AS SourcePayrollFactorID,
-            MIN(HRS_RdsRegisterDate) AS EarliestRegisterDate
-        FROM dbo.HRS_RuleDocumentScores
-        WHERE PAY_PfID_fk IN ({id_list})
-          AND HRS_RdsRegisterDate IS NOT NULL
-          AND LTRIM(RTRIM(HRS_RdsRegisterDate)) <> N''
-        GROUP BY PAY_PfID_fk
-    """, source_cnxn)
-    result = {}
-    for _, row in scores_df.iterrows():
-        yyyymm = _shamsi_to_year_month(row['EarliestRegisterDate'])
-        if yyyymm is not None:
-            result[int(row['SourcePayrollFactorID'])] = yyyymm
-    return result
-
-
-def _factor_register_year_months(source_cnxn, source_factor_ids):
-    """SourcePayrollFactorID -> PAY_PfRegisetrDate as YYYYMM (secondary fallback)."""
-    if not source_factor_ids:
-        return {}
-    id_list = ",".join(str(int(x)) for x in sorted(set(int(i) for i in source_factor_ids)))
-    pf_df = pd.read_sql(f"""
-        SELECT
-            PAY_PfID AS SourcePayrollFactorID,
-            PAY_PfRegisetrDate AS RegisterDate
-        FROM dbo.PAY_PayrollFactor
-        WHERE PAY_PfID IN ({id_list})
-    """, source_cnxn)
-    result = {}
-    for _, row in pf_df.iterrows():
-        yyyymm = _shamsi_to_year_month(row['RegisterDate'])
-        if yyyymm is not None:
-            result[int(row['SourcePayrollFactorID'])] = yyyymm
-    return result
-
-
-def _build_formula_description(source_pf_id, month_id, source_sql, source_kind):
+def _build_formula_description(target):
+    source_pf_id = target["SourcePayrollFactorID"]
+    month = target.get("EffectiveFromMonth")
+    slot = target.get("SlotCode")
+    expr = target.get("OutputExpr") or ""
+    source_kind = target.get("SourceKind") or "formula"
+    raw = target.get("FormulaSql") or ""
+    pure = bool(target.get("StatutePure"))
+    deferred = target.get("DeferredReason") or ""
     header = (
         f"[Migrated from source {source_kind}]\n"
-        f"SourcePayrollFactorID={source_pf_id}; MonthID={month_id}\n"
-        f"NOTE: Original engine is SQL. Rahkaran FormulaBody is a stub; rewrite in app.\n"
+        f"SourcePayrollFactorID={source_pf_id}; "
+        f"EffectiveFromMonth={month}; Slot={slot}; "
+        f"Dispatcher={target.get('dispatcher')}\n"
+        f"StatutePure={'yes' if pure else 'no'}; "
+        f"HasSelf={'yes' if target.get('HasSelf') else 'no'}\n"
+        f"RdFactorRefs={target.get('RdFactorRefs') or ''}\n"
+        f"NonRdFactorRefs={target.get('NonRdFactorRefs') or ''}\n"
+        f"DeferredReason={deferred or '(none)'}\n"
+        f"OutputExpr={expr}\n"
+        f"NOTE: Statute factors are evaluated at حکم issue (not monthly payroll). "
+        f"Non-RD refs (attendance/other) are deferred — FormulaBody is a stub.\n"
         f"---\n"
     )
-    body = source_sql or ''
+    body = raw
     max_sql = 80000
     if len(body) > max_sql:
-        body = body[:max_sql] + '\n...[truncated]'
+        body = body[:max_sql] + "\n...[truncated]"
     return header + body
-
-
-def _dest_employment_type_ids(dest_cnxn):
-    """Prefer mapped ETs; fall back to all HCM3.EmploymentType rows."""
-    mapped = pd.read_sql("""
-        SELECT DestEmploymentTypeID
-        FROM master.dbo.EmploymentTypeMigrationMapping
-        ORDER BY DestEmploymentTypeID
-    """, dest_cnxn)
-    if not mapped.empty:
-        return [int(x) for x in mapped['DestEmploymentTypeID'].tolist()]
-    all_et = pd.read_sql("""
-        SELECT EmploymentTypeID
-        FROM HCM3.EmploymentType
-        ORDER BY EmploymentTypeID
-    """, dest_cnxn)
-    return [int(x) for x in all_et['EmploymentTypeID'].tolist()]
 
 
 def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
     """
-    Remove prior property/formula migration so we can rebuild with ET expansion.
-    Also clears any null-ET properties hanging off migrated statute factors.
+    Remove prior property/formula migration so we can rebuild from formula breaks.
     """
     has_prop_map = pd.read_sql("""
         SELECT CASE WHEN OBJECT_ID('master.dbo.StatuteFactorPropertyMigrationMapping')
@@ -253,7 +196,6 @@ def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
     """, dest_cnxn).iloc[0]['HasMap'] == 1
 
     if has_prop_map:
-        # Delete properties before formulas (FK FormulaRef)
         dest_cursor.execute("""
             IF COL_LENGTH(
                 'master.dbo.StatuteFactorPropertyMigrationMapping',
@@ -283,7 +225,6 @@ def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
             "DELETE FROM master.dbo.StatuteFactorPropertyMigrationMapping"
         )
 
-    # Any remaining properties on migrated statute factors
     dest_cursor.execute("""
         DELETE sfp
         FROM HCM3.StatuteFactorProperty sfp
@@ -303,310 +244,201 @@ def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
     print("  -> Cleared previous migrated statute-factor properties/formulas.")
 
 
-def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
-    print("Fetching payroll factors used on rule documents...")
-    source_df = pd.read_sql("""
-        SELECT
-            pf.PAY_PfID AS SourcePayrollFactorID,
-            pf.PAY_PfName AS FactorName,
-            pf.PAY_PfNote AS FactorNote,
-            pf.PAY_PfFieldName AS FieldName,
-            CASE WHEN d.PAY_PfID_fk IS NOT NULL THEN 1 ELSE 0 END AS InDetail,
-            CASE WHEN s.PAY_PfID_fk IS NOT NULL THEN 1 ELSE 0 END AS InScore
-        FROM dbo.PAY_PayrollFactor pf
-        LEFT JOIN (
-            SELECT DISTINCT PAY_PfID_fk
-            FROM dbo.HRS_RuleDocumentDetail
-            WHERE PAY_PfID_fk > 0
-        ) d ON d.PAY_PfID_fk = pf.PAY_PfID
-        LEFT JOIN (
-            SELECT DISTINCT PAY_PfID_fk
-            FROM dbo.HRS_RuleDocumentScores
-            WHERE PAY_PfID_fk > 0
-        ) s ON s.PAY_PfID_fk = pf.PAY_PfID
-        WHERE pf.PAY_PfID > 0
-          AND (d.PAY_PfID_fk IS NOT NULL OR s.PAY_PfID_fk IS NOT NULL)
-        ORDER BY pf.PAY_PfID
-    """, source_cnxn)
+def _purge_non_parent2_statute_factors(source_cnxn, dest_cnxn, dest_cursor):
+    """Remove previously mapped StatuteFactors that are not parent=2."""
+    keep_ids = set(
+        load_parent2_factors(source_cnxn)["SourcePayrollFactorID"].astype(int).tolist()
+    )
+    mapped_df = pd.read_sql(
+        """
+        SELECT SourcePayrollFactorID, DestStatuteFactorID
+        FROM master.dbo.StatuteFactorMigrationMapping
+        """,
+        dest_cnxn,
+    )
+    if mapped_df.empty:
+        return 0
 
-    if source_df.empty:
-        print("No statute-related payroll factors found.")
-        return
+    drop = mapped_df[
+        ~mapped_df["SourcePayrollFactorID"].astype(int).isin(keep_ids)
+    ]
+    if drop.empty:
+        print("  -> No non-parent=2 statute factors to purge.")
+        return 0
 
-    source_df['FactorName'] = source_df['FactorName'].apply(clean_persian_text)
-    source_df['FactorNote'] = source_df['FactorNote'].apply(
-        lambda x: clean_persian_text(x) if pd.notna(x) else None
+    dest_ids = [int(x) for x in drop["DestStatuteFactorID"].tolist()]
+    src_ids = [int(x) for x in drop["SourcePayrollFactorID"].tolist()]
+    dest_list = ",".join(str(x) for x in dest_ids)
+    src_list = ",".join(str(x) for x in src_ids)
+    print(
+        f"  -> Purging {len(dest_ids)} non-parent={STATUTE_PARENT_ID} "
+        f"statute factors from destination..."
     )
 
-    mapped_df = pd.read_sql(
+    dest_cursor.execute(f"""
+        DELETE FROM HCM3.EmployeeStatuteFactor
+        WHERE StatuteFactorPropertyRef IN (
+            SELECT StatuteFactorPropertyID FROM HCM3.StatuteFactorProperty
+            WHERE StatuteFactorRef IN ({dest_list})
+        )
+    """)
+    dest_cursor.execute(f"""
+        DELETE FROM HCM3.StatuteFactorProperty
+        WHERE StatuteFactorRef IN ({dest_list})
+    """)
+    dest_cursor.execute(f"""
+        DELETE FROM HCM3.StatuteFactor
+        WHERE StatuteFactorID IN ({dest_list})
+    """)
+    dest_cursor.execute(f"""
+        DELETE FROM master.dbo.StatuteFactorMigrationMapping
+        WHERE SourcePayrollFactorID IN ({src_list})
+    """)
+    return len(dest_ids)
+
+
+def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
+    print(
+        f"  -> Loading PAY_PayrollFactor WHERE PAY_PfParentID_fk = "
+        f"{STATUTE_PARENT_ID}..."
+    )
+    factors_df = load_parent2_factors(source_cnxn)
+    print(f"  -> Found {len(factors_df)} parent={STATUTE_PARENT_ID} factors.")
+
+    mapping_df = pd.read_sql(
         "SELECT SourcePayrollFactorID, DestStatuteFactorID "
         "FROM master.dbo.StatuteFactorMigrationMapping",
         dest_cnxn,
     )
-    already = {
-        int(row['SourcePayrollFactorID']): int(row['DestStatuteFactorID'])
-        for _, row in mapped_df.iterrows()
-    }
-    pending = source_df[~source_df['SourcePayrollFactorID'].isin(already.keys())].copy()
-
-    print(
-        f"  -> Candidates: {len(source_df)}. "
-        f"Already mapped: {len(already)}. To process: {len(pending)}."
-    )
-    if pending.empty:
-        print("  -> All statute factor masters already mapped.")
-        return
-
-    existing_df = pd.read_sql(
-        "SELECT StatuteFactorID, Name, Title FROM HCM3.StatuteFactor",
-        dest_cnxn,
-    )
-    title_buckets = {}
-    for _, row in existing_df.iterrows():
-        if row['Title'] is None or (isinstance(row['Title'], float) and pd.isna(row['Title'])):
-            continue
-        key = normalize_persian(str(row['Title']).strip())
-        if not key:
-            continue
-        title_buckets.setdefault(key, []).append(int(row['StatuteFactorID']))
-    title_index = {k: ids[0] for k, ids in title_buckets.items() if len(ids) == 1}
-
-    claimed = set(already.values())
-    for dest_id in list(claimed):
-        for key, value in list(title_index.items()):
-            if value == dest_id:
-                del title_index[key]
-
-    used_titles = {
-        str(t)
-        for t in existing_df['Title'].dropna().tolist()
+    existing_map = {
+        int(r["SourcePayrollFactorID"]): int(r["DestStatuteFactorID"])
+        for _, r in mapping_df.iterrows()
     }
 
-    last_id = _ensure_table_id(dest_cursor, 'HCM3.StatuteFactor', 0)
-    insert_sql = """
-        INSERT INTO HCM3.StatuteFactor (
-            StatuteFactorID, Name, Title, PeriodCode, TypeCode,
-            RelatedStatuteTypeCode, Description,
-            VisibleInStatute, VisibleInEmployee,
-            CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, GETDATE(), 1, GETDATE(), 1)
-    """
-    map_sql = """
-        INSERT INTO master.dbo.StatuteFactorMigrationMapping (
-            SourcePayrollFactorID, DestStatuteFactorID
-        ) VALUES (?, ?)
-    """
+    existing_titles = set(
+        pd.read_sql(
+            "SELECT Title FROM HCM3.StatuteFactor", dest_cnxn
+        )["Title"].dropna().tolist()
+    )
+    used_titles = {normalize_persian(t) for t in existing_titles}
 
+    last_id = _ensure_table_id(dest_cursor, "HCM3.StatuteFactor")
+    next_id = last_id + 1
     inserted = 0
     linked = 0
-    for _, row in pending.iterrows():
-        source_id = int(row['SourcePayrollFactorID'])
-        base_title = row['FactorName'] or '-'
-        title_key = normalize_persian(str(base_title).strip()) if base_title else ''
-        existing_id = title_index.get(title_key) if title_key else None
-        if existing_id is not None and existing_id not in claimed:
-            dest_cursor.execute(map_sql, (source_id, existing_id))
-            claimed.add(existing_id)
-            for key, value in list(title_index.items()):
-                if value == existing_id:
-                    del title_index[key]
+
+    for _, row in factors_df.iterrows():
+        src_id = int(row["SourcePayrollFactorID"])
+        if src_id in existing_map:
             linked += 1
             continue
 
-        title = _unique_title(base_title, source_id, used_titles)
-        name = f'Mig_Pf_{source_id}'
-        type_code = TYPE_PRIMARY if int(row['InDetail']) == 1 else TYPE_SECONDARY
-        note = row['FactorNote']
-        if note and len(note) > 0:
-            description = note
-        else:
-            field = row['FieldName']
-            description = (
-                str(field).strip()
-                if pd.notna(field) and str(field).strip() not in ('', '0')
-                else None
-            )
-
-        last_id += 1
-        dest_cursor.execute(
-            insert_sql,
-            (
-                last_id,
-                name,
-                title,
-                PERIOD_MONTHLY,
-                type_code,
-                RELATED_IN_SERVICE,
-                description,
-            ),
+        title_src = row.get("PAY_PfTitle") or row.get("FactorName")
+        title = _unique_title(
+            clean_persian_text(title_src), src_id, used_titles
         )
-        dest_cursor.execute(map_sql, (source_id, last_id))
-        claimed.add(last_id)
+        factor_type = (
+            TYPE_PRIMARY
+            if int(row.get("PAY_PfInsuranceStatus") or 0) == 1
+            else TYPE_SECONDARY
+        )
+        note = row.get("FactorNote")
+        description = (
+            clean_persian_text(note)
+            if note is not None and str(note).strip()
+            else f"Migrated from PAY_PayrollFactor {src_id} (parent={STATUTE_PARENT_ID})"
+        )
+        name = f"Mig_Pf_{src_id}"
+        dest_cursor.execute("""
+            INSERT INTO HCM3.StatuteFactor (
+                StatuteFactorID, Name, Title, PeriodCode, TypeCode,
+                RelatedStatuteTypeCode, Description,
+                VisibleInStatute, VisibleInEmployee,
+                CreationDate, Creator, LastModificationDate, LastModifier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, GETDATE(), 1, GETDATE(), 1)
+        """, (
+            next_id,
+            name,
+            title,
+            PERIOD_MONTHLY,
+            factor_type,
+            RELATED_IN_SERVICE,
+            description,
+        ))
+        dest_cursor.execute("""
+            INSERT INTO master.dbo.StatuteFactorMigrationMapping
+                (SourcePayrollFactorID, DestStatuteFactorID)
+            VALUES (?, ?)
+        """, (src_id, next_id))
+        next_id += 1
         inserted += 1
 
     if inserted:
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
-            (last_id, 'HCM3.StatuteFactor'),
+            (next_id - 1, "HCM3.StatuteFactor"),
         )
+
     print(
-        f"  -> StatuteFactors inserted: {inserted}, linked existing: {linked}. "
-        f"Skipped (already mapped): {len(already)}."
+        f"  -> StatuteFactor masters: inserted={inserted}, "
+        f"already_mapped={linked}, catalog={len(factors_df)}."
     )
 
 
-def _collect_source_formula_versions(source_cnxn, mapped_factor_ids):
-    """
-    Build one formula version per (SourcePayrollFactorID, MonthID).
-    Prefer PAY_PayrollBackFormula; if a factor has none, fall back to PAY_PfFormula
-    with Issue month = earliest HRS_RuleDocumentScores register YYYYMM
-    (then factor register date, then max PAY_MonthID).
-    """
-    if not mapped_factor_ids:
-        return pd.DataFrame()
-
-    id_list = ",".join(str(int(x)) for x in sorted(mapped_factor_ids))
-
-    back_df = pd.read_sql(f"""
-        SELECT
-            b.PAY_PbfID AS SourceBackFormulaID,
-            b.PAY_PfID_fk AS SourcePayrollFactorID,
-            b.PAY_MonthID_fk AS SourceMonthID,
-            b.PAY_PbfFormula AS FormulaSql
-        FROM dbo.PAY_PayrollBackFormula b
-        WHERE ISNULL(b.PAY_PbfActive, 1) = 1
-          AND b.PAY_PfID_fk IN ({id_list})
-          AND b.PAY_MonthID_fk IS NOT NULL
-          AND b.PAY_MonthID_fk > 0
-          AND b.PAY_PbfFormula IS NOT NULL
-          AND LTRIM(RTRIM(b.PAY_PbfFormula)) <> ''
-    """, source_cnxn)
-
-    if not back_df.empty:
-        back_df = back_df.sort_values(
-            ['SourcePayrollFactorID', 'SourceMonthID', 'SourceBackFormulaID']
-        )
-        back_df = back_df.drop_duplicates(
-            subset=['SourcePayrollFactorID', 'SourceMonthID'],
-            keep='last',
-        ).copy()
-        back_df['SourceKind'] = 'PAY_PayrollBackFormula'
+def _annotate_roll_target(t: dict) -> dict:
+    """Lightweight purity flags for Roll/UDF-backed property shells."""
+    sql = (t.get("FormulaSql") or "") + "\n" + (t.get("OutputExpr") or "")
+    has_self = bool(re.search(r"\bSelf\b", sql, re.I))
+    has_udf = bool(t.get("dispatcher")) or bool(
+        re.search(r"\bFx[A-Za-z0-9_]+\s*\(", sql, re.I)
+    )
+    # Roll-era formulas always need expert body; mark deferred when UDF-backed.
+    pure = False
+    deferred = None
+    if t.get("IsTrivialZero"):
+        deferred = "trivial_zero_roll"
+    elif has_udf:
+        deferred = f"udf_roll:{t.get('dispatcher') or 'Fx*'}"
     else:
-        back_df = pd.DataFrame(
-            columns=[
-                'SourceBackFormulaID', 'SourcePayrollFactorID',
-                'SourceMonthID', 'FormulaSql', 'SourceKind',
-            ]
-        )
-
-    factors_with_back = set(
-        int(x) for x in back_df['SourcePayrollFactorID'].tolist()
-    ) if not back_df.empty else set()
-    missing = [i for i in mapped_factor_ids if int(i) not in factors_with_back]
-
-    fallback_rows = []
-    if missing:
-        miss_list = ",".join(str(int(x)) for x in missing)
-        score_months = _earliest_score_year_months(source_cnxn, missing)
-        register_months = _factor_register_year_months(source_cnxn, missing)
-
-        latest_month = pd.read_sql("""
-            SELECT MAX(Pay_MonthID) AS MaxMonth
-            FROM dbo.PAY_Month
-            WHERE Pay_MonthID > 0
-        """, source_cnxn).iloc[0]['MaxMonth']
-        if latest_month is None or (isinstance(latest_month, float) and pd.isna(latest_month)):
-            latest_month = 140401
-        else:
-            latest_month = int(latest_month)
-
-        pf_df = pd.read_sql(f"""
-            SELECT
-                PAY_PfID AS SourcePayrollFactorID,
-                PAY_PfFormula AS FormulaSql
-            FROM dbo.PAY_PayrollFactor
-            WHERE PAY_PfID IN ({miss_list})
-              AND PAY_PfFormula IS NOT NULL
-              AND LTRIM(RTRIM(PAY_PfFormula)) <> ''
-        """, source_cnxn)
-
-        used_score = 0
-        used_register = 0
-        used_latest = 0
-        for _, row in pf_df.iterrows():
-            sql = _formula_text(row['FormulaSql'])
-            if sql is None:
-                continue
-            source_id = int(row['SourcePayrollFactorID'])
-            if source_id in score_months:
-                month_id = score_months[source_id]
-                used_score += 1
-            elif source_id in register_months:
-                month_id = register_months[source_id]
-                used_register += 1
-            else:
-                month_id = latest_month
-                used_latest += 1
-            fallback_rows.append({
-                'SourceBackFormulaID': None,
-                'SourcePayrollFactorID': source_id,
-                'SourceMonthID': month_id,
-                'FormulaSql': sql,
-                'SourceKind': 'PAY_PayrollFactor.PAY_PfFormula',
-            })
-        if fallback_rows:
-            print(
-                f"  -> PfFormula fallback IssueYearMonth: "
-                f"earliest score={used_score}, "
-                f"factor register={used_register}, "
-                f"max month={used_latest}."
-            )
-
-    if fallback_rows:
-        back_df = pd.concat([back_df, pd.DataFrame(fallback_rows)], ignore_index=True)
-
-    if back_df.empty:
-        return back_df
-
-    back_df['FormulaSql'] = back_df['FormulaSql'].apply(_formula_text)
-    back_df = back_df[back_df['FormulaSql'].notna()].copy()
-    return back_df
+        deferred = "roll_needs_expert_formula"
+    t["StatutePure"] = pure
+    t["HasSelf"] = has_self
+    t["DeferredReason"] = deferred
+    t["SourceKind"] = f"RollFormula/{t.get('dispatcher') or 'raw'}"
+    t["RdFactorRefs"] = ""
+    t["NonRdFactorRefs"] = ""
+    return t
 
 
 def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
-    print("Migrating StatuteFactorProperty + Formula (expand to all employment types)...")
+    print(
+        "  -> Building RollFormula property targets "
+        "(UDF date/ET windows)..."
+    )
+    targets, stats, _factors = build_roll_property_targets(source_cnxn, dest_cnxn)
+    print(f"  -> Roll property stats: {stats}")
+    print(f"  -> Built {len(targets)} property targets.")
 
-    factor_map_df = pd.read_sql("""
-        SELECT SourcePayrollFactorID, DestStatuteFactorID
-        FROM master.dbo.StatuteFactorMigrationMapping
-    """, dest_cnxn)
-    if factor_map_df.empty:
+    setup_statute_factor_property_mapping_table(
+        dest_cursor, recreate_if_legacy=True
+    )
+    _clear_previously_migrated_properties(dest_cursor, dest_cnxn)
+
+    factor_map = {
+        int(r["SourcePayrollFactorID"]): int(r["DestStatuteFactorID"])
+        for _, r in pd.read_sql(
+            "SELECT SourcePayrollFactorID, DestStatuteFactorID "
+            "FROM master.dbo.StatuteFactorMigrationMapping",
+            dest_cnxn,
+        ).iterrows()
+    }
+    if not factor_map:
         print("  -> No mapped statute factors; skip properties.")
         return
 
-    et_ids = _dest_employment_type_ids(dest_cnxn)
-    if not et_ids:
-        print("  -> No destination employment types found; skip properties.")
-        return
-    print(f"  -> Employment types to apply: {len(et_ids)}.")
-
-    _clear_previously_migrated_properties(dest_cursor, dest_cnxn)
-    # Recreate mapping table if legacy schema was dropped during clear/setup
-    setup_statute_factor_property_mapping_table(dest_cursor, recreate_if_legacy=True)
-
-    factor_map = {
-        int(r['SourcePayrollFactorID']): int(r['DestStatuteFactorID'])
-        for _, r in factor_map_df.iterrows()
-    }
-
-    versions_df = _collect_source_formula_versions(source_cnxn, list(factor_map.keys()))
-    if versions_df.empty:
-        print("  -> No source formula versions found for mapped factors.")
-        return
-
-    formula_last_id = _ensure_table_id(dest_cursor, 'HCM3.Formula', 0)
-    property_last_id = _ensure_table_id(dest_cursor, 'HCM3.StatuteFactorProperty', 0)
-    uiobject_blob = _load_formula_uiobject_template()
+    uiobject = _load_formula_uiobject_template()
+    formula_last_id = _ensure_table_id(dest_cursor, "HCM3.Formula", 0)
+    property_last_id = _ensure_table_id(dest_cursor, "HCM3.StatuteFactorProperty", 0)
 
     insert_formula_sql = """
         INSERT INTO HCM3.Formula (
@@ -623,110 +455,217 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
     """
     insert_prop_map_sql = """
         INSERT INTO master.dbo.StatuteFactorPropertyMigrationMapping (
-            SourcePayrollFactorID, SourceMonthID, DestEmploymentTypeID,
-            SourceBackFormulaID, DestStatuteFactorPropertyID, DestFormulaID
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            SourcePayrollFactorID, EffectiveFromMonth, DestEmploymentTypeID,
+            SlotCode, SourceBackFormulaID, DestStatuteFactorPropertyID,
+            DestFormulaID, OutputExpr, StatutePure, HasSelf,
+            NonRdFactorRefs, DeferredReason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
+    formula_cache = {}
     formulas_inserted = 0
     properties_inserted = 0
+    properties_pure = 0
+    properties_deferred = 0
     skipped_no_factor = 0
+    skipped_no_month = 0
 
-    for _, row in versions_df.iterrows():
-        source_pf_id = int(row['SourcePayrollFactorID'])
-        month_id = int(row['SourceMonthID'])
-        dest_factor_id = factor_map.get(source_pf_id)
-        if dest_factor_id is None:
+    for raw in targets:
+        t = _annotate_roll_target(dict(raw))
+        src_pf = int(t["SourcePayrollFactorID"])
+        dest_factor_id = factor_map.get(src_pf)
+        if not dest_factor_id:
             skipped_no_factor += 1
             continue
 
-        source_sql = row['FormulaSql']
-        description = _build_formula_description(
-            source_pf_id, month_id, source_sql, row.get('SourceKind') or 'formula'
-        )
-        back_id = row.get('SourceBackFormulaID')
-        if back_id is not None and not (isinstance(back_id, float) and pd.isna(back_id)):
-            back_id = int(back_id)
-        else:
-            back_id = None
+        frm = t.get("EffectiveFromMonth")
+        if frm is None or (isinstance(frm, float) and pd.isna(frm)):
+            skipped_no_month += 1
+            continue
+        from_month = int(frm)
+        et_id = int(t["DestEmploymentTypeID"])
+        slot = t.get("SlotCode") or "ALL"
+        expr = t.get("OutputExpr") or ""
+        pure = 1 if t.get("StatutePure") else 0
+        has_self = 1 if t.get("HasSelf") else 0
+        deferred = t.get("DeferredReason")
 
-        # One shared formula for all employment types of this version
-        formula_last_id += 1
+        formula_key = (src_pf, from_month, slot, expr, pure)
+        formula_id = formula_cache.get(formula_key)
+        if formula_id is None:
+            formula_last_id += 1
+            dest_cursor.execute(
+                insert_formula_sql,
+                (
+                    formula_last_id,
+                    FORMULA_STUB_BODY,
+                    uiobject,
+                    FORMULA_MODULE_STAFF,
+                    _build_formula_description(t),
+                ),
+            )
+            formula_id = formula_last_id
+            formula_cache[formula_key] = formula_id
+            formulas_inserted += 1
+
+        property_last_id += 1
         dest_cursor.execute(
-            insert_formula_sql,
+            insert_property_sql,
             (
-                formula_last_id,
-                FORMULA_STUB_BODY,
-                uiobject_blob,
-                FORMULA_MODULE_STAFF,
-                description,
+                property_last_id,
+                dest_factor_id,
+                et_id,
+                from_month,
+                from_month,
+                PROPERTY_STATUS_ACTIVE,
+                formula_id,
             ),
         )
-        formulas_inserted += 1
-
-        for et_id in et_ids:
-            property_last_id += 1
-            dest_cursor.execute(
-                insert_property_sql,
-                (
-                    property_last_id,
-                    dest_factor_id,
-                    et_id,
-                    month_id,
-                    month_id,
-                    PROPERTY_STATUS_ACTIVE,
-                    formula_last_id,
-                ),
-            )
-            dest_cursor.execute(
-                insert_prop_map_sql,
-                (
-                    source_pf_id,
-                    month_id,
-                    et_id,
-                    back_id,
-                    property_last_id,
-                    formula_last_id,
-                ),
-            )
-            properties_inserted += 1
+        dest_cursor.execute(
+            insert_prop_map_sql,
+            (
+                src_pf,
+                from_month,
+                et_id,
+                slot,
+                None,
+                property_last_id,
+                formula_id,
+                expr[:4000] if expr else None,
+                pure,
+                has_self,
+                None,
+                (deferred[:1000] if deferred else None),
+            ),
+        )
+        properties_inserted += 1
+        if pure:
+            properties_pure += 1
+        else:
+            properties_deferred += 1
 
     dest_cursor.execute(
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
-        (formula_last_id, 'HCM3.Formula'),
+        (formula_last_id, "HCM3.Formula"),
     )
     dest_cursor.execute(
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
-        (property_last_id, 'HCM3.StatuteFactorProperty'),
+        (property_last_id, "HCM3.StatuteFactorProperty"),
     )
 
     print(
         f"  -> Formulas inserted: {formulas_inserted}. "
-        f"Properties inserted: {properties_inserted}. "
-        f"Skipped (no factor map): {skipped_no_factor}. "
-        f"Source versions: {len(versions_df)}. "
-        f"ETs each: {len(et_ids)}."
+        f"Properties inserted: {properties_inserted} "
+        f"(statute-pure={properties_pure}, deferred={properties_deferred}). "
+        f"Skipped no-factor={skipped_no_factor}, no-month={skipped_no_month}."
     )
 
 
+def _write_expert_factor_review(source_cnxn, dest_cnxn):
+    EXPERT_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    factors = load_parent2_factors(source_cnxn)
+    mapping = pd.read_sql(
+        "SELECT SourcePayrollFactorID, DestStatuteFactorID "
+        "FROM master.dbo.StatuteFactorMigrationMapping",
+        dest_cnxn,
+    )
+    props = pd.read_sql(
+        """
+        SELECT SourcePayrollFactorID, EffectiveFromMonth, DestEmploymentTypeID,
+               SlotCode, OutputExpr, StatutePure, HasSelf, DeferredReason
+        FROM master.dbo.StatuteFactorPropertyMigrationMapping
+        """,
+        dest_cnxn,
+    )
+
+    factors = factors.merge(
+        mapping,
+        on="SourcePayrollFactorID",
+        how="left",
+    )
+    prop_counts = (
+        props.groupby("SourcePayrollFactorID")
+        .agg(
+            PropertyCount=("DestEmploymentTypeID", "size"),
+            DistinctMonths=("EffectiveFromMonth", "nunique"),
+            DistinctSlots=("SlotCode", "nunique"),
+        )
+        .reset_index()
+    )
+    factors = factors.merge(prop_counts, on="SourcePayrollFactorID", how="left")
+    for col in ("PropertyCount", "DistinctMonths", "DistinctSlots"):
+        factors[col] = factors[col].fillna(0).astype(int)
+
+    out_csv = EXPERT_REVIEW_DIR / "parent2_factors.csv"
+    factors.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    # Sample interesting factors
+    sample_ids = [134, 175, 186, 112]
+    sample = props[props["SourcePayrollFactorID"].isin(sample_ids)].copy()
+    sample.to_csv(
+        EXPERT_REVIEW_DIR / "sample_134_175_186_112.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    md_lines = [
+        "# Parent=2 statute factors (RollFormula → properties)",
+        "",
+        f"- Catalog size: **{len(factors)}**",
+        f"- Properties mapped: **{len(props)}**",
+        f"- Factors with ≥1 property: **{(factors['PropertyCount'] > 0).sum()}**",
+        "",
+        "## Sample property rows (134 / 175 / 186 / 112)",
+        "",
+    ]
+    if not sample.empty:
+        g = (
+            sample.groupby(
+                ["SourcePayrollFactorID", "SlotCode", "EffectiveFromMonth"]
+            )
+            .size()
+            .reset_index(name="rows")
+        )
+        for _, r in g.iterrows():
+            md_lines.append(
+                f"- pf={int(r['SourcePayrollFactorID'])} "
+                f"slot={r['SlotCode']} from={int(r['EffectiveFromMonth'])} "
+                f"rows={int(r['rows'])}"
+            )
+    else:
+        md_lines.append("_no sample rows_")
+    md_lines.extend(["", "See `parent2_factors.csv`.", ""])
+    (EXPERT_REVIEW_DIR / "README.md").write_text(
+        "\n".join(md_lines), encoding="utf-8"
+    )
+    print(f"  -> Expert review written under {EXPERT_REVIEW_DIR}")
+
+
 def run():
-    print("\n--- Running Step 17: Statute Factor Migration ---")
+    print(
+        f"\n--- Running Step 17: Statute Factor Migration "
+        f"(parent={STATUTE_PARENT_ID} + RollFormula) ---"
+    )
 
     source_cnxn, dest_cnxn = get_connections()
     dest_cursor = dest_cnxn.cursor()
 
     try:
         setup_statute_factor_mapping_table(dest_cursor)
-        # Keep legacy property mapping until clear can use it to delete old rows
         setup_statute_factor_property_mapping_table(
             dest_cursor, recreate_if_legacy=False
         )
 
+        _purge_non_parent2_statute_factors(source_cnxn, dest_cnxn, dest_cursor)
         _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor)
         _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor)
+        _write_expert_factor_review(source_cnxn, dest_cnxn)
 
         dest_cnxn.commit()
-        print("Success! Statute factor masters/properties/formulas migration finished.")
+        print(
+            "Success! Parent=2 statute factors + RollFormula properties "
+            "migrated. See analysis/statute_factor_parent2_roll/out."
+        )
 
     except Exception as e:
         dest_cnxn.rollback()

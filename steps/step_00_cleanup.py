@@ -436,20 +436,48 @@ def _null_master_fks_before_delete(cursor):
     Main child tables are deleted earlier; this is a safety net.
     """
     if _mapping_exists(cursor, 'JobMigrationMapping'):
-        _exec_count(cursor, 'WR JobRef/JobRankRef cleared', """
+        # Any job whose ParentRef points at a migrated job (rank-1 children, etc.)
+        child_job_sql = """
+            SELECT c.JobID
+            FROM HCM3.Job c
+            WHERE c.ParentRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+        """
+        _exec_count(cursor, 'WR JobRef/JobRankRef cleared', f"""
             UPDATE wr
             SET wr.JobRef = NULL, wr.JobRankRef = NULL,
                 wr.LastModificationDate = GETDATE(), wr.LastModifier = 1
             FROM HCM3.EmployeeWorkRecord wr
             WHERE wr.JobRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
                OR wr.JobRankRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+               OR wr.JobRef IN ({child_job_sql})
+               OR wr.JobRankRef IN ({child_job_sql})
         """)
-        _exec_count(cursor, 'Statute JobRef cleared', """
+        _exec_count(cursor, 'Statute JobRef cleared', f"""
             UPDATE s
             SET s.JobRef = NULL,
                 s.LastModificationDate = GETDATE(), s.LastModifier = 1
             FROM HCM3.EmployeeStatute s
             WHERE s.JobRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+               OR s.JobRef IN ({child_job_sql})
+        """)
+        _exec_count(cursor, 'PostJob for migrated jobs + children cleared', f"""
+            DELETE FROM HCM3.PostJob
+            WHERE JobRef IN ({child_job_sql})
+               OR JobRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+        """)
+        # Delete synthetic / child jobs under migrated parents (all ranks).
+        _exec_count(cursor, 'Job children of migrated parents deleted', """
+            DELETE FROM HCM3.Job
+            WHERE ParentRef IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+        """)
+        # Break SAME-TABLE ParentRef among migrated jobs before DELETE_BY_MAPPING.
+        _exec_count(cursor, 'Job ParentRef among migrated jobs cleared', """
+            UPDATE HCM3.Job
+            SET ParentRef = NULL,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE JobID IN (SELECT DestJobID FROM master.dbo.JobMigrationMapping)
+              AND ParentRef IS NOT NULL
         """)
 
     if _mapping_exists(cursor, 'EmploymentTypeMigrationMapping'):

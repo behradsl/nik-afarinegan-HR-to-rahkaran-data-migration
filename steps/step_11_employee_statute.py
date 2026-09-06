@@ -14,6 +14,7 @@ from utils.org_migration import (
     ensure_table_id,
     setup_statute_mapping_table,
     setup_statute_type_mapping_table,
+    rank1_job_by_parent,
 )
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -257,6 +258,8 @@ def run():
         dept_map = ensure_departments(source_cnxn, dest_cnxn, dest_cursor)
         post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
         job_map = ensure_jobs(source_cnxn, dest_cnxn, dest_cursor)
+        # Statutes (like PostJob) point at rank-1 children, not migrated parents.
+        rank1_by_parent = rank1_job_by_parent(dest_cnxn, set(job_map.values()))
         et_map = ensure_employment_types(source_cnxn, dest_cnxn, dest_cursor)
         place_map = ensure_places_as_work_locations(source_cnxn, dest_cnxn, dest_cursor)
 
@@ -417,7 +420,8 @@ def run():
             statute_type_ref = statute_type_map.get(source_rt) if source_rt else None
 
             source_job = post_to_job.get(source_post) if source_post else None
-            job_ref = job_map.get(source_job) if source_job else None
+            parent_job = job_map.get(source_job) if source_job else None
+            job_ref = rank1_by_parent.get(parent_job) if parent_job else None
             if job_ref:
                 with_job += 1
 

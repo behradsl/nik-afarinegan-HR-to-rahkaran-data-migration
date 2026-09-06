@@ -1098,9 +1098,40 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
     return result
 
 
+def rank1_job_by_parent(dest_cnxn, parent_ids=None):
+    """
+    Map parent JobID -> rank-1 child JobID (JobRankNumber=1).
+    If parent_ids is given, only those parents are included.
+    """
+    live_df = pd.read_sql(
+        """
+        SELECT JobID, ParentRef, JobRankNumber
+        FROM HCM3.Job
+        WHERE ParentRef IS NOT NULL
+          AND JobRankNumber = ?
+        """,
+        dest_cnxn,
+        params=[CHILD_JOB_RANK_NUMBER],
+    )
+    wanted = None if parent_ids is None else {int(p) for p in parent_ids}
+    result = {}
+    for _, row in live_df.iterrows():
+        parent_id = int(row['ParentRef'])
+        if wanted is not None and parent_id not in wanted:
+            continue
+        child_id = int(row['JobID'])
+        existing = result.get(parent_id)
+        if existing is None or child_id < existing:
+            result[parent_id] = child_id
+    return result
+
+
 def ensure_post_jobs(source_cnxn, dest_cnxn, dest_cursor, post_map=None, job_map=None):
     """
     Migrate TBL_Post.TBL_JobID_fk -> HCM3.PostJob.
+
+    JobRef points at the rank-1 child under the migrated parent job
+    (not the parent JobID itself).
     """
     if post_map is None:
         post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
@@ -1121,12 +1152,40 @@ def ensure_post_jobs(source_cnxn, dest_cnxn, dest_cursor, post_map=None, job_map
         print("  -> No Post→Job links in source.")
         return 0
 
+    parent_ids = set(job_map.values())
+    rank1_by_parent = rank1_job_by_parent(dest_cnxn, parent_ids)
+
     existing_df = pd.read_sql(
-        "SELECT PostRef, JobRef FROM HCM3.PostJob",
+        "SELECT PostJobID, PostRef, JobRef FROM HCM3.PostJob",
         dest_cnxn,
     )
+    # Retarget rows that still point at parent jobs to their rank-1 children.
+    retargeted = 0
+    for idx, row in existing_df.iterrows():
+        job_ref = int(row['JobRef'])
+        child_id = rank1_by_parent.get(job_ref)
+        if child_id is None or child_id == job_ref:
+            continue
+        dest_cursor.execute(
+            """
+            UPDATE HCM3.PostJob
+            SET JobRef = ?, LastModificationDate = GETDATE(), LastModifier = 1
+            WHERE PostJobID = ?
+              AND JobRef = ?
+            """,
+            (child_id, int(row['PostJobID']), job_ref),
+        )
+        if dest_cursor.rowcount:
+            retargeted += 1
+            existing_df.at[idx, 'JobRef'] = child_id
+
     existing_pairs = {
         (int(r['PostRef']), int(r['JobRef']))
+        for _, r in existing_df.iterrows()
+    }
+    # One PostJob per post: index current PostRef -> PostJobID for in-place fixups.
+    post_job_by_post = {
+        int(r['PostRef']): int(r['PostJobID'])
         for _, r in existing_df.iterrows()
     }
 
@@ -1138,21 +1197,52 @@ def ensure_post_jobs(source_cnxn, dest_cnxn, dest_cursor, post_map=None, job_map
         ) VALUES (?, ?, ?, GETDATE(), 1, GETDATE(), 1)
     """
     inserted = 0
+    updated = 0
     skipped = 0
+    missing_child = 0
     for _, row in source_df.iterrows():
         source_post = int(row['SourcePostID'])
         source_job = int(row['SourceJobID'])
         dest_post = post_map.get(source_post)
-        dest_job = job_map.get(source_job)
-        if not dest_post or not dest_job:
+        parent_job = job_map.get(source_job)
+        if not dest_post or not parent_job:
             skipped += 1
+            continue
+        dest_job = rank1_by_parent.get(parent_job)
+        if not dest_job:
+            missing_child += 1
             continue
         pair = (dest_post, dest_job)
         if pair in existing_pairs:
             continue
+        existing_pj = post_job_by_post.get(dest_post)
+        if existing_pj is not None:
+            dest_cursor.execute(
+                """
+                UPDATE HCM3.PostJob
+                SET JobRef = ?, LastModificationDate = GETDATE(), LastModifier = 1
+                WHERE PostJobID = ?
+                """,
+                (dest_job, existing_pj),
+            )
+            if dest_cursor.rowcount:
+                updated += 1
+            old_job = next(
+                (
+                    j
+                    for (p, j) in list(existing_pairs)
+                    if p == dest_post
+                ),
+                None,
+            )
+            if old_job is not None:
+                existing_pairs.discard((dest_post, old_job))
+            existing_pairs.add(pair)
+            continue
         last_id += 1
         dest_cursor.execute(insert_sql, (last_id, dest_post, dest_job))
         existing_pairs.add(pair)
+        post_job_by_post[dest_post] = last_id
         inserted += 1
 
     if inserted:
@@ -1161,8 +1251,9 @@ def ensure_post_jobs(source_cnxn, dest_cnxn, dest_cursor, post_map=None, job_map
             (last_id,),
         )
     print(
-        f"  -> PostJob inserted: {inserted}. "
-        f"Skipped (unmapped post/job): {skipped}."
+        f"  -> PostJob inserted: {inserted}, retargeted to rank-1: {retargeted}, "
+        f"updated: {updated}. Skipped (unmapped post/job): {skipped}, "
+        f"missing rank-1 child: {missing_child}."
     )
     return inserted
 
@@ -1269,14 +1360,10 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
     for dest_id in list(claimed_dest_ids):
         _claim_dest(dest_id, claimed_dest_ids, code_title_index)
 
-    # Free codes/titles held by mapped jobs so we can re-assign cleanly on upsert/repair.
-    if claimed_dest_ids:
-        for _, row in existing_pairs_df.iterrows():
-            if int(row['JobID']) in claimed_dest_ids:
-                if row['Code'] is not None and str(row['Code']).strip():
-                    used_codes.discard(str(row['Code']).strip())
-                title_key = str(row['Title']).strip() if row['Title'] else DEFAULT_TITLE
-                used_titles.discard(title_key)
+    # Keep codes/titles of already-mapped (and all existing) jobs reserved during
+    # inserts. Freeing them here caused UIX_HCM3_Job_Code_Title collisions when
+    # Step 9 inserts remaining jobs while Step 7 rows still hold those values.
+    # The two-phase update below frees mapped codes via temporary __mig_* values.
 
     missing_df = insert_candidates[~insert_candidates['SourceJobID'].isin(result.keys())]
     inserted = 0
@@ -1307,17 +1394,8 @@ def ensure_jobs(source_cnxn, dest_cnxn, dest_cursor, source_job_ids=None):
             if existing_id is not None and existing_id not in claimed_dest_ids:
                 dest_cursor.execute(insert_mapping_sql, (source_id, existing_id))
                 result[source_id] = existing_id
-                if existing_id in {
-                    int(r['JobID']) for _, r in existing_pairs_df.iterrows()
-                }:
-                    held = existing_pairs_df.loc[
-                        existing_pairs_df['JobID'] == existing_id
-                    ].iloc[0]
-                    if held['Code'] is not None and str(held['Code']).strip():
-                        used_codes.discard(str(held['Code']).strip())
-                    used_titles.discard(
-                        str(held['Title']).strip() if held['Title'] else DEFAULT_TITLE
-                    )
+                # Do not discard this row's code/title from used_* — the physical
+                # row still owns them until the two-phase update.
                 _claim_dest(existing_id, claimed_dest_ids, code_title_index)
                 linked += 1
                 continue
