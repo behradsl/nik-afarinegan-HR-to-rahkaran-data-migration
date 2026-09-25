@@ -2,15 +2,18 @@
 Step 10: Rebuild HCM3.OrganizationalStructure for Rahkaran UI.
 
 Per OrganizationChart (Oc) era:
-  - Department nodes (PostRef NULL) form the tree via department parent links
-  - Post nodes hang under their department node
+  - The full department tree is copied into every chart. Source departments
+    are not tied to a chart. Department nodes have PostRef NULL.
+  - Posts of that chart hang under their department.
+  - A post keeps its parent post only when that parent is on the same chart
+    and in the same department. Otherwise ParentRef is the department node
+    (parent post 0, or a post that belongs to another department).
   - InsertionDate = Oc date; DeletionDate = next Oc date (NULL for latest)
   - OrganizationalStructureDescription per Oc ChangeDate
   - OrganizationalStructureItem (مصوب) on each post node
 """
 import pandas as pd
 import warnings
-from datetime import date
 from utils.date_helpers import shamsi_to_gregorian
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text
@@ -105,16 +108,6 @@ def _clear_previous_structure(dest_cursor):
             DELETE FROM master.dbo.OrgStructureDescriptionMigrationMapping
         END
     """)
-
-
-def _collect_dept_ancestors(dept_id, parent_by_dept, needed):
-    """Add dept_id and all ancestors into needed set."""
-    seen = set()
-    current = dept_id
-    while current and current not in seen:
-        seen.add(current)
-        needed.add(current)
-        current = parent_by_dept.get(current)
 
 
 def _insert_dept_nodes(
@@ -255,11 +248,16 @@ def run():
             WHERE TBL_DepartmentID > 0
         """, source_cnxn)
         parent_by_dept = {}
+        all_source_depts = set()
         for _, r in depts_df.iterrows():
             did = int(r['SourceDepartmentID'])
+            all_source_depts.add(did)
             pid = _positive_fk(r['SourceParentDepartmentID'])
             if pid and pid != did:
                 parent_by_dept[did] = pid
+        # Departments are not tied to a chart, so every structure version
+        # gets the full mapped department tree.
+        all_source_depts = {did for did in all_source_depts if did in dept_map}
 
         posts_df = pd.read_sql("""
             SELECT
@@ -342,30 +340,17 @@ def run():
             dest_cursor.execute(insert_desc_map_sql, (oc_id, desc_last_id))
             descs_inserted += 1
 
-            # For the latest Oc (no deletion), also publish a description on "today"
-            # so the UI ChangeDate=today lookup finds a row. Mapped as SourceOcID=0.
-            if deletion is None:
-                today_str = date.today().strftime('%Y-%m-%d')
-                if str(insertion)[:10] != today_str:
-                    desc_last_id += 1
-                    dest_cursor.execute(
-                        insert_desc_sql,
-                        (desc_last_id, today_str, desc_text[:2000]),
-                    )
-                    dest_cursor.execute(insert_desc_map_sql, (0, desc_last_id))
-                    descs_inserted += 1
-
             oc_posts = posts_df[posts_df['SourceOcID'] == oc_id]
-            needed_depts = set()
+            post_dept = {}
             for _, prow in oc_posts.iterrows():
-                source_dept = _positive_fk(prow['SourceDepartmentID'])
-                if source_dept:
-                    _collect_dept_ancestors(source_dept, parent_by_dept, needed_depts)
+                post_dept[int(prow['SourcePostID'])] = _positive_fk(
+                    prow['SourceDepartmentID']
+                )
 
             dept_local, structure_last_id, d_ins, d_skip = _insert_dept_nodes(
                 dest_cursor,
                 oc_id,
-                needed_depts,
+                all_source_depts,
                 parent_by_dept,
                 dept_map,
                 insertion,
@@ -378,7 +363,7 @@ def run():
             skipped_no_dept_master += d_skip
 
             post_local = {}  # SourcePostID -> DestOrganizationalStructureID
-            pending_parent = []  # (dest_os_id, source_parent_post_id)
+            pending_parent = []  # (dest_os_id, child_dept, source_parent_post)
 
             for _, prow in oc_posts.iterrows():
                 source_post_id = int(prow['SourcePostID'])
@@ -413,7 +398,9 @@ def run():
                 post_local[source_post_id] = structure_last_id
                 source_parent_post = _positive_fk(prow['SourceParentPostID'])
                 if source_parent_post and source_parent_post != source_post_id:
-                    pending_parent.append((structure_last_id, source_parent_post))
+                    pending_parent.append(
+                        (structure_last_id, source_dept, source_parent_post)
+                    )
                 post_nodes += 1
 
                 item_last_id += 1
@@ -429,11 +416,19 @@ def run():
                 )
                 items_inserted += 1
 
-            # Prefer post→post parent when parent post is on the same chart
+            # Keep post→post parent only inside the same department.
+            # A post whose parent is 0 or sits in another department stays
+            # under its department node.
             parent_linked = 0
-            for dest_os_id, source_parent_post in pending_parent:
+            for dest_os_id, child_dept, source_parent_post in pending_parent:
                 parent_os = post_local.get(source_parent_post)
-                if not parent_os:
+                parent_dept = post_dept.get(source_parent_post)
+                if (
+                    not parent_os
+                    or parent_dept is None
+                    or child_dept is None
+                    or parent_dept != child_dept
+                ):
                     continue
                 dest_cursor.execute(
                     """
