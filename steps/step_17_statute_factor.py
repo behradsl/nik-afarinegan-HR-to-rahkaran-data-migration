@@ -1,6 +1,10 @@
 """
-Step 17: Migrate statute factors (PAY_PfParentID_fk = 2) → HCM3.StatuteFactor,
+Step 17: Migrate statute factors → HCM3.StatuteFactor,
 plus StatuteFactorProperty + Formula stubs.
+
+Source set is the formula tree: direct children of عوامل حکمی (parent 2,
+TypeCode اصلی), امتیازات فردی (parent 22, TypeCode فرعی), and سابقه خدمت
+leaves that store a user amount on the score sheet (TypeCode فرعی).
 
 Formulas come from PAY_PfRollFormula only. Property date × employment-type
 windows are extracted from the scalar UDFs those rolls call
@@ -16,6 +20,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
 from utils.roll_formula_properties import (
     STATUTE_PARENT_ID,
+    STATUTE_PARENT_IDS,
     build_roll_property_targets,
     load_parent2_factors,
 )
@@ -244,8 +249,19 @@ def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
     print("  -> Cleared previous migrated statute-factor properties/formulas.")
 
 
+def _type_code(parent_id):
+    """عوامل حکمی → اصلی. امتیازات فردی and سابقه خدمت → فرعی."""
+    try:
+        parent = int(parent_id)
+    except (TypeError, ValueError):
+        parent = STATUTE_PARENT_ID
+    if parent == STATUTE_PARENT_ID:
+        return TYPE_PRIMARY
+    return TYPE_SECONDARY
+
+
 def _purge_non_parent2_statute_factors(source_cnxn, dest_cnxn, dest_cursor):
-    """Remove previously mapped StatuteFactors that are not parent=2."""
+    """Remove mapped StatuteFactors outside parents 2, 22, and سابقه خدمت."""
     keep_ids = set(
         load_parent2_factors(source_cnxn)["SourcePayrollFactorID"].astype(int).tolist()
     )
@@ -271,8 +287,8 @@ def _purge_non_parent2_statute_factors(source_cnxn, dest_cnxn, dest_cursor):
     dest_list = ",".join(str(x) for x in dest_ids)
     src_list = ",".join(str(x) for x in src_ids)
     print(
-        f"  -> Purging {len(dest_ids)} non-parent={STATUTE_PARENT_ID} "
-        f"statute factors from destination..."
+        f"  -> Purging {len(dest_ids)} statute factors outside "
+        f"parents {STATUTE_PARENT_IDS} and سابقه خدمت..."
     )
 
     dest_cursor.execute(f"""
@@ -299,11 +315,11 @@ def _purge_non_parent2_statute_factors(source_cnxn, dest_cnxn, dest_cursor):
 
 def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
     print(
-        f"  -> Loading PAY_PayrollFactor WHERE PAY_PfParentID_fk = "
-        f"{STATUTE_PARENT_ID}..."
+        "  -> Loading PAY_PayrollFactor parents "
+        f"{STATUTE_PARENT_IDS} plus سابقه خدمت user amounts..."
     )
     factors_df = load_parent2_factors(source_cnxn)
-    print(f"  -> Found {len(factors_df)} parent={STATUTE_PARENT_ID} factors.")
+    print(f"  -> Found {len(factors_df)} statute-catalog factors.")
 
     mapping_df = pd.read_sql(
         "SELECT SourcePayrollFactorID, DestStatuteFactorID "
@@ -326,10 +342,23 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
     next_id = last_id + 1
     inserted = 0
     linked = 0
+    types_updated = 0
 
     for _, row in factors_df.iterrows():
         src_id = int(row["SourcePayrollFactorID"])
+        factor_type = _type_code(row.get("ParentFactorID"))
         if src_id in existing_map:
+            dest_cursor.execute(
+                """
+                UPDATE HCM3.StatuteFactor
+                SET TypeCode = ?, LastModificationDate = GETDATE(), LastModifier = 1
+                WHERE StatuteFactorID = ?
+                  AND ISNULL(TypeCode, -1) <> ?
+                """,
+                (factor_type, existing_map[src_id], factor_type),
+            )
+            if dest_cursor.rowcount:
+                types_updated += 1
             linked += 1
             continue
 
@@ -337,16 +366,12 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
         title = _unique_title(
             clean_persian_text(title_src), src_id, used_titles
         )
-        factor_type = (
-            TYPE_PRIMARY
-            if int(row.get("PAY_PfInsuranceStatus") or 0) == 1
-            else TYPE_SECONDARY
-        )
+        parent_id = row.get("ParentFactorID")
         note = row.get("FactorNote")
         description = (
             clean_persian_text(note)
             if note is not None and str(note).strip()
-            else f"Migrated from PAY_PayrollFactor {src_id} (parent={STATUTE_PARENT_ID})"
+            else f"Migrated from PAY_PayrollFactor {src_id} (parent={parent_id})"
         )
         name = f"Mig_Pf_{src_id}"
         dest_cursor.execute("""
@@ -381,7 +406,8 @@ def _migrate_factor_masters(source_cnxn, dest_cnxn, dest_cursor):
 
     print(
         f"  -> StatuteFactor masters: inserted={inserted}, "
-        f"already_mapped={linked}, catalog={len(factors_df)}."
+        f"already_mapped={linked}, types_updated={types_updated}, "
+        f"catalog={len(factors_df)}."
     )
 
 
@@ -643,8 +669,8 @@ def _write_expert_factor_review(source_cnxn, dest_cnxn):
 
 def run():
     print(
-        f"\n--- Running Step 17: Statute Factor Migration "
-        f"(parent={STATUTE_PARENT_ID} + RollFormula) ---"
+        "\n--- Running Step 17: Statute Factor Migration "
+        f"(parents {STATUTE_PARENT_IDS} + سابقه خدمت + RollFormula) ---"
     )
 
     source_cnxn, dest_cnxn = get_connections()
@@ -663,8 +689,9 @@ def run():
 
         dest_cnxn.commit()
         print(
-            "Success! Parent=2 statute factors + RollFormula properties "
-            "migrated. See analysis/statute_factor_parent2_roll/out."
+            "Success! Statute factors (عوامل حکمی + امتیازات فردی + سابقه خدمت) "
+            "and RollFormula properties migrated. "
+            "See analysis/statute_factor_parent2_roll/out."
         )
 
     except Exception as e:

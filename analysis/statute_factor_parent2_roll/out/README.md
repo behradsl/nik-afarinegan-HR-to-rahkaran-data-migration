@@ -1,8 +1,8 @@
 # Parent=2 statute factors (RollFormula → properties)
 
-- Catalog size: **95**
-- Properties mapped: **1058**
-- Factors with ≥1 property: **92**
+- Catalog size: **246**
+- Properties mapped: **4642**
+- Factors with ≥1 property: **242**
 
 ## Sample property rows (134 / 175 / 186 / 112)
 

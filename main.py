@@ -23,6 +23,7 @@ from steps import (
     step_18_employee_photo,
     step_19_service_leakage_work_record,
     step_20_employment_number,
+    step_21_employee_statute_factor,
 )
 
 def get_config_path():
@@ -33,7 +34,17 @@ def get_config_path():
         application_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(application_path, 'config.json')
 
+def _console_replace_unencodable():
+    """Persian Windows consoles (cp1256) raise UnicodeEncodeError on some log characters."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
 def main():
+    _console_replace_unencodable()
     print("========================================")
     print("   DATA MIGRATION PIPELINE STARTED      ")
     print("========================================")
@@ -41,7 +52,7 @@ def main():
     config_path = get_config_path()
     
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8-sig') as f:
             config = json.load(f)
     except FileNotFoundError:
         print(f"\nCRITICAL ERROR: 'config.json' not found at {config_path}")
@@ -156,6 +167,11 @@ def main():
             step_20_employment_number.run()
         else:
             print("\n--- Skipping Step 20: Employment Number (شناسه مستخدم) ---")
+
+        if steps_to_run.get("21_employee_statute_factor", False):
+            step_21_employee_statute_factor.run()
+        else:
+            print("\n--- Skipping Step 21: Employee Statute Factor Values ---")
 
         print("\n========================================")
         print("   PIPELINE COMPLETED SUCCESSFULLY      ")

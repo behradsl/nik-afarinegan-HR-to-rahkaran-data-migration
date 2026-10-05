@@ -1,6 +1,12 @@
 {
     "source_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_SOURCE_IP;Database=personnelGharb;UID=sa;PWD=YourPassword;",
     "dest_conn": "Driver={ODBC Driver 17 for SQL Server};Server=YOUR_DEST_IP;Database=MadaniSG;UID=sa;PWD=YourPassword;",
+    "redis": {
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 6379,
+        "db": 0
+    },
     "steps_to_run": {
         "0_cleanup": false,
         "1_party": true,
@@ -22,6 +28,7 @@
         "17_statute_factor": true,
         "18_employee_photo": true,
         "19_service_leakage_work_record": true,
-        "20_employment_number": true
+        "20_employment_number": true,
+        "21_employee_statute_factor": true
     }
 }

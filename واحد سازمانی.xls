@@ -1,0 +1,739 @@
+﻿<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:html="http://www.w3.org/TR/REC-html40">
+ <DocumentProperties xmlns="urn:schemas-microsoft-com:office:office">
+  <Version>15.00</Version>
+ </DocumentProperties>
+ <OfficeDocumentSettings xmlns="urn:schemas-microsoft-com:office:office">
+  <AllowPNG/>
+ </OfficeDocumentSettings>
+ <ExcelWorkbook xmlns="urn:schemas-microsoft-com:office:excel">
+  <WindowHeight>7755</WindowHeight>
+  <WindowWidth>20490</WindowWidth>
+  <WindowTopX>0</WindowTopX>
+  <WindowTopY>0</WindowTopY>
+  <ProtectStructure>False</ProtectStructure>
+  <ProtectWindows>False</ProtectWindows>
+ </ExcelWorkbook>
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+   <Alignment ss:Vertical="Bottom"/>
+   <Borders/>
+   <Font ss:FontName="Calibri" x:Family="Swiss" ss:Size="11" ss:Color="#000000"/>
+   <Interior/>
+   <NumberFormat/>
+   <Protection/>
+  </Style>
+ </Styles>
+ <Worksheet ss:Name="Worksheet1" ss:RightToLeft="1">
+  <Names>
+   <NamedRange ss:Name="_FilterDatabase" ss:RefersTo="=Worksheet1!R1C1:R85C4"
+    ss:Hidden="1"/>
+  </Names>
+  <Table ss:ExpandedColumnCount="4" ss:ExpandedRowCount="85" x:FullColumns="1"
+   x:FullRows="1" ss:DefaultRowHeight="15">
+   <Column ss:Width="50.25"/>
+   <Column ss:Width="80.25"/>
+   <Column ss:AutoFitWidth="0" ss:Width="200.25" ss:Span="1"/>
+   <Row>
+    <Cell><Data ss:Type="String">ردیف</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">کد سازمانی پست</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">عنوان پست</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">واحد سازمانی </Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">1</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">8</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر هيأت مدیره و مدیرعامل و حسابرسي داخلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر هيأت دفتره و دفترعامل و حسابرسي داخلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">2</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">12</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">  رئیس دفتر مدیرعامل</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر مدیرعامل</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">3</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">14</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر روابط عمومي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر روابط عمومي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">4</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">19</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفترحراست و امور محرمانه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفترحراست و امور محرمانه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">5</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">22</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه حفاظت پرسنلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> گروه حفاظت پرسنلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">6</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">26</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه حفاظت فيزيکي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> گروه حفاظت فيزيکي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">7</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">30</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفترحقوقي و رسيدگي به شکايات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفترحقوقي و رسيدگي به شکايات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">8</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">40</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> معاون منابع انساني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">معاونت منابع انساني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">9</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">41</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر برنامه ريزي منابع انساني و آموزش</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر برنامه ريزي منابع انساني و آموزش</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">10</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">46</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور کارکنان و رفاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور کارکنان و رفاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">11</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">47</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره کارگزيني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره کارگزيني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">12</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">54</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره رفاه و  بازنشستگي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره رفاه و  بازنشستگي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">13</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">60</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر دفتريت استراتژيک و بهره وري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر مدیریت استراتژيک و بهره وري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">14</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">66</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر سازماندهي و بهبود روشها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر سازماندهي و بهبود روشها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">15</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">72</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> معاون مالي و پشتيباني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">معاونت مالي و پشتيباني</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">16</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">75</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور مالي و ذيحسابي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور مالي و ذيحسابي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">17</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">85</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره حسابداري قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره حسابداري قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">18</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">90</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره حسابداري تأسيسات و  انبارها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره حسابداري تأسيسات و  انبارها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">19</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">95</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره حسابداري پرداخت و  مميزي اسناد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره حسابداري پرداخت و  مميزي اسناد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">20</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">100</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره دفترداري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره دفترداري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">21</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">105</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور تدارکات و  قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور تدارکات و  قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">22</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">106</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره تدارکات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره تدارکات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">23</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">113</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره قراردادها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">24</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">119</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره انبارها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره انبارها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">25</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">129</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور نظارت بر خدمات عمومي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور نظارت بر خدمات عمومي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">26</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">136</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> معاون برنامه ريزي و تحقيقات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">معاونت برنامه ريزي و تحقيقات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">27</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">137</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر بودجه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر بودجه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">28</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">143</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري تأمين منابع مالي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري تأمين منابع مالي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">29</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">145</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفترتحقيقات و کنترل کيفيت تجهيزات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفترتحقيقات و کنترل کيفيت تجهيزات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">30</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">151</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر برنامه ريزي فني و برآورد بار</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر برنامه ريزي فني و برآورد بار</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">31</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">158</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه مطالعات بار</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">گروه مطالعات بار</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">32</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">161</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر فناوري ارتباطات و دفتريت اطلاعات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر فناوري ارتباطات و دفتريت اطلاعات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">33</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">175</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر خدمات مشترکين، دفتريت مصرف و وصول درآمد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر خدمات مشترکين، دفتريت مصرف و وصول درآمد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">34</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">180</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> معاون طرح و توسعه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">معاونت طرح و توسعه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">35</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">181</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح پست ها (کرمانشاه)‌</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح پست ها (کرمانشاه)‌</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">36</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">187</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح پست ها (کردستان)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح پست ها (کردستان)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">37</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">191</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح پست ها (‌ايلام )‌</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح پست ها (‌ايلام )‌</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">38</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">194</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح خطوط (کرمانشاه)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح خطوط (کرمانشاه)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">39</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">198</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح خطوط (کردستان)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح خطوط (کردستان)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">40</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">201</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح خطوط (ايلام)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح خطوط (ايلام)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">41</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">204</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح تله متري و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح تله متري و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">42</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">207</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح توليد پراکنده</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح توليد پراکنده</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">43</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">210</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح پدافند غير عامل، دفتريت بحران و HSE</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح پدافند غير عامل، دفتريت بحران و HSE</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">44</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">215</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر مهندسي طرح ها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر مهندسي طرح ها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">45</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">223</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه نظارت بر طراحي پست ها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">گروه نظارت بر طراحي پست ها</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">46</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">230</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح ساختمان</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح ساختمان</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">47</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">234</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح خطوط کابلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح خطوط کابلي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">48</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">236</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> معاون بهره برداري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">معاونت بهره برداري</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">49</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">237</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر بازار برق</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر بازار برق</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">50</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">243</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر فني نظارت بر توليد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر فني نظارت بر توليد</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">51</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">244</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر دفتر فني انتقال</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> دفتر فني انتقال</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">52</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">247</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه مطالعات شبکه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">گروه مطالعات شبکه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">53</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">250</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه مطالعات خط، پست و حفاظت</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">گروه مطالعات خط، پست و حفاظت</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">54</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">256</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور ديسپاچينگ و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور ديسپاچينگ و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">55</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">262</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> رئیس گروه نظارت بر ديسپاچينگ و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">گروه نظارت بر ديسپاچينگ و مخابرات</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">56</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">268</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره ديسپاچينگ فوق توزيع (RDC)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره ديسپاچينگ فوق توزيع (RDC)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">57</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">280</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره ديسپاچينگ (AOC)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره ديسپاچينگ (AOC)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">58</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">292</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره پشتيباني انتقال</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره پشتيباني انتقال</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">59</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">295</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مجري طرح هاي اصلاح و  بهينه سازي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">مجري طرح هاي اصلاح و  بهينه سازي</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">60</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">300</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور انتقال برق ناحيه شرقي استان کرمانشاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور انتقال برق ناحيه شرقي استان کرمانشاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">61</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">303</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات خطوط(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات خطوط(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">62</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">306</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات پست و رلياژ(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات پست و رلياژ(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">63</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">311</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 1(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 1(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">64</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">319</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 2(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 2(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">65</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">327</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 3(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 3(شرقي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">66</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">334</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور انتقال برق ناحيه غربي استان کرمانشاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور انتقال برق ناحيه غربي استان کرمانشاه</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">67</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">337</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات خطوط(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات خطوط(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">68</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">340</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات پست و رلياژ(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات پست و رلياژ(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">69</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">345</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 1 (غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 1 (غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">70</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">353</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 2 (غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 2 (غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">71</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">361</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 3(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 3(غربي)</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">72</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">368</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور انتقال برق استان کردستان</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور انتقال برق استان کردستان</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">73</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">373</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات خطوط</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات خطوط</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">74</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">376</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات پست و رلياژ</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات پست و رلياژ</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">75</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">381</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 1</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 1</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">76</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">391</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 2</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 2</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">77</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">399</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 3</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 3</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">78</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">407</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> مدیر امور انتقال برق استان ايلام</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">دفتر امور انتقال برق استان ايلام</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">79</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">412</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره نظارت بر تعميرات خطوط</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره نظارت بر تعميرات خطوط</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">80</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">415</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره نظارت بر تعميرات پست و رلياژ</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره نظارت بر تعميرات پست و رلياژ</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">81</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">420</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس   اداره بهره برداري پست هاي ناحيه 1</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> اداره بهره برداري پست هاي ناحيه 1</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">82</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">429</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 2</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 2</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="Number">83</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">437</Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">رئیس  اداره بهره برداري پست هاي ناحيه 3</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String">اداره بهره برداري پست هاي ناحيه 3</Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+   <Row>
+    <Cell ss:Index="2"><Data ss:Type="String"></Data><NamedCell
+      ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"> </Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+    <Cell><Data ss:Type="String"></Data><NamedCell ss:Name="_FilterDatabase"/></Cell>
+   </Row>
+  </Table>
+  <WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel">
+   <Selected/>
+   <DisplayRightToLeft/>
+   <Panes>
+    <Pane>
+     <Number>3</Number>
+     <ActiveRow>10</ActiveRow>
+     <ActiveCol>3</ActiveCol>
+    </Pane>
+   </Panes>
+   <ProtectObjects>False</ProtectObjects>
+   <ProtectScenarios>False</ProtectScenarios>
+  </WorksheetOptions>
+  <AutoFilter x:Range="R1C1:R85C4"
+   xmlns="urn:schemas-microsoft-com:office:excel">
+  </AutoFilter>
+ </Worksheet>
+</Workbook>

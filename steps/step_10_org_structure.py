@@ -2,12 +2,19 @@
 Step 10: Rebuild HCM3.OrganizationalStructure for Rahkaran UI.
 
 Per OrganizationChart (Oc) era:
-  - The full department tree is copied into every chart. Source departments
-    are not tied to a chart. Department nodes have PostRef NULL.
-  - Posts of that chart hang under their department.
-  - A post keeps its parent post only when that parent is on the same chart
-    and in the same department. Otherwise ParentRef is the department node
-    (parent post 0, or a post that belongs to another department).
+  - One node per post. ParentRef follows TBL_PostParentID_fk on the same
+    chart. Parent 0, or a parent not on this chart, stays null.
+  - Department nodes come from department_managers.csv (one reviewed manager
+    post per department per chart). Each department node hangs under that
+    manager post. PostRef on a department node is null.
+  - The manager post and every post below him take that department as
+    DepartmentRef, until the next manager post. Posts that report directly
+    to the manager and belong to that department are reparented under the
+    department node; posts further down keep their post parent, so they
+    sit inside the same folder. Source TBL_DepartmentID_fk on those posts
+    is not used. Posts outside every manager subtree keep their source
+    department. Posts with no department use one technical department
+    because DepartmentRef cannot be null.
   - InsertionDate = Oc date; DeletionDate = next Oc date (NULL for latest)
   - OrganizationalStructureDescription per Oc ChangeDate
   - OrganizationalStructureItem (مصوب) on each post node
@@ -17,6 +24,11 @@ import warnings
 from utils.date_helpers import shamsi_to_gregorian
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text
+from utils.department_managers import (
+    assign_departments_under_managers,
+    department_managers_path,
+    load_approved_managers,
+)
 from utils.org_migration import (
     ensure_departments,
     ensure_posts,
@@ -29,10 +41,14 @@ from utils.org_migration import (
 warnings.filterwarnings('ignore', category=UserWarning)
 
 OPEN_END_SHAMSI = '1499/12/29'
-NODE_DEPT = 'D'
 NODE_POST = 'P'
+NODE_DEPT = 'D'
 # OrganizationStructurePostType: 1 = مصوب
 POST_TYPE_APPROVED = 1
+# HCM3.OrganizationalStructure.DepartmentRef is NOT NULL. Posts with no
+# source department still need a department id; they are roots (ParentRef NULL).
+NO_DEPT_CODE = 'MIG-NO-DEPT'
+NO_DEPT_TITLE = 'بدون واحد سازمانی'
 
 
 def _parse_shamsi_date(raw):
@@ -110,82 +126,57 @@ def _clear_previous_structure(dest_cursor):
     """)
 
 
-def _insert_dept_nodes(
-    dest_cursor,
-    oc_id,
-    needed_depts,
-    parent_by_dept,
-    dept_map,
-    insertion,
-    deletion,
-    structure_last_id,
-    insert_os_sql,
-    insert_map_sql,
-):
-    """Insert department-only OS nodes; return source_dept_id -> dest_os_id."""
-    local = {}
-    pending = set(needed_depts)
-    inserted = 0
-    skipped = 0
-    safety = 0
-    max_passes = len(pending) + 5
+def _chain_reaches(parent_of, start_id, target_id):
+    """True when walking ParentRef from start_id reaches target_id."""
+    seen = set()
+    current = start_id
+    while current and current not in seen:
+        if current == target_id:
+            return True
+        seen.add(current)
+        current = parent_of.get(current)
+    return False
 
-    while pending and safety < max_passes:
-        safety += 1
-        progress = False
-        for source_dept_id in list(pending):
-            dest_dept = dept_map.get(source_dept_id)
-            if not dest_dept:
-                skipped += 1
-                pending.discard(source_dept_id)
-                progress = True
-                continue
 
-            parent_src = parent_by_dept.get(source_dept_id)
-            if parent_src and parent_src in needed_depts and parent_src not in local:
-                continue
+def _ensure_unassigned_department(dest_cursor):
+    """Department id used only so post nodes without a unit can be inserted."""
+    dest_cursor.execute(
+        "SELECT DepartmentID FROM HCM3.Department WHERE Code = ?",
+        (NO_DEPT_CODE,),
+    )
+    row = dest_cursor.fetchone()
+    if row:
+        return int(row[0])
 
-            parent_ref = local.get(parent_src) if parent_src else None
-            structure_last_id += 1
-            dest_cursor.execute(
-                insert_os_sql,
-                (structure_last_id, dest_dept, None, parent_ref, insertion, deletion),
-            )
-            dest_cursor.execute(
-                insert_map_sql,
-                (oc_id, NODE_DEPT, source_dept_id, structure_last_id),
-            )
-            local[source_dept_id] = structure_last_id
-            pending.discard(source_dept_id)
-            inserted += 1
-            progress = True
-
-        if not progress:
-            for source_dept_id in list(pending):
-                dest_dept = dept_map.get(source_dept_id)
-                if not dest_dept:
-                    skipped += 1
-                    pending.discard(source_dept_id)
-                    continue
-                structure_last_id += 1
-                dest_cursor.execute(
-                    insert_os_sql,
-                    (structure_last_id, dest_dept, None, None, insertion, deletion),
-                )
-                dest_cursor.execute(
-                    insert_map_sql,
-                    (oc_id, NODE_DEPT, source_dept_id, structure_last_id),
-                )
-                local[source_dept_id] = structure_last_id
-                pending.discard(source_dept_id)
-                inserted += 1
-            break
-
-    return local, structure_last_id, inserted, skipped
+    last_id = ensure_table_id(dest_cursor, 'HCM3.Department', 0) + 1
+    dest_cursor.execute(
+        """
+        INSERT INTO HCM3.Department (
+            DepartmentID, Code, UniqueCode, Title, AbbrSign, RegionalDivisionRef, Status,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        ) VALUES (?, ?, ?, ?, ?, NULL, 1, GETDATE(), 1, GETDATE(), 1)
+        """,
+        (last_id, NO_DEPT_CODE, NO_DEPT_CODE, NO_DEPT_TITLE, NO_DEPT_CODE),
+    )
+    dest_cursor.execute(
+        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.Department'",
+        (last_id,),
+    )
+    print(f"  -> Technical department for posts with no unit: {last_id}.")
+    return last_id
 
 
 def run():
     print("\n--- Running Step 10: Organizational Structure Migration (rebuild) ---")
+
+    managers_path = department_managers_path()
+    print(f"Reading department managers from {managers_path}...")
+    managers_by_oc = load_approved_managers(managers_path)
+    print(
+        "  -> Approved manager posts: "
+        f"{sum(len(v) for v in managers_by_oc.values())} "
+        f"across {len(managers_by_oc)} chart(s)."
+    )
 
     source_cnxn, dest_cnxn = get_connections()
     dest_cursor = dest_cnxn.cursor()
@@ -201,6 +192,7 @@ def run():
         print("Ensuring Department / Post masters...")
         dept_map = ensure_departments(source_cnxn, dest_cnxn, dest_cursor)
         post_map = ensure_posts(source_cnxn, dest_cnxn, dest_cursor)
+        unassigned_dept_id = _ensure_unassigned_department(dest_cursor)
 
         print("Fetching Organization Charts...")
         oc_df = pd.read_sql("""
@@ -239,25 +231,6 @@ def run():
                 'OcDescription': row['OcDescription'],
                 'OcNo': row['OcNo'],
             })
-
-        depts_df = pd.read_sql("""
-            SELECT
-                TBL_DepartmentID AS SourceDepartmentID,
-                TBL_DepartmentParentID_fk AS SourceParentDepartmentID
-            FROM dbo.TBL_Department
-            WHERE TBL_DepartmentID > 0
-        """, source_cnxn)
-        parent_by_dept = {}
-        all_source_depts = set()
-        for _, r in depts_df.iterrows():
-            did = int(r['SourceDepartmentID'])
-            all_source_depts.add(did)
-            pid = _positive_fk(r['SourceParentDepartmentID'])
-            if pid and pid != did:
-                parent_by_dept[did] = pid
-        # Departments are not tied to a chart, so every structure version
-        # gets the full mapped department tree.
-        all_source_depts = {did for did in all_source_depts if did in dept_map}
 
         posts_df = pd.read_sql("""
             SELECT
@@ -311,13 +284,16 @@ def run():
             ) VALUES (?, ?)
         """
 
-        dept_nodes = 0
         post_nodes = 0
+        dept_nodes = 0
         items_inserted = 0
         descs_inserted = 0
-        skipped_no_dept = 0
         skipped_no_post = 0
-        skipped_no_dept_master = 0
+        no_dept_posts = 0
+        posts_from_manager = 0
+        managers_skipped = 0
+        parents_linked = 0
+        parents_skipped_cycle = 0
 
         for oc in oc_windows:
             oc_id = oc['SourceOcID']
@@ -341,29 +317,9 @@ def run():
             descs_inserted += 1
 
             oc_posts = posts_df[posts_df['SourceOcID'] == oc_id]
-            post_dept = {}
-            for _, prow in oc_posts.iterrows():
-                post_dept[int(prow['SourcePostID'])] = _positive_fk(
-                    prow['SourceDepartmentID']
-                )
-
-            dept_local, structure_last_id, d_ins, d_skip = _insert_dept_nodes(
-                dest_cursor,
-                oc_id,
-                all_source_depts,
-                parent_by_dept,
-                dept_map,
-                insertion,
-                deletion,
-                structure_last_id,
-                insert_os_sql,
-                insert_map_sql,
-            )
-            dept_nodes += d_ins
-            skipped_no_dept_master += d_skip
-
             post_local = {}  # SourcePostID -> DestOrganizationalStructureID
-            pending_parent = []  # (dest_os_id, child_dept, source_parent_post)
+            pending_parent = []  # (dest_os_id, source_post_id, source_parent_post)
+            unassigned_posts = set()
 
             for _, prow in oc_posts.iterrows():
                 source_post_id = int(prow['SourcePostID'])
@@ -375,10 +331,9 @@ def run():
                 source_dept = _positive_fk(prow['SourceDepartmentID'])
                 dest_dept = dept_map.get(source_dept) if source_dept else None
                 if not dest_dept:
-                    skipped_no_dept += 1
-                    continue
+                    dest_dept = unassigned_dept_id
+                    unassigned_posts.add(source_post_id)
 
-                parent_ref = dept_local.get(source_dept) if source_dept else None
                 structure_last_id += 1
                 dest_cursor.execute(
                     insert_os_sql,
@@ -386,7 +341,7 @@ def run():
                         structure_last_id,
                         dest_dept,
                         dest_post,
-                        parent_ref,
+                        None,
                         insertion,
                         deletion,
                     ),
@@ -399,7 +354,7 @@ def run():
                 source_parent_post = _positive_fk(prow['SourceParentPostID'])
                 if source_parent_post and source_parent_post != source_post_id:
                     pending_parent.append(
-                        (structure_last_id, source_dept, source_parent_post)
+                        (structure_last_id, source_post_id, source_parent_post)
                     )
                 post_nodes += 1
 
@@ -416,19 +371,17 @@ def run():
                 )
                 items_inserted += 1
 
-            # Keep post→post parent only inside the same department.
-            # A post whose parent is 0 or sits in another department stays
-            # under its department node.
-            parent_linked = 0
-            for dest_os_id, child_dept, source_parent_post in pending_parent:
+            # ParentRef is the source parent post on this same chart.
+            # A link that would cycle is left null.
+            parent_of = {os_id: None for os_id in post_local.values()}
+            child_to_parent = {}
+            oc_parents_linked = 0
+            for dest_os_id, source_post_id, source_parent_post in pending_parent:
                 parent_os = post_local.get(source_parent_post)
-                parent_dept = post_dept.get(source_parent_post)
-                if (
-                    not parent_os
-                    or parent_dept is None
-                    or child_dept is None
-                    or parent_dept != child_dept
-                ):
+                if not parent_os:
+                    continue
+                if _chain_reaches(parent_of, parent_os, dest_os_id):
+                    parents_skipped_cycle += 1
                     continue
                 dest_cursor.execute(
                     """
@@ -439,10 +392,91 @@ def run():
                     """,
                     (parent_os, dest_os_id, parent_os),
                 )
-                if dest_cursor.rowcount:
-                    parent_linked += 1
-            if parent_linked:
-                print(f"    -> Post→post parents linked: {parent_linked}.")
+                parent_of[dest_os_id] = parent_os
+                child_to_parent[source_post_id] = source_parent_post
+                oc_parents_linked += 1
+                parents_linked += 1
+            if oc_parents_linked:
+                print(f"    -> Post parents linked: {oc_parents_linked}.")
+
+            # DepartmentRef from the reviewed manager list, then a department
+            # folder under each manager post.
+            oc_managers = {
+                post_id: dept_id
+                for post_id, dept_id in managers_by_oc.get(oc_id, {}).items()
+                if post_id in post_local and dept_map.get(dept_id)
+            }
+            for post_id, dept_id in managers_by_oc.get(oc_id, {}).items():
+                if post_id not in post_local or not dept_map.get(dept_id):
+                    managers_skipped += 1
+            assigned = assign_departments_under_managers(child_to_parent, oc_managers)
+            oc_from_manager = 0
+            for source_post_id, source_dept in assigned.items():
+                dest_os = post_local.get(source_post_id)
+                dest_dept = dept_map.get(source_dept)
+                if not dest_os or not dest_dept:
+                    continue
+                unassigned_posts.discard(source_post_id)
+                dest_cursor.execute(
+                    """
+                    UPDATE HCM3.OrganizationalStructure
+                    SET DepartmentRef = ?
+                    WHERE OrganizationalStructureID = ?
+                    """,
+                    (dest_dept, dest_os),
+                )
+                oc_from_manager += 1
+                posts_from_manager += 1
+
+            dept_os_by_manager = {}
+            for manager_post_id, source_dept in oc_managers.items():
+                structure_last_id += 1
+                dest_cursor.execute(
+                    insert_os_sql,
+                    (
+                        structure_last_id,
+                        dept_map[source_dept],
+                        None,
+                        post_local[manager_post_id],
+                        insertion,
+                        deletion,
+                    ),
+                )
+                dest_cursor.execute(
+                    insert_map_sql,
+                    (oc_id, NODE_DEPT, source_dept, structure_last_id),
+                )
+                dept_os_by_manager[manager_post_id] = structure_last_id
+                dept_nodes += 1
+
+            # Posts that reported to the manager and belong to his unit
+            # move under the department node. Deeper posts keep their
+            # post parent, so the chain stays inside that folder.
+            # A post that is itself a manager of another unit stays under
+            # the manager post, beside the folder.
+            moved_under_dept = 0
+            for source_post_id, source_dept in assigned.items():
+                parent_post = child_to_parent.get(source_post_id)
+                if parent_post not in dept_os_by_manager:
+                    continue
+                if oc_managers.get(parent_post) != source_dept:
+                    continue
+                dest_cursor.execute(
+                    """
+                    UPDATE HCM3.OrganizationalStructure
+                    SET ParentRef = ?
+                    WHERE OrganizationalStructureID = ?
+                    """,
+                    (dept_os_by_manager[parent_post], post_local[source_post_id]),
+                )
+                moved_under_dept += 1
+            no_dept_posts += len(unassigned_posts)
+            if oc_managers:
+                print(
+                    f"    -> Manager units: {len(oc_managers)} "
+                    f"department nodes, posts in those units: {oc_from_manager}, "
+                    f"moved directly under the department node: {moved_under_dept}."
+                )
 
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? "
@@ -462,11 +496,15 @@ def run():
 
         dest_cnxn.commit()
         print(
-            f"Success! Dept nodes: {dept_nodes}, Post nodes: {post_nodes}, "
+            f"Success! Post nodes: {post_nodes}, "
+            f"Department nodes: {dept_nodes}, "
             f"Items: {items_inserted}, Descriptions: {descs_inserted}. "
+            f"Posts placed by manager list: {posts_from_manager}. "
+            f"Post parents linked: {parents_linked}. "
+            f"Parent links skipped (cycle): {parents_skipped_cycle}. "
             f"Skipped (no post master): {skipped_no_post}. "
-            f"Skipped (no dept on post): {skipped_no_dept}. "
-            f"Skipped (no dept master): {skipped_no_dept_master}."
+            f"Manager rows skipped: {managers_skipped}. "
+            f"Posts still without a department: {no_dept_posts}."
         )
 
     except Exception as e:

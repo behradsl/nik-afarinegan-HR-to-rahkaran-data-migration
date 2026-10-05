@@ -13,7 +13,7 @@ def get_config_path():
 def get_connections():
     """Reads config.json and returns Source and Destination connections."""
     try:
-        with open(get_config_path(), 'r') as f:
+        with open(get_config_path(), 'r', encoding='utf-8-sig') as f:
             config = json.load(f)
             
         source_cnxn = pyodbc.connect(config['source_conn'])

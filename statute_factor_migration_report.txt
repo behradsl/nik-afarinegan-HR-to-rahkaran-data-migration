@@ -1,0 +1,353 @@
+Statute factor properties and values
+How they were extracted, how source amounts were assigned, and what was not migrated
+
+This note is for discussion with the customer. It describes the current migration of
+عوامل حکمی, امتیازات فردی, and سابقه خدمت into Rahkaran. The numbers are from the
+local migration already loaded into the destination database.
+
+
+1. What was created in the destination
+
+Three groups of source payroll factors were created as statute factors.
+
+  Source group                                      Destination type
+  ------------------------------------------------  ----------------------------
+  Direct children of parent 2, عوامل حکمی           اصلی (TypeCode 1)
+  Direct children of parent 22, امتیازات فردی       فرعی (TypeCode 2)
+  سابقه خدمت leaves under parents 511000–518000     فرعی (TypeCode 2)
+  that have a user-entered amount on the score
+  sheet
+
+Parent 3 (شاغلین خاص) and parent 51 (سختی کار کارگران) were not created. They are
+not inputs of the حکمی price.
+
+246 statute factors were created in total: the parent-2 factors, the 36 parent-22
+factors, and 115 سابقه خدمت factors.
+
+Every property carries the formula stub "return 0;". The source formula text is
+stored in the formula description so it can be reviewed later. The historical
+amount is the migrated value. The stub does not recalculate it.
+
+
+2. How a property was opened
+
+Rahkaran stores each amount on EmployeeStatuteFactor, and that row must point at
+one StatuteFactorProperty. The application later finds the property by three
+things together:
+
+  - the factor
+  - the employment type of the حکم
+  - the latest property start month that is still on or before the حکم apply month
+
+A property that starts after the apply month is not used. If no property has
+started yet for that factor and employment type, the amount cannot be stored.
+The migration follows the same rule and does not guess a different property.
+
+The start month and the employment types were taken from the source roll formula,
+PAY_PfRollFormula, as follows.
+
+2.1 Employment-type formula
+
+Most money factors call FxPAY_PersonnelEmploymentType. That function has six
+expressions. Each expression applies to a fixed group of source employment types.
+A property was created only when the expression is not 0.
+
+  Slot   Source employment types                         Destination names
+  -----  ----------------------------------------------  ---------------------------
+  1      22, 23                                          کارمند رسمی،
+                                                         کارمند رسمی-آزمایشی
+  2      20, 21, 24, 25, 26, 38                          کارمند حکمی، پیمانی،
+                                                         مدیرعامل، قراردادی،
+                                                         طرحی، امریه
+  3      10, 11                                          کارگر رسمی، کارگری
+  4      12                                              انجام کار مشخص
+  4 then 13 until 1398/11, then slot 3 from 1398/12     ماده 124 کارگری
+  3
+
+Slots 5 and 6 of this function are not used for a property. They have no
+employment-type list in the source function.
+
+The property start month is the later of:
+
+  - the factor register date (PAY_PfRegisetrDate), or the first حکم that uses
+    the factor on HRS_RuleDocumentDetail, whichever is earlier
+  - the date window inside the formula, when the formula itself changes by date
+
+Examples of a zero slot, which received no property:
+
+  Factor 110, فوق العاده بدی آب و هوا
+    Employee slots have an expression. Worker slots (10, 11, 12, 13) are 0.
+    کارگر رسمی، کارگری، انجام کار مشخص، and ماده 124 therefore have no property.
+
+  Factor 107, کمک هزینه اولاد
+    Same shape. Worker slots are 0.
+
+  Factor 127, حق مدرک تحصیلی
+    Only the انجام کار مشخص expression is filled. The other slots are 0.
+
+  Factor 145, سایر 2
+    Only the انجام کار مشخص expression is filled.
+
+  Factor 126, افزایش حق الزحمه
+    Every slot is 0, so the factor has no property for any employment type.
+
+2.2 Parent 22 score factors
+
+These factors have an empty roll formula, and they have no rows on
+HRS_RuleDocumentDetail. The score is stored on HRS_RuleDocumentScores.
+
+Because there is no detail row, the start-month rule falls through to the factor
+register date alone. One property was opened for every destination employment
+type at that month.
+
+  Factor                                          Register date    Property starts
+  ----------------------------------------------  ---------------  ---------------
+  2250 امتیاز تحصیلات رسمی (خدمات کشوری)          1392/07/07       1392/07
+  2251, 2252, 2253, 2254, 2264                    same window      1392/07
+  2258 امتیاز سختی شرایط محیط کار                 1400/12/17       1400/12
+  2261 امتیاز فوق العاده شغل                      1400/12/17       1400/12
+  2262 امتیاز حق شغل                              1400/12/17       1400/12
+  2265 امتیاز حق شاغل                             1400/12/17       1400/12
+  and the other خدمات کشوری scores in that set                    1400/12
+  2275 امتیاز ترمیم حقوق                          1401/09/01       1401/09
+  2276 تعداد فرزندان مشمول سنوات ارفاقی           1403/10/15       1403/10
+
+The score procedure still writes HRS_RdsSystemAmount onto احکام whose apply
+month is earlier than that register date. Those older scores have no property
+that has started yet.
+
+2.3 سابقه خدمت
+
+These factors also have an empty roll formula. The property starts at the
+earliest حکم execute month that has a non-zero HRS_RdsUserAmount for that
+factor. A stored 0 on an earlier حکم does not pull the start month backward.
+One property was opened per destination employment type at that month.
+
+
+3. How a source amount was written onto a حکم
+
+Each migrated حکم already has:
+
+  IssueDate = HRS_RdExportDate
+  ApplyDate = HRS_RdExcuteDate
+
+The property is chosen from ApplyDate. Issue dates were compared with the source
+and reported. They are not used to choose the property. On this load, every
+apply date matches the source execute date. 2,473 issue dates are empty in the
+destination while the source export date is filled.
+
+For each حکم and each factor, at most one destination row is written.
+
+  Source group              Field copied                         Rows written
+  ------------------------  -----------------------------------  ------------
+  Parent 2, عوامل حکمی      HRS_RddPrice                         399,690
+  Parent 22, امتیازات فردی  HRS_RdsSystemAmount                  285,933
+  سابقه خدمت                HRS_RdsUserAmount                    386,393
+                                                                 ------------
+  Total                                                          1,072,016
+
+A stored 0 is treated as a real amount and is written when a property matches.
+A row with a delete date is not read. If the same حکم and factor appear more
+than once, the line with the latest register date is kept and the extra line is
+reported.
+
+On the destination row:
+
+  EditedValue holds the copied amount.
+  Value is computed as isnull(EditedValue, CalcValue), so it shows the same
+  number.
+  CalcValue is 0. The column cannot be left empty, and the formula has not been
+  rebuilt. The stub formula also returns 0, so a later calculation that prefers
+  EditedValue keeps the migrated amount.
+
+The property attached to the row is the one for the same factor and the حکم
+employment type whose start month is the greatest month still on or before the
+apply month. If that property does not exist, or two properties share that
+start month, the amount is written to the exception list and is not attached to
+another property.
+
+82,136 احکام were migrated. 76,667 of them have at least one factor value.
+
+
+4. What the four detail amounts mean, and which one was copied
+
+A parent-2 detail line can hold four numbers at once:
+
+  HRS_RddScore            points
+  HRS_RddPercent          percent
+  HRS_RddAdjustmentScore  adjustment points
+  HRS_RddPrice            money amount
+
+The source save procedure copies the matching parent-22 score onto HRS_RddScore,
+then sets HRS_RddPrice from that score. The price is score times the rial
+coefficient, or a percent of prices already calculated, and the adjustment is
+added after that. Score and price therefore appear together on one detail row.
+They are not two independent inputs of the same factor.
+
+The migration copies HRS_RddPrice onto the money factor.
+The score is copied from HRS_RdsSystemAmount onto the parent-22 factor, when
+that score-sheet row exists.
+HRS_RddPercent and HRS_RddAdjustmentScore are not copied. They are inputs of the
+price calculation, and the calculated price is already in HRS_RddPrice.
+
+
+5. Amounts that were not migrated, and how each one was lost
+
+5.1 Deleted detail rows: 363,286 parent-2 lines
+
+HRS_RuleDocumentDetail has 772,492 parent-2 lines. 409,206 have no delete date
+and were candidates. 363,286 have a delete date and were not read. This is
+intentional. A deleted source line is not a current حکم value.
+
+6,962 parent-22 score rows also have a system amount and a delete date. Those
+were not read.
+
+5.2 Parent-2 prices with no property for that employment type: 9,498 lines on 6,939 احکام
+
+The source still has HRS_RddPrice on these lines. The formula slot for that
+employment type is 0, so section 2.1 created no property. The value step then
+refuses to hang the price on a property of another employment type.
+
+  Factor   Name                         Lines   Employment types with a price
+  -------  ---------------------------  ------  ---------------------------------
+  110      فوق العاده بدی آب و هوا      5,618   کارگر رسمی 2,291; کارگری 1,988;
+                                                انجام کار مشخص 100; ماده 124 1,239
+  107      کمک هزینه اولاد              2,834   کارگر رسمی 1,151; کارگری 1,135;
+                                                ماده 124 548
+  145      سایر 2                         559   کارگر رسمی 549; کارمند پیمانی 10
+  127      حق مدرک تحصیلی                 342   کارگری 327; کارگر رسمی 8;
+                                                کارمند پیمانی 7
+  139      فوق العاده نقاط مرزی           114   ماده 124 60; کارگر رسمی 21;
+                                                کارگری 17; انجام کار مشخص 16
+  126      افزایش حق الزحمه                25   کارمند پیمانی 25
+                                                (every slot of this formula is 0)
+  2210     تخلفات اداری                     8   worker types
+  2211     حراست                            8   worker types
+  112      فوق العاده ویژه                  2   کارگر رسمی
+  100      حقوق و مزایا                     1   انجام کار مشخص
+  103      فوق العاده سختی محیط کار         1   انجام کار مشخص
+  130      حقوق شغل                         1   کارمند حکمی
+  132      حقوق شخص                         1   کارمند حکمی
+
+6,939 of these احکام already have other factor values, so the حکم is only
+partly filled. The missing number is the price of the factor whose slot is 0.
+
+How the loss happens: the property extraction treats a 0 expression as "this
+employment type does not use this factor" and skips the property. The source
+حکم nevertheless stored a price. With no property, the price has nowhere to go.
+
+5.3 Parent-2 prices whose property starts after the حکم: 1 line
+
+One price sits on a حکم whose apply month is before that factor's property
+start (1398/12). Same rule as section 5.4, on a single money line.
+
+5.4 Parent-22 scores whose property starts after the حکم: 22,232 lines on 5,104 احکام
+
+These scores exist as HRS_RdsSystemAmount. The property exists for the
+employment type, and it starts on the factor register date from section 2.2.
+The حکم apply month is earlier, so the property is not eligible.
+
+  Property start   Lines    What it covers
+  ---------------  -------  -------------------------------------------------
+  1392/07           5,305   تحصیلات، مهارت، and the other scores registered
+                            in 1392/07 (2250–2254, 2264)
+  1400/12          14,877   حق شغل، حق شاغل، فوق العاده شغل، سختی کار، and
+                            the other scores registered on 1400/12/17
+  1401/09           2,025   امتیاز ترمیم حقوق (2275)
+  1403/10              25   سنوات ارفاقی طرح جوانی جمعیت (2276)
+
+4,501 of these احکام have other factor values. 614 have no factor value at all:
+the only amounts on those احکام were scores dated before the factor was
+registered, so nothing could be attached.
+
+How the loss happens: parent-22 factors have no detail rows, so the start month
+was taken from PAY_PfRegisetrDate. The score sheet has amounts on older احکام.
+The value step will not use a property that starts later than the apply month.
+
+A further 16 parent-22 lines, on 8 احکام, have no property for that employment
+type because the employment-type formula slot is 0 (factors 2210 and 2211,
+included in the small rows of section 5.2).
+
+5.5 سابقه خدمت zeros dated before the first non-zero amount: 147 lines on 8 احکام
+
+HRS_RdsUserAmount is 0 on these lines, and the حکم apply month is before the
+first non-zero amount of that factor. The property was opened at the first
+non-zero month, so the earlier 0 has no property yet.
+
+How the loss happens: the start-month query ignores user amounts equal to 0.
+The value step still tries to write a stored 0, then finds that the property
+has not started.
+
+5.6 احکام that could not be matched to an employment type or an apply month: 78 lines
+
+  Parent-2 prices            17 lines on 7 احکام
+  Parent-22 scores           17 lines on 3 احکام
+  سابقه خدمت amounts         44 lines on 3 احکام
+
+These احکام are in the destination, and the source amount is non-blank. The
+destination employment type or the apply date is empty, so no property can be
+chosen. The 7 price احکام and 3 score احکام and 3 سابقه خدمت احکام in the
+"no factor value at all" counts above are this group. Some overlap where one
+حکم fails for more than one amount.
+
+5.7 Detail scores that were never given a destination factor: 9,497 احکام
+
+40,720 احکام have a non-zero HRS_RddScore on a parent-2 detail line.
+
+  31,093   The matching parent-22 system score is in the destination, so the
+           score is stored on the score factor. The detail column itself was
+           not copied, and does not need to be, because the same score is on
+           the parent-22 factor.
+
+  9,497    HRS_RddScore is filled, and this حکم has no parent-22 score row in
+           the source at all. The score lives only on the price detail. The
+           migration copies the price of that detail and does not copy
+           HRS_RddScore, so this score is not on any destination factor.
+
+  130      A parent-22 score row does exist, and it was not inserted, for the
+           reason in section 5.4. The detail score of those احکام is therefore
+           also missing from the destination.
+
+How the loss happens for the 9,497: the value rule copies HRS_RddPrice for the
+money factor and HRS_RdsSystemAmount for the score factor. It has no third
+copy of HRS_RddScore. When the score sheet has no row, the points on the detail
+are dropped.
+
+5.8 Percent and adjustment
+
+HRS_RddPercent and HRS_RddAdjustmentScore are not stored on any destination
+factor. They were left out because the price already includes their effect.
+If the customer needs those two numbers as their own factors, they are absent
+today on every حکم.
+
+
+6. What is already complete
+
+  399,690 of 409,206 live parent-2 prices are on a destination factor.
+  285,933 of 308,198 live parent-22 system scores are on a destination factor.
+  386,393 of 386,584 live سابقه خدمت user amounts are on a destination factor.
+
+The lines in section 5 are the remainder. Deleted rows in section 5.1 are the
+rest of the source tables and were excluded on purpose.
+
+
+7. Points to confirm
+
+  1. Where the formula slot is 0 and the حکم still has HRS_RddPrice (section
+     5.2, 9,498 prices), should that price be migrated? That needs a property
+     for the employment type even though the source expression is 0.
+
+  2. Should a parent-22 property start at the first حکم that carries
+     HRS_RdsSystemAmount, instead of at the date the factor was registered
+     (section 5.4, 22,232 scores)?
+
+  3. Should a سابقه خدمت value of 0 on an older حکم be migrated (section 5.5,
+     147 zeros)? That means opening the property at the first stored amount,
+     including zero.
+
+  4. Where HRS_RddScore is filled and there is no parent-22 score row (section
+     5.7, 9,497 احکام), must that detail score appear on a destination factor,
+     or is the migrated price enough?
+
+  5. Are HRS_RddPercent and HRS_RddAdjustmentScore required as their own
+     values, or is the price that already includes them enough?

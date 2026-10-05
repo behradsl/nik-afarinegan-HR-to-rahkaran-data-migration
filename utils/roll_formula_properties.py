@@ -1,7 +1,10 @@
 """
 Statute-factor property targets from PAY_PfRollFormula + UDF bodies.
 
-Catalog: PAY_PayrollFactor where PAY_PfParentID_fk = 2.
+Catalog: PAY_PayrollFactor children of parent 2 (عوامل حکمی) and parent 22
+(امتیازات فردی), plus سابقه خدمت leaves that have a user amount on
+HRS_RuleDocumentScores. Those service factors have no roll formula;
+their property is one shell per employment type.
 Formulas: PAY_PfRollFormula only (not PAY_PfFormula / BackFormula).
 
 Dispatchers handled:
@@ -31,6 +34,14 @@ from utils.formula_break import (
 )
 
 STATUTE_PARENT_ID = 2
+# امتیازات فردی. Same statute-factor path as عوامل حکمی; TypeCode is فرعی.
+SCORE_PARENT_ID = 22
+STATUTE_PARENT_IDS = (STATUTE_PARENT_ID, SCORE_PARENT_ID)
+SERVICE_HISTORY_NOTE = (
+    "FxHRS_RuleDocumentPersonnelScoresCMSL reads "
+    "HRS_RuleDocumentScores.HRS_RdsUserAmount for this factor "
+    "when it builds امتیاز سنوات and امتیاز تجربه."
+)
 
 _UDF_CALL_RE = re.compile(r"\b(?:dbo\.)?(Fx[A-Za-z0-9_]+)\s*\(", re.I)
 _CMSL_PF_IF_RE = re.compile(
@@ -44,8 +55,36 @@ _DATE_CMP_RE = re.compile(
 _SHAMSI_DATE_RE = re.compile(r"'(\d{4}/\d{2}/\d{2})'")
 
 
+def load_service_history_factor_ids(source_cnxn) -> set[int]:
+    """
+    سابقه خدمت leaves that feed the حکم score.
+    A factor qualifies when a score-sheet row stores a non-zero user amount
+    and the factor is not itself a parent-2 or parent-22 statute factor.
+    """
+    df = pd.read_sql(
+        f"""
+        SELECT DISTINCT s.PAY_PfID_fk AS PfID
+        FROM dbo.HRS_RuleDocumentScores s
+        INNER JOIN dbo.PAY_PayrollFactor pf ON pf.PAY_PfID = s.PAY_PfID_fk
+        WHERE pf.PAY_PfID > 0
+          AND ISNULL(pf.PAY_PfParentID_fk, 0) NOT IN ({STATUTE_PARENT_ID}, {SCORE_PARENT_ID})
+          AND ISNULL(TRY_CAST(s.HRS_RdsUserAmount AS float), 0) <> 0
+        """,
+        source_cnxn,
+    )
+    if df.empty:
+        return set()
+    return {int(x) for x in df["PfID"].tolist()}
+
+
 def load_parent2_factors(source_cnxn) -> pd.DataFrame:
-    return pd.read_sql(
+    service_ids = load_service_history_factor_ids(source_cnxn)
+    service_clause = ""
+    if service_ids:
+        service_clause = (
+            " OR PAY_PfID IN (" + ",".join(str(i) for i in sorted(service_ids)) + ")"
+        )
+    frame = pd.read_sql(
         f"""
         SELECT
             PAY_PfID AS SourcePayrollFactorID,
@@ -59,14 +98,52 @@ def load_parent2_factors(source_cnxn) -> pd.DataFrame:
             PAY_PfActive AS PAY_PfActive,
             PAY_PfRegisetrDate AS FactorRegisterDate,
             CAST(PAY_PfRollFormula AS nvarchar(max)) AS RollFormula,
-            CAST(PAY_PfFormula AS nvarchar(max)) AS PfFormula
+            CAST(PAY_PfFormula AS nvarchar(max)) AS PfFormula,
+            CASE
+                WHEN ISNULL(PAY_PfParentID_fk, 0) NOT IN ({STATUTE_PARENT_ID}, {SCORE_PARENT_ID})
+                THEN 1 ELSE 0
+            END AS IsServiceHistory
         FROM dbo.PAY_PayrollFactor
-        WHERE PAY_PfParentID_fk = {STATUTE_PARENT_ID}
-          AND PAY_PfID > 0
+        WHERE PAY_PfID > 0
+          AND (
+                PAY_PfParentID_fk IN ({",".join(str(i) for i in STATUTE_PARENT_IDS)})
+                {service_clause}
+          )
         ORDER BY PAY_PfID
         """,
         source_cnxn,
     )
+    return frame
+
+
+def service_score_anchor_year_months(source_cnxn, factor_ids) -> dict[int, int]:
+    """Earliest حکم execute month that stores a user amount for each service factor."""
+    ids = [int(x) for x in factor_ids]
+    if not ids:
+        return {}
+    id_list = ",".join(str(i) for i in ids)
+    df = pd.read_sql(
+        f"""
+        SELECT
+            s.PAY_PfID_fk AS SourcePayrollFactorID,
+            MIN(TRY_CAST(
+                REPLACE(LEFT(LTRIM(RTRIM(rd.HRS_RdExcuteDate)), 7), N'/', N'')
+                AS INT
+            )) AS MinExecuteYM
+        FROM dbo.HRS_RuleDocumentScores s
+        INNER JOIN dbo.HRS_RuleDocument rd ON rd.HRS_RdID = s.HRS_RdID_fk
+        WHERE s.PAY_PfID_fk IN ({id_list})
+          AND ISNULL(TRY_CAST(s.HRS_RdsUserAmount AS float), 0) <> 0
+        GROUP BY s.PAY_PfID_fk
+        """,
+        source_cnxn,
+    )
+    out = {}
+    for _, row in df.iterrows():
+        ym = normalize_shamsi_yyyymm(row["MinExecuteYM"])
+        if ym is not None:
+            out[int(row["SourcePayrollFactorID"])] = ym
+    return out
 
 
 def load_payment_system_factor_ets(source_cnxn) -> dict[int, set[int]]:
@@ -270,9 +347,15 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
     et_map = load_et_maps(dest_cnxn)
     all_dest = sorted(set(et_map.values()))
     pay_ets = load_payment_system_factor_ets(source_cnxn)
-    anchors = factor_anchor_year_months(
-        source_cnxn, [int(x) for x in factors["SourcePayrollFactorID"].tolist()]
-    )
+    factor_id_list = [int(x) for x in factors["SourcePayrollFactorID"].tolist()]
+    anchors = factor_anchor_year_months(source_cnxn, factor_id_list)
+    service_ids = [
+        int(x)
+        for x in factors.loc[factors["IsServiceHistory"].astype(int) == 1, "SourcePayrollFactorID"]
+    ]
+    for pf, ym in service_score_anchor_year_months(source_cnxn, service_ids).items():
+        previous = anchors.get(pf)
+        anchors[pf] = ym if previous is None else min(int(previous), int(ym))
 
     cmsl_body = _object_definition(source_cnxn, "FxHRS_RuleDocumentPersonnelCMSL")
     rd_personnel_body = _object_definition(source_cnxn, "FxHRS_RuleDocumentPersonnel")
@@ -286,16 +369,32 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
         name = str(row["FactorName"] or "")
         anchor = anchors.get(pf)
         payment_filter = pay_ets.get(pf)  # None if not in any PS listing
+        is_service = int(row.get("IsServiceHistory") or 0) == 1
 
         stats["factors"] += 1
         if not roll or roll in ("0", "selef", "Self", "self"):
             # Still try CMSL if this PfID has a dedicated block there
             block = extract_cmsl_pf_block(cmsl_body, pf)
-            if block:
+            if block and not is_service:
                 roll = f"dbo.FxHRS_RuleDocumentPersonnelCMSL(HRS_RdID_fk,{pf})"
                 stats["inferred_cmsl_roll"] += 1
             else:
-                stats["empty_roll"] += 1
+                if is_service:
+                    stats["service_history"] += 1
+                    slot_label = "service_history_user_amount"
+                    output_expr = "HRS_RdsUserAmount"
+                    formula_sql = SERVICE_HISTORY_NOTE
+                    dispatcher = "RuleDocumentPersonnelScoresCMSL"
+                    notes = "service_history_user_amount"
+                    trivial = False
+                else:
+                    stats["empty_roll"] += 1
+                    slot_label = "no_roll_formula"
+                    output_expr = roll or "0"
+                    formula_sql = roll or "0"
+                    dispatcher = None
+                    notes = "empty_or_trivial_roll"
+                    trivial = True
                 dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
                 for det in dest_ets:
                     targets.append(
@@ -306,12 +405,12 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                             "EffectiveToMonth": None,
                             "DestEmploymentTypeID": int(det),
                             "SlotCode": "ALL",
-                            "SlotLabel": "no_roll_formula",
-                            "OutputExpr": roll or "0",
-                            "FormulaSql": roll or "0",
-                            "dispatcher": None,
-                            "notes": "empty_or_trivial_roll",
-                            "IsTrivialZero": True,
+                            "SlotLabel": slot_label,
+                            "OutputExpr": output_expr,
+                            "FormulaSql": formula_sql,
+                            "dispatcher": dispatcher,
+                            "notes": notes,
+                            "IsTrivialZero": trivial,
                         }
                     )
                 continue
