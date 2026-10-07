@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pandas as pd
 import warnings
 from db_core import get_connections
@@ -48,6 +50,14 @@ INSURANCE_STATUS_SKIP = {0, 710008}  # پایه / ندارد
 
 EDUCATION_STATE_LOOKUP = {1: 'محصل', 2: 'دانشجو'}
 PHYSICAL_STATE_LOOKUP = {1: 'سالم', 2: 'معلول'}
+# Source HRS_MaritalStatusID_fk (PayBase parent 2). 0 is تعاریف پایه and is skipped.
+PERSONNEL_MARITAL_STATUS = {
+    20001: 1,  # مجرد
+    20002: 2,  # متاهل
+    20003: 3,  # معیل
+    20004: 4,  # زن سرپرست خانوار
+}
+HEAD_OF_HOUSEHOLD_LOOKUP = {4: 'زن سرپرست خانوار'}
 
 
 def _parse_shamsi_date(raw, *, reject_mass_register=False):
@@ -78,6 +88,10 @@ def _resolve_marriage_start(row):
         if parsed:
             return parsed
     return None
+
+
+def _day_after(date_str):
+    return (datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def _resolve_marriage_end(row):
@@ -257,6 +271,9 @@ def run():
         print("Ensuring EducationState / PhysicalState lookups...")
         ensure_lookup_codes(dest_cnxn, dest_cursor, 'EducationState', EDUCATION_STATE_LOOKUP)
         ensure_lookup_codes(dest_cnxn, dest_cursor, 'PhysicalState', PHYSICAL_STATE_LOOKUP)
+        print("Ensuring marital-status lookup code for زن سرپرست خانوار...")
+        ensure_lookup_codes(dest_cnxn, dest_cursor, 'MaritalStatus', HEAD_OF_HOUSEHOLD_LOOKUP)
+        ensure_lookup_codes(dest_cnxn, dest_cursor, 'PersonMaritalStatus', HEAD_OF_HOUSEHOLD_LOOKUP)
 
         print("Ensuring default insurance Organization...")
         organization_ref = ensure_default_insurance_organization(dest_cnxn, dest_cursor)
@@ -381,12 +398,41 @@ def run():
             FROM HCM3.EmployeeMarriage
         """, dest_cnxn)
         existing_marriage_keys = set()
+        marriage_history = {}
         for _, row in existing_marriage_df.iterrows():
             eff = row['EffectiveDate']
             if pd.isna(eff):
                 continue
             eff_str = pd.to_datetime(eff).strftime('%Y-%m-%d')
-            existing_marriage_keys.add((int(row['EmployeeRef']), int(row['StatusCode']), eff_str))
+            employee_ref = int(row['EmployeeRef'])
+            status_code = int(row['StatusCode'])
+            existing_marriage_keys.add((employee_ref, status_code, eff_str))
+            marriage_history.setdefault(employee_ref, []).append((eff_str, status_code))
+
+        print("Loading source marital status for migrated employees...")
+        marital_employees = pd.read_sql("""
+            SELECT
+                m.SourceID,
+                e.EmployeeID,
+                e.PartyRef,
+                p.BirthDate AS PartyBirthDate,
+                p.MaritalStatus AS PartyMaritalStatus
+            FROM master.dbo.PartyMigrationMapping m
+            JOIN HCM3.Employee e ON m.DestPartyID = e.PartyRef
+            JOIN GNR3.Party p ON p.PartyID = e.PartyRef
+        """, dest_cnxn)
+        source_marital = pd.read_sql("""
+            SELECT
+                TBL_PersonnelID AS SourceID,
+                HRS_MaritalStatusID_fk AS MaritalStatusID,
+                TBL_PersonnelEmployeDate AS EmployeDate
+            FROM dbo.TBL_Personnel
+            WHERE TBL_PersonnelID > 0
+        """, source_cnxn)
+        source_marital_by_id = {
+            int(row.SourceID): row
+            for row in source_marital.itertuples(index=False)
+        }
 
         print("Preparing ID generators...")
         relative_last_id = _ensure_table_id(dest_cursor, 'HCM3.EmployeeRelative', 0)
@@ -594,6 +640,7 @@ def run():
                 marriage_last_id, employee_id, status_code, effective_date
             ))
             existing_marriage_keys.add(key)
+            marriage_history.setdefault(employee_id, []).append((effective_date, status_code))
             marriages_inserted += 1
 
         print("Building EmployeeMarriage history for newly inserted spouses...")
@@ -630,6 +677,45 @@ def run():
             dest_cursor.execute(update_party_sql, (2, party_ref))
             party_updates += 1
 
+        print("Reconciling EmployeeMarriage with source marital status...")
+        marriages_reconciled = 0
+        for row in marital_employees.itertuples(index=False):
+            source_row = source_marital_by_id.get(int(row.SourceID))
+            if source_row is None:
+                continue
+            source_code = PERSONNEL_MARITAL_STATUS.get(_as_int(source_row.MaritalStatusID))
+            if source_code is None:
+                continue
+            employee_id = int(row.EmployeeID)
+            history = marriage_history.get(employee_id) or []
+            if history:
+                latest_date, latest_status = max(history)
+                if latest_status != source_code:
+                    before = marriages_inserted
+                    add_marriage(employee_id, source_code, _day_after(latest_date))
+                    if marriages_inserted > before:
+                        marriages_reconciled += 1
+            elif source_code != 1:
+                effective = _parse_shamsi_date(source_row.EmployeDate)
+                if not effective:
+                    birth = row.PartyBirthDate
+                    effective = (
+                        pd.to_datetime(birth).strftime('%Y-%m-%d')
+                        if pd.notna(birth) else DEFAULT_BIRTH
+                    )
+                before = marriages_inserted
+                add_marriage(employee_id, source_code, effective)
+                if marriages_inserted > before:
+                    marriages_reconciled += 1
+
+            party_status = (
+                2 if employee_id in newly_spouse_employees
+                else _as_int(row.PartyMaritalStatus)
+            )
+            if party_status != source_code:
+                dest_cursor.execute(update_party_sql, (source_code, int(row.PartyRef)))
+                party_updates += 1
+
         dest_cursor.execute(
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeRelative'",
             (relative_last_id,),
@@ -650,6 +736,7 @@ def run():
             f"Insurance inserted: {insurance_inserted}. "
             f"IsSurety updated: {insurance_surety_updated}. "
             f"Marriages inserted: {marriages_inserted}. "
+            f"Marriages reconciled: {marriages_reconciled}. "
             f"Party marital updates: {party_updates}. "
             f"Skipped (no employee): {skipped_no_employee}. "
             f"Skipped (already mapped): {skipped_already_mapped}. "

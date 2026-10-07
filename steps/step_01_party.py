@@ -33,11 +33,14 @@ def _party_fields_from_row(row, city_map):
             id_number = id_number[:20]
 
     gender = 1 if row['SexID'] == 10001 else (2 if row['SexID'] == 10002 else None)
-    marital_status = (
-        1 if row['MaritalStatusID'] == 20001
-        else (2 if row['MaritalStatusID'] == 20002
-              else (3 if row['MaritalStatusID'] == 20003 else None))
-    )
+    marital_status = None
+    if pd.notna(row['MaritalStatusID']):
+        marital_status = {
+            20001: 1,  # مجرد
+            20002: 2,  # متاهل
+            20003: 3,  # معیل
+            20004: 4,  # زن سرپرست خانوار
+        }.get(int(row['MaritalStatusID']))
     birth_place = clean_persian_text(row['BirthPlace'])
     export_place = clean_persian_text(row['ExportPlace'])
 
