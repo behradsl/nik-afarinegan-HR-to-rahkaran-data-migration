@@ -7,7 +7,7 @@ LOOKUP_IDGEN_TABLE = 'Sys3.Lookup'
 LOOKUP_INSERT_SQL = """
     INSERT INTO SYS3.Lookup (
         LookupID, Type, Code, Value, DisplayOrder, Extra, System, CanEdit, CanDelete
-    ) VALUES (?, ?, ?, ?, ?, N'', 'HCM3', 1, 1)
+    ) VALUES (?, ?, ?, ?, ?, N'', ?, ?, ?)
 """
 
 
@@ -53,6 +53,28 @@ def repair_lookup_extra(dest_cursor, lookup_type=None):
     if repaired:
         print(f"  -> Repaired Extra on {repaired} Lookup row(s).")
     return repaired
+
+
+def _lookup_row_flags(dest_cursor, lookup_type):
+    """Copy System/CanEdit/CanDelete from an existing code of this type.
+
+    PersonMaritalStatus is GNR3 and not editable. A new code inserted as HCM3
+    is missing from the employee form's lookup list, so a party value of that
+    code cannot be opened.
+    """
+    dest_cursor.execute(
+        """
+        SELECT TOP 1 System, CanEdit, CanDelete
+        FROM SYS3.Lookup
+        WHERE Type = ?
+        ORDER BY Code
+        """,
+        (lookup_type,),
+    )
+    row = dest_cursor.fetchone()
+    if not row:
+        return 'HCM3', 1, 1
+    return row[0] or 'HCM3', 1 if row[1] else 0, 1 if row[2] else 0
 
 
 def _next_lookup_id(dest_cursor):
@@ -151,6 +173,7 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
     result = {}
     inserted = 0
     updated = 0
+    system, can_edit, can_delete = _lookup_row_flags(dest_cursor, lookup_type)
 
     current_last_id, idgen_exists = _next_lookup_id(dest_cursor)
 
@@ -158,7 +181,7 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
         value = normalize_persian(value) if value else value
         dest_cursor.execute(
             """
-            SELECT LookupID, Value
+            SELECT LookupID, Value, System, CanEdit, CanDelete
             FROM SYS3.Lookup
             WHERE Type = ? AND Code = ?
             """,
@@ -167,6 +190,11 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
         row = dest_cursor.fetchone()
         if row:
             existing_value = row[1]
+            same_flags = (
+                (row[2] or '') == system
+                and (1 if row[3] else 0) == can_edit
+                and (1 if row[4] else 0) == can_delete
+            )
             if (
                 overwrite_values
                 and value is not None
@@ -175,13 +203,24 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
                 dest_cursor.execute(
                     """
                     UPDATE SYS3.Lookup
-                    SET Value = ?, Extra = N''
+                    SET Value = ?, Extra = N'', System = ?, CanEdit = ?, CanDelete = ?
                     WHERE Type = ? AND Code = ?
                     """,
-                    (value, lookup_type, code),
+                    (value, system, can_edit, can_delete, lookup_type, code),
                 )
                 updated += 1
                 result[code] = value
+            elif not same_flags:
+                dest_cursor.execute(
+                    """
+                    UPDATE SYS3.Lookup
+                    SET System = ?, CanEdit = ?, CanDelete = ?, Extra = N''
+                    WHERE Type = ? AND Code = ?
+                    """,
+                    (system, can_edit, can_delete, lookup_type, code),
+                )
+                updated += 1
+                result[code] = existing_value
             else:
                 result[code] = existing_value
             continue
@@ -189,7 +228,10 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
         current_last_id += 1
         dest_cursor.execute(
             LOOKUP_INSERT_SQL,
-            (current_last_id, lookup_type, code, value, max(code - 1, 0)),
+            (
+                current_last_id, lookup_type, code, value, max(code - 1, 0),
+                system, can_edit, can_delete,
+            ),
         )
         result[code] = value
         inserted += 1
@@ -198,7 +240,7 @@ def ensure_lookup_codes(dest_cnxn, dest_cursor, lookup_type, code_to_value, *, o
         print(f"  -> Added {inserted} missing {lookup_type} code(s).")
         _bump_lookup_idgen(dest_cursor, current_last_id, idgen_exists)
     if updated:
-        print(f"  -> Updated Value on {updated} existing {lookup_type} code(s).")
+        print(f"  -> Updated {updated} existing {lookup_type} code(s).")
     elif not result:
         # Nothing inserted and nothing found — still return requested defaults
         result = {int(c): normalize_persian(v) for c, v in code_to_value.items()}
@@ -235,8 +277,10 @@ def sync_lookup(dest_cnxn, dest_cursor, lookup_type, unique_values):
         for val in missing_values:
             current_last_id += 1
             max_code += 1
+            system, can_edit, can_delete = _lookup_row_flags(dest_cursor, lookup_type)
             dest_cursor.execute(LOOKUP_INSERT_SQL, (
-                current_last_id, lookup_type, max_code, val, max_code - 1
+                current_last_id, lookup_type, max_code, val, max_code - 1,
+                system, can_edit, can_delete,
             ))
             existing_map[val] = max_code
 

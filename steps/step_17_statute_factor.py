@@ -130,6 +130,20 @@ def setup_statute_factor_property_mapping_table(cursor, *, recreate_if_legacy=Tr
             )
         END
     """)
+    cursor.execute("""
+        IF COL_LENGTH(
+            'master.dbo.StatuteFactorPropertyMigrationMapping',
+            'IssueYearMonth'
+        ) IS NULL
+            ALTER TABLE master.dbo.StatuteFactorPropertyMigrationMapping
+                ADD IssueYearMonth INT NULL
+        IF COL_LENGTH(
+            'master.dbo.StatuteFactorPropertyMigrationMapping',
+            'ApplyYearMonth'
+        ) IS NULL
+            ALTER TABLE master.dbo.StatuteFactorPropertyMigrationMapping
+                ADD ApplyYearMonth INT NULL
+    """)
     cursor.commit()
 
 
@@ -172,7 +186,9 @@ def _build_formula_description(target):
     header = (
         f"[Migrated from source {source_kind}]\n"
         f"SourcePayrollFactorID={source_pf_id}; "
-        f"EffectiveFromMonth={month}; Slot={slot}; "
+        f"IssueYearMonth={target.get('IssueYearMonth') or month}; "
+        f"ApplyYearMonth={target.get('ApplyYearMonth') or month}; "
+        f"Slot={slot}; "
         f"Dispatcher={target.get('dispatcher')}\n"
         f"StatutePure={'yes' if pure else 'no'}; "
         f"HasSelf={'yes' if target.get('HasSelf') else 'no'}\n"
@@ -199,6 +215,18 @@ def _clear_previously_migrated_properties(dest_cursor, dest_cnxn):
         SELECT CASE WHEN OBJECT_ID('master.dbo.StatuteFactorPropertyMigrationMapping')
                     IS NOT NULL THEN 1 ELSE 0 END AS HasMap
     """, dest_cnxn).iloc[0]['HasMap'] == 1
+
+    dest_cursor.execute("""
+        IF OBJECT_ID('master.dbo.StatuteFactorMigrationMapping') IS NOT NULL
+            DELETE esf
+            FROM HCM3.EmployeeStatuteFactor esf
+            INNER JOIN HCM3.StatuteFactorProperty sfp
+                ON esf.StatuteFactorPropertyRef = sfp.StatuteFactorPropertyID
+            INNER JOIN master.dbo.StatuteFactorMigrationMapping m
+                ON sfp.StatuteFactorRef = m.DestStatuteFactorID
+        IF OBJECT_ID('master.dbo.EmployeeStatuteFactorMigrationMapping') IS NOT NULL
+            DELETE FROM master.dbo.EmployeeStatuteFactorMigrationMapping
+    """)
 
     if has_prop_map:
         dest_cursor.execute("""
@@ -484,8 +512,8 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
             SourcePayrollFactorID, EffectiveFromMonth, DestEmploymentTypeID,
             SlotCode, SourceBackFormulaID, DestStatuteFactorPropertyID,
             DestFormulaID, OutputExpr, StatutePure, HasSelf,
-            NonRdFactorRefs, DeferredReason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            NonRdFactorRefs, DeferredReason, IssueYearMonth, ApplyYearMonth
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     formula_cache = {}
@@ -509,6 +537,8 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
             skipped_no_month += 1
             continue
         from_month = int(frm)
+        issue_month = int(t.get("IssueYearMonth") or from_month)
+        apply_month = int(t.get("ApplyYearMonth") or from_month)
         et_id = int(t["DestEmploymentTypeID"])
         slot = t.get("SlotCode") or "ALL"
         expr = t.get("OutputExpr") or ""
@@ -541,8 +571,8 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
                 property_last_id,
                 dest_factor_id,
                 et_id,
-                from_month,
-                from_month,
+                issue_month,
+                apply_month,
                 PROPERTY_STATUS_ACTIVE,
                 formula_id,
             ),
@@ -562,6 +592,8 @@ def _migrate_factor_properties(source_cnxn, dest_cnxn, dest_cursor):
                 has_self,
                 None,
                 (deferred[:1000] if deferred else None),
+                issue_month,
+                apply_month,
             ),
         )
         properties_inserted += 1

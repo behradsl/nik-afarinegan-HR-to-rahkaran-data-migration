@@ -333,6 +333,17 @@ def _dest_ets_for_factor(
     return list(all_dest)
 
 
+def _dest_ets_with_stored(pf: int, dest_ets: list[int], stored_apply: dict) -> list[int]:
+    """Keep formula employment types, and add any type that already stores an amount."""
+    out = list(dest_ets)
+    seen = {int(x) for x in out}
+    for factor, et in stored_apply:
+        if int(factor) == int(pf) and int(et) not in seen:
+            out.append(int(et))
+            seen.add(int(et))
+    return out
+
+
 def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | None = None):
     """
     Returns (targets, stats, factor_df).
@@ -347,6 +358,7 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
     et_map = load_et_maps(dest_cnxn)
     all_dest = sorted(set(et_map.values()))
     pay_ets = load_payment_system_factor_ets(source_cnxn)
+    stored_apply = _earliest_stored_apply_months(source_cnxn, dest_cnxn)
     factor_id_list = [int(x) for x in factors["SourcePayrollFactorID"].tolist()]
     anchors = factor_anchor_year_months(source_cnxn, factor_id_list)
     service_ids = [
@@ -395,7 +407,11 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                     dispatcher = None
                     notes = "empty_or_trivial_roll"
                     trivial = True
-                dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
+                dest_ets = _dest_ets_with_stored(
+                    pf,
+                    _dest_ets_for_factor(None, et_map, payment_filter, all_dest),
+                    stored_apply,
+                )
                 for det in dest_ets:
                     targets.append(
                         {
@@ -428,7 +444,11 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                     break
             if not et_call or len(et_call["args"]) < 8:
                 stats["et_parse_error"] += 1
-                dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
+                dest_ets = _dest_ets_with_stored(
+                    pf,
+                    _dest_ets_for_factor(None, et_map, payment_filter, all_dest),
+                    stored_apply,
+                )
                 for det in dest_ets:
                     targets.append(
                         {
@@ -455,18 +475,27 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                 windows = et_slot_windows("PersonnelEmploymentType", source_et)
                 if not windows:
                     continue
-                if payment_filter is not None and payment_filter and source_et not in payment_filter:
-                    continue
                 dest_et = et_map.get(source_et)
                 if dest_et is None:
+                    continue
+                has_stored = (pf, int(dest_et)) in stored_apply
+                if (
+                    payment_filter is not None
+                    and payment_filter
+                    and source_et not in payment_filter
+                    and not has_stored
+                ):
                     continue
                 for w_from, w_to, slot, w_note in windows:
                     if should_skip_slot(slot, "PersonnelEmploymentType"):
                         continue
                     expr = slots.get(slot) or "0"
-                    if is_trivial_zero(expr):
+                    trivial = is_trivial_zero(expr)
+                    if trivial and not has_stored:
                         stats["skipped_trivial_et_slot"] += 1
                         continue
+                    if trivial and has_stored:
+                        stats["kept_zero_slot_with_amount"] += 1
                     # intersect with anchor: property starts at max(anchor, w_from)
                     prop_from = w_from
                     if anchor is not None:
@@ -479,6 +508,8 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                     notes = "roll:PersonnelEmploymentType"
                     if w_note:
                         notes += "; " + w_note
+                    if trivial:
+                        notes += "; zero_slot_kept_for_stored_amount"
                     targets.append(
                         {
                             "SourcePayrollFactorID": pf,
@@ -492,7 +523,7 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                             "FormulaSql": roll,
                             "dispatcher": "PersonnelEmploymentType",
                             "notes": notes,
-                            "IsTrivialZero": False,
+                            "IsTrivialZero": trivial,
                         }
                     )
             continue
@@ -508,7 +539,11 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
             cmsl_pf = int(m.group(2)) if m else pf
             block = extract_cmsl_pf_block(cmsl_body, cmsl_pf)
             windows = extract_date_windows_from_block(block or roll)
-            dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
+            dest_ets = _dest_ets_with_stored(
+                pf,
+                _dest_ets_for_factor(None, et_map, payment_filter, all_dest),
+                stored_apply,
+            )
             for w in windows:
                 prop_from = w["EffectiveFromMonth"]
                 if prop_from is None:
@@ -567,7 +602,11 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
                         "notes": "rd_personnel_collapsed",
                     }
                 ]
-            dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
+            dest_ets = _dest_ets_with_stored(
+                pf,
+                _dest_ets_for_factor(None, et_map, payment_filter, all_dest),
+                stored_apply,
+            )
             for w in windows:
                 prop_from = w["EffectiveFromMonth"] or anchor
                 for det in dest_ets:
@@ -590,7 +629,11 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
             continue
 
         # --- default: one property shell per ET ---
-        dest_ets = _dest_ets_for_factor(None, et_map, payment_filter, all_dest)
+        dest_ets = _dest_ets_with_stored(
+            pf,
+            _dest_ets_for_factor(None, et_map, payment_filter, all_dest),
+            stored_apply,
+        )
         for det in dest_ets:
             targets.append(
                 {
@@ -634,5 +677,136 @@ def build_roll_property_targets(source_cnxn, dest_cnxn, factor_ids: list[int] | 
         claimed[key] = t
         unique.append(t)
 
+    backdated = _assign_issue_and_apply_months(unique, stored_apply)
+    stats["apply_backdated"] = backdated
     stats["targets"] = len(unique)
     return unique, dict(stats), factors
+
+
+def _execute_year_month_sql(column: str) -> str:
+    """Shamsi YYYY/MM/DD text → YYYYMM. Invalid months become NULL."""
+    return f"""
+        CASE
+            WHEN {column} LIKE '[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]'
+             AND TRY_CAST(SUBSTRING({column}, 6, 2) AS int) BETWEEN 1 AND 12
+            THEN TRY_CAST(LEFT({column}, 4) AS int) * 100
+               + TRY_CAST(SUBSTRING({column}, 6, 2) AS int)
+        END
+    """
+
+
+def _earliest_stored_apply_months(source_cnxn, dest_cnxn) -> dict[tuple[int, int], int]:
+    """
+    Earliest حکم execute month that already stores an amount, per
+    (source factor, destination employment type).
+
+    Parent 2 uses HRS_RddPrice, parent 22 uses HRS_RdsSystemAmount,
+    سابقه خدمت uses HRS_RdsUserAmount. A stored 0 counts. Deleted rows
+    do not. This month is the property ApplyYearMonth when it is earlier
+    than the month the factor was defined.
+    """
+    et_map = load_et_maps(dest_cnxn)
+    if not et_map:
+        return {}
+    ym_rd = _execute_year_month_sql("rd.HRS_RdExcuteDate")
+    service_ids = load_service_history_factor_ids(source_cnxn)
+    if service_ids:
+        service_filter = (
+            "AND s.PAY_PfID_fk IN ("
+            + ",".join(str(int(i)) for i in sorted(service_ids))
+            + ")"
+        )
+    else:
+        service_filter = "AND 1 = 0"
+    frame = pd.read_sql(
+        f"""
+        SELECT PfID, SourceET, MIN(YM) AS YM
+        FROM (
+            SELECT d.PAY_PfID_fk AS PfID, rd.TBL_EtID_fk AS SourceET,
+                   {ym_rd} AS YM
+            FROM dbo.HRS_RuleDocumentDetail d
+            INNER JOIN dbo.HRS_RuleDocument rd ON rd.HRS_RdID = d.HRS_RdID_fk
+            INNER JOIN dbo.PAY_PayrollFactor pf ON pf.PAY_PfID = d.PAY_PfID_fk
+            WHERE pf.PAY_PfParentID_fk = {STATUTE_PARENT_ID}
+              AND d.PAY_PfID_fk > 0
+              AND d.HRS_RddPrice IS NOT NULL
+              AND rd.TBL_EtID_fk IS NOT NULL
+              AND (
+                    d.HRS_RddDeleteDate IS NULL
+                    OR LTRIM(RTRIM(d.HRS_RddDeleteDate)) IN (N'', N'0')
+                  )
+            UNION ALL
+            SELECT s.PAY_PfID_fk, rd.TBL_EtID_fk, {ym_rd}
+            FROM dbo.HRS_RuleDocumentScores s
+            INNER JOIN dbo.HRS_RuleDocument rd ON rd.HRS_RdID = s.HRS_RdID_fk
+            INNER JOIN dbo.PAY_PayrollFactor pf ON pf.PAY_PfID = s.PAY_PfID_fk
+            WHERE pf.PAY_PfParentID_fk = {SCORE_PARENT_ID}
+              AND s.PAY_PfID_fk > 0
+              AND rd.TBL_EtID_fk IS NOT NULL
+              AND NULLIF(LTRIM(RTRIM(s.HRS_RdsSystemAmount)), N'') IS NOT NULL
+              AND (
+                    s.HRS_RdsDeleteDate IS NULL
+                    OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
+                  )
+            UNION ALL
+            SELECT s.PAY_PfID_fk, rd.TBL_EtID_fk, {ym_rd}
+            FROM dbo.HRS_RuleDocumentScores s
+            INNER JOIN dbo.HRS_RuleDocument rd ON rd.HRS_RdID = s.HRS_RdID_fk
+            WHERE s.PAY_PfID_fk > 0
+              AND rd.TBL_EtID_fk IS NOT NULL
+              AND NULLIF(LTRIM(RTRIM(s.HRS_RdsUserAmount)), N'') IS NOT NULL
+              AND (
+                    s.HRS_RdsDeleteDate IS NULL
+                    OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
+                  )
+              {service_filter}
+        ) amounts
+        WHERE YM IS NOT NULL
+        GROUP BY PfID, SourceET
+        """,
+        source_cnxn,
+    )
+    earliest: dict[tuple[int, int], int] = {}
+    for _, row in frame.iterrows():
+        dest_et = et_map.get(int(row["SourceET"]))
+        if dest_et is None or pd.isna(row["YM"]):
+            continue
+        key = (int(row["PfID"]), int(dest_et))
+        ym = int(row["YM"])
+        current = earliest.get(key)
+        if current is None or ym < current:
+            earliest[key] = ym
+    return earliest
+
+
+def _assign_issue_and_apply_months(targets, earliest) -> int:
+    """
+    IssueYearMonth stays the month the property was defined.
+    ApplyYearMonth moves back to the earliest stored حکم amount for that
+    factor and employment type, so older statutes can hold the value.
+    Only the earliest property of each factor and employment type moves.
+    """
+    groups = defaultdict(list)
+    for target in targets:
+        month = target.get("EffectiveFromMonth")
+        if month is None or (isinstance(month, float) and pd.isna(month)):
+            target["IssueYearMonth"] = None
+            target["ApplyYearMonth"] = None
+            continue
+        groups[
+            (int(target["SourcePayrollFactorID"]), int(target["DestEmploymentTypeID"]))
+        ].append(target)
+
+    backdated = 0
+    for key, group in groups.items():
+        group.sort(key=lambda item: int(item["EffectiveFromMonth"]))
+        earliest_ym = earliest.get(key)
+        for index, target in enumerate(group):
+            issue = int(target["EffectiveFromMonth"])
+            apply = issue
+            if index == 0 and earliest_ym is not None and earliest_ym < issue:
+                apply = earliest_ym
+                backdated += 1
+            target["IssueYearMonth"] = issue
+            target["ApplyYearMonth"] = apply
+    return backdated

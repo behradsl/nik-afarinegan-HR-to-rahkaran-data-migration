@@ -20,8 +20,8 @@ from utils.org_migration import (
 warnings.filterwarnings('ignore', category=UserWarning)
 
 OPEN_END_SHAMSI = '1499/12/29'
-# EmployeeStatute.Status — active/confirmed analogue
-STATUTE_STATUS_ACTIVE = 1
+# SYS3.Lookup EmployeeStatuteStatus: 1 ذخیره, 5 تایید کارگزینی, 10 تایید پرداخت
+STATUTE_STATUS_PAYMENT_CONFIRMED = 10
 
 # StatuteType required defaults (Rahkaran NOT NULL columns)
 STATUTE_TYPE_DEFAULTS = {
@@ -243,6 +243,36 @@ def _resolve_structure_ref(
     if apply_date and deletion and str(apply_date) > str(deletion)[:10]:
         return None
     return structure_id
+
+
+def _fill_employment_date_and_payment_status(dest_cursor):
+    """
+    EmploymentDate on every statute is that employee's first statute date:
+    the earliest ApplyDate, or the earliest IssueDate when no apply date exists.
+    Status is تایید پرداخت.
+    """
+    dest_cursor.execute(
+        """
+        UPDATE s
+        SET s.EmploymentDate = d.FirstDate,
+            s.Status = ?,
+            s.LastModificationDate = GETDATE(),
+            s.LastModifier = 1
+        FROM HCM3.EmployeeStatute s
+        INNER JOIN (
+            SELECT
+                EmployeeRef,
+                COALESCE(MIN(ApplyDate), MIN(IssueDate)) AS FirstDate
+            FROM HCM3.EmployeeStatute
+            GROUP BY EmployeeRef
+        ) d ON d.EmployeeRef = s.EmployeeRef
+        """,
+        (STATUTE_STATUS_PAYMENT_CONFIRMED,),
+    )
+    print(
+        "  -> Employment date set from each employee's first statute date. "
+        f"Payment-confirmed status set on {dest_cursor.rowcount} statutes."
+    )
 
 
 def run():
@@ -514,7 +544,7 @@ def run():
                     place_code,
                     rank_code,
                     description,
-                    STATUTE_STATUS_ACTIVE,
+                    STATUTE_STATUS_PAYMENT_CONFIRMED,
                 ),
             )
             dest_cursor.execute(insert_mapping_sql, (source_rd_id, statute_last_id))
@@ -525,6 +555,7 @@ def run():
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeStatute'",
             (statute_last_id,),
         )
+        _fill_employment_date_and_payment_status(dest_cursor)
 
         dest_cnxn.commit()
         print(

@@ -5,11 +5,11 @@ Parent 2 (عوامل حکمی): HRS_RddPrice.
 Parent 22 (امتیازات فردی): HRS_RdsSystemAmount.
 سابقه خدمت: HRS_RdsUserAmount.
 
-CalcValue is NOT NULL on the destination, so it is stored as 0.
-EditedValue carries the migrated amount. Value is computed as
-isnull(EditedValue, CalcValue), so it shows the same amount.
-The property is the one whose start month is the latest still on or
-before the statute apply month.
+CalcValue and EditedValue both store the migrated amount.
+Value is computed as isnull(EditedValue, CalcValue).
+The property is the one whose ApplyYearMonth is the latest still on or
+before the statute apply month. IssueYearMonth stays the month the
+property was defined and can be later than ApplyYearMonth.
 """
 import bisect
 import csv
@@ -194,7 +194,8 @@ def _report_date_mismatches(source_cnxn, statutes):
 def _load_property_index(dest_cnxn):
     frame = pd.read_sql(
         """
-        SELECT SourcePayrollFactorID, EffectiveFromMonth,
+        SELECT SourcePayrollFactorID,
+               ISNULL(ApplyYearMonth, EffectiveFromMonth) AS EffectiveFromMonth,
                DestEmploymentTypeID, DestStatuteFactorPropertyID
         FROM master.dbo.StatuteFactorPropertyMigrationMapping
         """,
@@ -397,7 +398,7 @@ def _flush(dest_cursor, factor_rows, map_rows):
             EmployeeStatuteFactorID, EmployeeStatuteRef, StatuteFactorRef,
             StatuteFactorPropertyRef, CalcValue, EditedValue,
             CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, ?, 0, ?, GETDATE(), 1, GETDATE(), 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """,
         factor_rows,
     )
@@ -461,6 +462,7 @@ def _migrate_frame(
             statute["DestEmployeeStatuteID"],
             dest_factor,
             prop_id,
+            amount,
             amount,
         ))
         map_rows.append((rd_id, pf_id, source_name, next_id))

@@ -259,6 +259,11 @@ HCM_EXTRA_FIELD_SPECS = {
         'title_path': r'systemgroup.hcm.staff\TrainingExtra2Title',
         'show_path': r'systemgroup.hcm.staff\ShowTrainingExtra2',
     },
+    'EmployeeEducationExtra1': {
+        'title': 'وضعیت مدرک',
+        'title_path': r'systemgroup.hcm.staff\EducationExtra1Title',
+        'show_path': r'systemgroup.hcm.staff\ShowEducationExtra1',
+    },
     # No Show/Title config groups for relatives Extra — LookupInfo title only
     'EmployeeRelativeExtra1': {
         'title': 'علت ایجاد تحت تکفل',

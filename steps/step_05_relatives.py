@@ -6,6 +6,7 @@ from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
 from utils.lookup_helpers import ensure_lookup_codes, sync_lookup
+from utils.rahkaran_cache import invalidate_lookup_cache
 from utils.hcm_extra_settings import ensure_hcm_extra_fields
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -730,6 +731,7 @@ def run():
         )
 
         dest_cnxn.commit()
+        invalidate_lookup_cache()
         print(
             f"Success! Relatives inserted: {relatives_inserted}. "
             f"Status updated: {relatives_status_updated}. "

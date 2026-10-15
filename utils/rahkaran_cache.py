@@ -26,6 +26,8 @@ LOOKUP_CACHE_FRAGMENTS = (
     'LookupC',
     'LookupInfoC',
     'LookupCache',
+    # Employee form keeps its own copy of lookup-backed fields.
+    'HCM_Staff_EmployeeUserCache',
 )
 
 _DEFAULT_REDIS = {

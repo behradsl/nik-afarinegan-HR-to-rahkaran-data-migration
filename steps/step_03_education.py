@@ -4,12 +4,16 @@ Step 3: Migrate HRS_DegreeHistory → HCM3.EmployeeEducation.
 NeedLevelCode: from the latest HRS_DegreeScore row for the same
 TBL_DegreeID (by HRS_DsDate, then HRS_DsID). Fallback default = 1.
 Ensures EducationNeedLevel lookup codes 1–4.
+
+Extra1Code: HRS_DhStatusId_fk (PayBase parent 36, وضعیت مدرک)
+→ SYS3.Lookup EmployeeEducationExtra1.
 """
 import pandas as pd
 import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_value, clean_persian_text
 from utils.date_helpers import shamsi_to_gregorian
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
 from utils.lookup_helpers import ensure_degree_mappings, ensure_lookup_codes, sync_lookup
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -22,6 +26,22 @@ EDUCATION_NEED_LEVEL_LOOKUP = {
     2: 'دو',
     3: 'سه',
     4: 'چهار',
+}
+
+# HRS_DhStatusId_fk → EmployeeEducation.Extra1Code (وضعیت مدرک)
+DEGREE_STATUS_RELATED = 3601
+DEGREE_STATUS_SIMILAR = 3602
+DEGREE_STATUS_UNRELATED = 3603
+EDUCATION_EXTRA1_LOOKUP = 'EmployeeEducationExtra1'
+EDUCATION_EXTRA1_VALUES = {
+    1: 'مرتبط',
+    2: 'مشابه',
+    3: 'غیر مرتبط',
+}
+DEGREE_STATUS_TO_EXTRA1 = {
+    DEGREE_STATUS_RELATED: 1,
+    DEGREE_STATUS_SIMILAR: 2,
+    DEGREE_STATUS_UNRELATED: 3,
 }
 
 
@@ -37,6 +57,17 @@ def setup_education_mapping_table(cursor):
         END
     """)
     cursor.commit()
+
+
+def _degree_status_extra1(raw):
+    """Map وضعیت مدرک. Missing or unknown source ids stay empty."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    try:
+        source_id = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return DEGREE_STATUS_TO_EXTRA1.get(source_id)
 
 
 def _normalize_need_level(raw):
@@ -110,6 +141,15 @@ def run():
         ensure_lookup_codes(
             dest_cnxn, dest_cursor, 'EducationNeedLevel', EDUCATION_NEED_LEVEL_LOOKUP
         )
+        print("Ensuring EmployeeEducationExtra1 (وضعیت مدرک)...")
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            EDUCATION_EXTRA1_LOOKUP,
+            EDUCATION_EXTRA1_VALUES,
+            overwrite_values=True,
+        )
+        ensure_hcm_extra_fields(dest_cursor, (EDUCATION_EXTRA1_LOOKUP,))
 
         print("Building NeedLevel map from latest DegreeScore per degree...")
         degree_need_map = _load_latest_need_by_degree(source_cnxn)
@@ -127,7 +167,8 @@ def run():
                 dh.HRS_DhAverage AS GPA,
                 dh.HRS_DhEnterDate AS StartDate,
                 dh.HRS_DhRecieveDate AS EndDate,
-                dh.HRS_DhExcuteDate AS EffectiveDate
+                dh.HRS_DhExcuteDate AS EffectiveDate,
+                dh.HRS_DhStatusId_fk AS DegreeStatusID
             FROM dbo.HRS_DegreeHistory dh
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = dh.TBL_DegreeId_fk
             LEFT JOIN dbo.TBL_DegreeBranch db ON db.TBL_DbID = dh.TBL_DbID_fk
@@ -186,7 +227,7 @@ def run():
             dest_cnxn, dest_cursor, 'EducationCenter', merged_df['CenterName'].unique()
         )
 
-        print("Preparing to insert / backfill Employee Education NeedLevelCode...")
+        print("Preparing to insert / backfill Employee Education...")
         dest_cursor.execute(
             "SELECT LastId FROM SYS3.tableIdGen WITH (UPDLOCK, HOLDLOCK) "
             "WHERE TableName = 'hcm3.employeeeducation'"
@@ -198,8 +239,9 @@ def run():
             INSERT INTO HCM3.EmployeeEducation (
                 EmployeeEducationID, EmployeeRef, DegreeCode, DisciplineCode, CenterCode,
                 StartDate, EndDate, GPA, NeedLevelCode, QualityCode, EffectiveDate,
+                Extra1Code,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ISNULL(?, GETDATE()), GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ISNULL(?, GETDATE()), ?, GETDATE(), 1, GETDATE(), 1)
         """
         insert_mapping_sql = """
             INSERT INTO master.dbo.EducationMigrationMapping (
@@ -209,6 +251,7 @@ def run():
         update_need_sql = """
             UPDATE HCM3.EmployeeEducation
             SET NeedLevelCode = ?,
+                Extra1Code = ?,
                 LastModificationDate = GETDATE(),
                 LastModifier = 1
             WHERE EmployeeEducationID = ?
@@ -219,6 +262,7 @@ def run():
         skipped_bad_degree = 0
         from_score = 0
         from_default = 0
+        extra1_counts = {1: 0, 2: 0, 3: 0, None: 0}
 
         for _, row in merged_df.iterrows():
             source_history_id = int(row['SourceDegreeHistoryID'])
@@ -239,9 +283,13 @@ def run():
             else:
                 from_score += 1
 
+            extra1_code = _degree_status_extra1(row['DegreeStatusID'])
+            extra1_counts[extra1_code] = extra1_counts.get(extra1_code, 0) + 1
+
             if source_history_id in already_map:
                 dest_cursor.execute(
-                    update_need_sql, (need_level, already_map[source_history_id])
+                    update_need_sql,
+                    (need_level, extra1_code, already_map[source_history_id]),
                 )
                 backfilled += 1
                 continue
@@ -266,7 +314,7 @@ def run():
             current_last_id += 1
             dest_cursor.execute(insert_edu_sql, (
                 current_last_id, emp_id, deg_code, disc_code, center_code,
-                start_date, end_date, gpa, need_level, effective_date,
+                start_date, end_date, gpa, need_level, effective_date, extra1_code,
             ))
             dest_cursor.execute(insert_mapping_sql, (source_history_id, current_last_id))
             already_map[source_history_id] = current_last_id
@@ -295,6 +343,13 @@ def run():
         print(
             f"  -> NeedLevel from latest DegreeScore: {from_score}. "
             f"Defaulted to {DEFAULT_NEED_LEVEL}: {from_default}."
+        )
+        print(
+            "  -> Extra1 وضعیت مدرک: "
+            f"مرتبط={extra1_counts.get(1, 0)}, "
+            f"مشابه={extra1_counts.get(2, 0)}, "
+            f"غیر مرتبط={extra1_counts.get(3, 0)}, "
+            f"empty={extra1_counts.get(None, 0)}."
         )
 
     except Exception as e:
