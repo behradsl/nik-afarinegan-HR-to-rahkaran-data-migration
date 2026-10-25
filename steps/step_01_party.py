@@ -6,6 +6,12 @@ from utils.data_helpers import clean_value, clean_persian_text, normalize_persia
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
+# Source has no religion, subreligion, or nationality. These are the defaults
+# written on every migrated person.
+RELIGION_ISLAM = 1
+SUBRELIGION_SHIA = 1
+NATIONALITY_IRAN = 'ایران'
+
 
 def setup_mapping_table(cursor):
     """Creates the mapping table in the master database if it doesn't exist."""
@@ -58,6 +64,9 @@ def _party_fields_from_row(row, city_map):
         'IDSerial': clean_value(row['IDSerial']),
         'Gender': gender,
         'MaritalStatus': marital_status,
+        'Religion': RELIGION_ISLAM,
+        'Subreligion': SUBRELIGION_SHIA,
+        'Nationality': NATIONALITY_IRAN,
     }
 
 
@@ -179,6 +188,7 @@ def run():
                 BirthDate = ?, BirthPlaceRef = ?, IssuancePlaceRef = ?,
                 Mobile = ?, Tel = ?, IDNumber = ?, IDSerial = ?,
                 Gender = ?, MaritalStatus = ?,
+                Religion = ?, Subreligion = ?, Nationality = ?,
                 LastModificationDate = GETDATE(), LastModifier = 1
             WHERE PartyID = ?
         """
@@ -189,7 +199,8 @@ def run():
                 fields['FatherName'], fields['BirthDate'], fields['BirthPlaceRef'],
                 fields['IssuancePlaceRef'], fields['Mobile'], fields['Tel'],
                 fields['IDNumber'], fields['IDSerial'], fields['Gender'],
-                fields['MaritalStatus'], dest_party_id,
+                fields['MaritalStatus'], fields['Religion'], fields['Subreligion'],
+                fields['Nationality'], dest_party_id,
             ))
             return 1 if dest_cursor.rowcount else 0
 
@@ -218,9 +229,9 @@ def run():
                 INSERT INTO GNR3.Party (
                     PartyID, FirstName, LastName, NationalID, FatherName, BirthDate,
                     BirthPlaceRef, IssuancePlaceRef, Mobile, Tel, IDNumber, IDSerial,
-                    Gender, MaritalStatus,
+                    Gender, MaritalStatus, Religion, Subreligion, Nationality,
                     CreationDate, Creator, LastModificationDate, LastModifier, Type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
             """
 
             for record in to_insert:
@@ -232,6 +243,7 @@ def run():
                     record['FatherName'], record['BirthDate'], record['BirthPlaceRef'],
                     record['IssuancePlaceRef'], record['Mobile'], record['Tel'],
                     record['IDNumber'], record['IDSerial'], record['Gender'], record['MaritalStatus'],
+                    record['Religion'], record['Subreligion'], record['Nationality'],
                 ))
                 dest_cursor.execute(insert_mapping_sql, (record['SourceID'], new_party_id))
                 inserted += 1

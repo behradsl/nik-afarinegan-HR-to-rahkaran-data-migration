@@ -40,10 +40,10 @@ def normalize_persian(text):
     # Arabic Kaf → Persian Keheh (keyboard ک)
     text = text.replace('\u0643', '\u06a9')  # ك → ک
 
-    # Common hamza-on-alef forms → plain Alef (search-friendly)
+    # Hamza-on-alef forms → plain Alef. Alef with madda (آ) is a real letter
+    # and must stay, so names such as آمنه are not stored as امنه.
     text = text.replace('\u0623', '\u0627')  # أ → ا
     text = text.replace('\u0625', '\u0627')  # إ → ا
-    text = text.replace('\u0622', '\u0627')  # آ → ا
     text = text.replace('\u0671', '\u0627')  # ٱ → ا
 
     # Teh Marbuta → Heh

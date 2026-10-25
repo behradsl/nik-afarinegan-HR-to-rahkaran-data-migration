@@ -2,19 +2,20 @@
 Step 10: Rebuild HCM3.OrganizationalStructure for Rahkaran UI.
 
 Per OrganizationChart (Oc) era:
-  - One node per post. ParentRef follows TBL_PostParentID_fk on the same
-    chart. Parent 0, or a parent not on this chart, stays null.
+  - One node per post. A post that is not a department manager keeps
+    TBL_PostParentID_fk on the same chart. Parent 0, or a parent not on
+    this chart, stays null.
   - Department nodes come from department_managers.csv (one reviewed manager
-    post per department per chart). Each department node hangs under that
-    manager post. PostRef on a department node is null.
+    post per department per chart). The manager post is the immediate child
+    of its department. A department's own parent is the department of the
+    nearest ancestor manager, never a post. PostRef on a department node
+    is null. The parent manager therefore stays the manager of the child
+    departments under his unit. Every other post keeps its source parent.
   - The manager post and every post below him take that department as
-    DepartmentRef, until the next manager post. Posts that report directly
-    to the manager and belong to that department are reparented under the
-    department node; posts further down keep their post parent, so they
-    sit inside the same folder. Source TBL_DepartmentID_fk on those posts
-    is not used. Posts outside every manager subtree keep their source
-    department. Posts with no department use one technical department
-    because DepartmentRef cannot be null.
+    DepartmentRef, until the next manager post. Source TBL_DepartmentID_fk
+    on those posts is not used. Posts outside every manager subtree keep
+    their source department. Posts with no department use one technical
+    department because DepartmentRef cannot be null.
   - InsertionDate = Oc date; DeletionDate = next Oc date (NULL for latest)
   - OrganizationalStructureDescription per Oc ChangeDate
   - OrganizationalStructureItem (مصوب) on each post node
@@ -136,6 +137,158 @@ def _chain_reaches(parent_of, start_id, target_id):
         seen.add(current)
         current = parent_of.get(current)
     return False
+
+
+def _ancestor_department_node(manager_post_id, parent_of_post, manager_dept_node):
+    """
+    Department structure id of the nearest ancestor post that manages a unit.
+    A department is never placed under a post. No ancestor manager means a root.
+    """
+    seen = set()
+    current = parent_of_post.get(manager_post_id)
+    own = manager_dept_node.get(manager_post_id)
+    while current and current not in seen:
+        seen.add(current)
+        node = manager_dept_node.get(current)
+        if node and node != own:
+            return node
+        current = parent_of_post.get(current)
+    return None
+
+
+def _department_parents_without_cycles(manager_dept_node, parent_of_post):
+    """Map each department structure id to its parent department, or None."""
+    proposed = {}
+    for manager_post_id, department_node in manager_dept_node.items():
+        proposed[department_node] = _ancestor_department_node(
+            manager_post_id, parent_of_post, manager_dept_node
+        )
+    for department_node, ancestor in list(proposed.items()):
+        if ancestor and _chain_reaches(proposed, ancestor, department_node):
+            proposed[department_node] = None
+    return proposed
+
+
+def reseat_departments_above_managers(dest_cursor, source_cnxn):
+    """
+    Hang each department on the parent manager's department, and keep that
+    manager as the department's immediate child. A department is not left
+    under a post. Other posts keep their source parent. Structure ids stay
+    the same, so statute links are left in place.
+    """
+    managers_by_oc = load_approved_managers(department_managers_path())
+    dest_cursor.execute("""
+        SELECT SourceOcID, NodeKind, SourceID, DestOrganizationalStructureID
+        FROM master.dbo.OrgStructureMigrationMapping
+    """)
+    post_os = {}
+    dept_os = {}
+    node_kind = {}
+    for oc_id, kind, source_id, dest_id in dest_cursor.fetchall():
+        key = (int(oc_id), int(source_id))
+        dest_id = int(dest_id)
+        node_kind[dest_id] = kind
+        if kind == NODE_POST:
+            post_os[key] = dest_id
+        elif kind == NODE_DEPT:
+            dept_os[key] = dest_id
+
+    source_parents = pd.read_sql("""
+        SELECT TBL_PostID AS SourcePostID, TBL_PostParentID_fk AS SourceParentPostID
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+    """, source_cnxn)
+    source_parent_of = {}
+    for _, row in source_parents.iterrows():
+        parent_id = _positive_fk(row['SourceParentPostID'])
+        if parent_id:
+            source_parent_of[int(row['SourcePostID'])] = parent_id
+
+    dest_cursor.execute(
+        "SELECT OrganizationalStructureID, ParentRef FROM HCM3.OrganizationalStructure"
+    )
+    parent_of = {
+        int(os_id): (int(parent_ref) if parent_ref is not None else None)
+        for os_id, parent_ref in dest_cursor.fetchall()
+    }
+
+    def _set_parent(child_id, new_parent):
+        if parent_of.get(child_id) == new_parent:
+            return False
+        parent_of[child_id] = new_parent
+        dest_cursor.execute(
+            """
+            UPDATE HCM3.OrganizationalStructure
+            SET ParentRef = ?
+            WHERE OrganizationalStructureID = ?
+            """,
+            (new_parent, child_id),
+        )
+        return True
+
+    departments_hung = 0
+    departments_rooted = 0
+    managers_seated = 0
+    posts_restored = 0
+    skipped = 0
+
+    for oc_id, managers in managers_by_oc.items():
+        posts_on_chart = {
+            post_id: node
+            for (chart_id, post_id), node in post_os.items()
+            if chart_id == oc_id
+        }
+        parent_of_post = {}
+        for post_id in posts_on_chart:
+            source_parent = source_parent_of.get(post_id)
+            if source_parent in posts_on_chart:
+                parent_of_post[post_id] = source_parent
+
+        manager_dept_node = {}
+        for manager_post_id, source_dept in managers.items():
+            manager_node = posts_on_chart.get(manager_post_id)
+            department_node = dept_os.get((oc_id, source_dept))
+            if not manager_node or not department_node:
+                skipped += 1
+                continue
+            manager_dept_node[manager_post_id] = department_node
+
+        department_ids = set(manager_dept_node.values())
+        for post_id, node in posts_on_chart.items():
+            if post_id in manager_dept_node:
+                continue
+            if parent_of.get(node) not in department_ids:
+                continue
+            source_parent = parent_of_post.get(post_id)
+            restored = posts_on_chart.get(source_parent) if source_parent else None
+            if _set_parent(node, restored):
+                posts_restored += 1
+
+        for manager_post_id, department_node in manager_dept_node.items():
+            if _set_parent(posts_on_chart[manager_post_id], department_node):
+                managers_seated += 1
+
+        for department_node, ancestor in _department_parents_without_cycles(
+            manager_dept_node, parent_of_post
+        ).items():
+            if ancestor not in department_ids and ancestor is not None:
+                skipped += 1
+                continue
+            if not _set_parent(department_node, ancestor):
+                continue
+            if ancestor:
+                departments_hung += 1
+            else:
+                departments_rooted += 1
+
+    print(
+        f"  -> Departments hung on the parent department: {departments_hung}. "
+        f"Root departments: {departments_rooted}. "
+        f"Managers seated under their department: {managers_seated}. "
+        f"Posts restored from a department: {posts_restored}. "
+        f"Skipped: {skipped}."
+    )
+    return departments_hung, managers_seated
 
 
 def _ensure_unassigned_department(dest_cursor):
@@ -399,8 +552,8 @@ def run():
             if oc_parents_linked:
                 print(f"    -> Post parents linked: {oc_parents_linked}.")
 
-            # DepartmentRef from the reviewed manager list, then a department
-            # folder under each manager post.
+            # DepartmentRef from the reviewed manager list. The department
+            # node itself hangs on the parent manager's department.
             oc_managers = {
                 post_id: dept_id
                 for post_id, dept_id in managers_by_oc.get(oc_id, {}).items()
@@ -428,7 +581,7 @@ def run():
                 oc_from_manager += 1
                 posts_from_manager += 1
 
-            dept_os_by_manager = {}
+            manager_dept_node = {}
             for manager_post_id, source_dept in oc_managers.items():
                 structure_last_id += 1
                 dest_cursor.execute(
@@ -437,7 +590,7 @@ def run():
                         structure_last_id,
                         dept_map[source_dept],
                         None,
-                        post_local[manager_post_id],
+                        None,
                         insertion,
                         deletion,
                     ),
@@ -446,20 +599,14 @@ def run():
                     insert_map_sql,
                     (oc_id, NODE_DEPT, source_dept, structure_last_id),
                 )
-                dept_os_by_manager[manager_post_id] = structure_last_id
+                parent_of[structure_last_id] = None
+                manager_dept_node[manager_post_id] = structure_last_id
                 dept_nodes += 1
 
-            # Posts that reported to the manager and belong to his unit
-            # move under the department node. Deeper posts keep their
-            # post parent, so the chain stays inside that folder.
-            # A post that is itself a manager of another unit stays under
-            # the manager post, beside the folder.
-            moved_under_dept = 0
-            for source_post_id, source_dept in assigned.items():
-                parent_post = child_to_parent.get(source_post_id)
-                if parent_post not in dept_os_by_manager:
-                    continue
-                if oc_managers.get(parent_post) != source_dept:
+            for department_node, ancestor in _department_parents_without_cycles(
+                manager_dept_node, child_to_parent
+            ).items():
+                if not ancestor:
                     continue
                 dest_cursor.execute(
                     """
@@ -467,15 +614,27 @@ def run():
                     SET ParentRef = ?
                     WHERE OrganizationalStructureID = ?
                     """,
-                    (dept_os_by_manager[parent_post], post_local[source_post_id]),
+                    (ancestor, department_node),
                 )
-                moved_under_dept += 1
+                parent_of[department_node] = ancestor
+
+            for manager_post_id, department_node in manager_dept_node.items():
+                manager_os = post_local[manager_post_id]
+                dest_cursor.execute(
+                    """
+                    UPDATE HCM3.OrganizationalStructure
+                    SET ParentRef = ?
+                    WHERE OrganizationalStructureID = ?
+                    """,
+                    (department_node, manager_os),
+                )
+                parent_of[manager_os] = department_node
+
             no_dept_posts += len(unassigned_posts)
             if oc_managers:
                 print(
                     f"    -> Manager units: {len(oc_managers)} "
-                    f"department nodes, posts in those units: {oc_from_manager}, "
-                    f"moved directly under the department node: {moved_under_dept}."
+                    f"departments, posts in those units: {oc_from_manager}."
                 )
 
         dest_cursor.execute(

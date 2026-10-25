@@ -169,6 +169,21 @@ def _insurance_duration(insurance_raw, duration_raw):
     return _as_int_or_none(duration_raw)
 
 
+def _work_record_role(row):
+    """
+    سمت is the job title when the history row has a real job.
+    Job 0 is the dummy رشته های شغلی, so the free-text post name is used instead.
+    """
+    if _positive_fk(row.get('SourceJobID')):
+        role = clean_persian_text(row.get('JobName'))
+        if role:
+            return role[:200]
+    role = clean_persian_text(row.get('PostName'))
+    if role:
+        return role[:200]
+    return None
+
+
 def _resolve_org_fks(row, dept_map, post_map):
     source_dept_id = _positive_fk(row.get('SourceDepartmentID'))
     source_post_id = _positive_fk(row.get('SourcePostID'))
@@ -216,7 +231,9 @@ def run():
                 j.TBL_JobName AS JobName,
                 d.TBL_DegreeName AS DegreeName
             FROM dbo.HRS_EmploymentServiceHistory esh
-            LEFT JOIN dbo.TBL_Job j ON j.TBL_JobID = esh.TBL_JobID_fk
+            LEFT JOIN dbo.TBL_Job j
+                ON j.TBL_JobID = esh.TBL_JobID_fk
+               AND esh.TBL_JobID_fk > 0
             LEFT JOIN dbo.TBL_Degree d ON d.TBL_DegreeID = esh.TBL_DegreeID_fk
             WHERE esh.TBL_PersonnelID_fk IS NOT NULL
               AND esh.TBL_PersonnelID_fk > 0
@@ -338,6 +355,7 @@ def run():
             UPDATE HCM3.EmployeeWorkRecord
             SET WorkTypeCode = ?,
                 WorkRelationTypeCode = ?,
+                Role = ?,
                 Extra1Code = ?,
                 Extra2Code = ?,
                 InsuranceDuration = ?,
@@ -375,6 +393,7 @@ def run():
 
             source_job_id = _positive_fk(row.get('SourceJobID'))
             job_ref = job_map.get(source_job_id) if source_job_id else None
+            role = _work_record_role(row)
 
             if source_id in already_mapped:
                 dest_wr_id = already_mapped[source_id]
@@ -383,6 +402,7 @@ def run():
                     (
                         work_type_code,
                         work_relation_code,
+                        role,
                         extra1_code,
                         extra2_code,
                         insurance_duration,
@@ -402,12 +422,6 @@ def run():
                 org_name = DEFAULT_ORG_NAME
                 defaulted_org += 1
             org_name = org_name[:400]
-
-            role = clean_persian_text(row['JobName'])
-            if role is None:
-                role = clean_persian_text(row['PostName'])
-            if role is not None:
-                role = role[:200]
 
             start_date = _parse_shamsi_date(row['StartDate'])
             end_raw = row['EndDate']

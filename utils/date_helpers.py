@@ -27,6 +27,31 @@ def shamsi_to_gregorian(shamsi_str):
     return None
 
 
+def gregorian_to_shamsi_year_month(value):
+    """Gregorian date (datetime, date, or YYYY-MM-DD) to Shamsi YYYYMM. None if empty."""
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = datetime.strptime(text[:10], '%Y-%m-%d').date()
+        except ValueError:
+            return None
+    elif isinstance(value, datetime):
+        value = value.date()
+    elif hasattr(value, 'to_pydatetime'):
+        value = value.to_pydatetime().date()
+    try:
+        shamsi = jdatetime.date.fromgregorian(date=value)
+    except (TypeError, ValueError):
+        return None
+    return shamsi.year * 100 + shamsi.month
+
+
 def months_between(start_date_str, end_date_str):
     """Whole months between two Gregorian YYYY-MM-DD strings. Returns None if either is invalid."""
     if not start_date_str or not end_date_str:

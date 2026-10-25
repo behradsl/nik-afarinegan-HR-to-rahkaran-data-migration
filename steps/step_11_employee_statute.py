@@ -3,7 +3,9 @@ import pandas as pd
 import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
-from utils.date_helpers import shamsi_to_gregorian
+from utils.date_helpers import gregorian_to_shamsi_year_month, shamsi_to_gregorian
+from utils.hcm_extra_settings import ensure_hcm_extra_fields
+from utils.lookup_helpers import ensure_lookup_codes
 from utils.org_migration import (
     ensure_departments,
     ensure_employment_types,
@@ -23,7 +25,29 @@ OPEN_END_SHAMSI = '1499/12/29'
 # SYS3.Lookup EmployeeStatuteStatus: 1 ذخیره, 5 تایید کارگزینی, 10 تایید پرداخت
 STATUTE_STATUS_PAYMENT_CONFIRMED = 10
 
-# StatuteType required defaults (Rahkaran NOT NULL columns)
+# StatuteType required defaults (Rahkaran NOT NULL columns).
+# Migrated statutes copy IssueTimeCode and AfterIssueStatusCode from the type.
+# HRS_RdPersonalGrade 1-20 → Extra1 (lookup value is the number, caption رتبه).
+# HRS_RdJobGrade PayBase parent 68 → Rank (caption طبقه شغلی).
+# Plain numeric job grades and 0 stay empty.
+STATUTE_EXTRA1_LOOKUP = 'EmployeeStatuteExtra1'
+STATUTE_RANK_LOOKUP = 'Rank'
+STATUTE_RANK_VALUES = {
+    1: 'مقدماتی',
+    2: 'پایه',
+    3: 'ارشد',
+    4: 'خبره',
+    5: 'عالی',
+}
+STATUTE_EXTRA1_VALUES = {code: str(code) for code in range(1, 21)}
+JOB_CLASS_TO_RANK = {
+    680001: 1,
+    680002: 2,
+    680003: 3,
+    680004: 4,
+    680005: 5,
+}
+
 STATUTE_TYPE_DEFAULTS = {
     'IssueTimeCode': 1,
     'AfterIssueStatusCode': 1,
@@ -245,6 +269,192 @@ def _resolve_structure_ref(
     return structure_id
 
 
+def _job_class_rank(raw):
+    """Map طبقه شغلی onto Rank. Numeric grades, 0, and unknown ids stay empty."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    try:
+        source_id = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return JOB_CLASS_TO_RANK.get(source_id)
+
+
+def _personal_grade_extra1(raw):
+    """Map رتبه فرد 1-20 onto Extra1. Zero and anything outside 1-20 stay empty."""
+    code = _positive_fk(raw)
+    if code is None or code > 20:
+        return None
+    return code
+
+
+def _statute_grade_rows(source_cnxn, dest_cursor):
+    """Source grades joined to migrated statutes. The source database name is not fixed."""
+    grades = pd.read_sql(
+        """
+        SELECT
+            HRS_RdID AS SourceRuleDocumentID,
+            HRS_RdJobGrade AS JobGrade,
+            HRS_RdPersonalGrade AS PersonalGrade
+        FROM dbo.HRS_RuleDocument
+        WHERE HRS_RdID > 0
+        """,
+        source_cnxn,
+    )
+    grade_by_source = {
+        int(row.SourceRuleDocumentID): (
+            _job_class_rank(row.JobGrade),
+            _personal_grade_extra1(row.PersonalGrade),
+        )
+        for row in grades.itertuples(index=False)
+    }
+    dest_cursor.execute(
+        """
+        SELECT SourceRuleDocumentID, DestEmployeeStatuteID
+        FROM master.dbo.StatuteMigrationMapping
+        """
+    )
+    rows = []
+    for source_id, dest_id in dest_cursor.fetchall():
+        rank_code, extra1_code = grade_by_source.get(int(source_id), (None, None))
+        rows.append((int(dest_id), rank_code, extra1_code))
+    return rows
+
+
+def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_cursor):
+    """
+    On migrated statutes:
+    Rank is طبقه شغلی, Extra1 is the 1-20 personal grade,
+    issue/apply year-months come from the dates, confirm dates follow the
+    issue date, and issue-time / after-issue status are copied from the type.
+    Work records that were copied from a statute take the statute's new rank.
+    """
+    print("Ensuring Rank (طبقه شغلی) and Extra1 (رتبه 1-20)...")
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        STATUTE_RANK_LOOKUP,
+        STATUTE_RANK_VALUES,
+        overwrite_values=True,
+    )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        STATUTE_EXTRA1_LOOKUP,
+        STATUTE_EXTRA1_VALUES,
+        overwrite_values=True,
+    )
+    ensure_hcm_extra_fields(
+        dest_cursor, (STATUTE_RANK_LOOKUP, STATUTE_EXTRA1_LOOKUP)
+    )
+    grade_rows = _statute_grade_rows(source_cnxn, dest_cursor)
+    dest_cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#StatuteGrade') IS NOT NULL DROP TABLE #StatuteGrade
+        CREATE TABLE #StatuteGrade (
+            DestEmployeeStatuteID BIGINT NOT NULL PRIMARY KEY,
+            RankCode INT NULL,
+            Extra1Code INT NULL
+        )
+        """
+    )
+    if grade_rows:
+        dest_cursor.fast_executemany = True
+        dest_cursor.executemany(
+            """
+            INSERT INTO #StatuteGrade (DestEmployeeStatuteID, RankCode, Extra1Code)
+            VALUES (?, ?, ?)
+            """,
+            grade_rows,
+        )
+    dest_cursor.execute(
+        """
+        UPDATE s
+        SET s.RankCode = x.RankCode,
+            s.Extra1Code = x.Extra1Code,
+            s.LastModificationDate = GETDATE(),
+            s.LastModifier = 1
+        FROM HCM3.EmployeeStatute s
+        INNER JOIN #StatuteGrade x
+            ON x.DestEmployeeStatuteID = s.EmployeeStatuteID
+        WHERE ISNULL(s.RankCode, -1) <> ISNULL(x.RankCode, -1)
+           OR ISNULL(s.Extra1Code, -1) <> ISNULL(x.Extra1Code, -1)
+        """
+    )
+    print(f"  -> Statute Rank/Extra1 updated: {dest_cursor.rowcount}.")
+
+    dest_cursor.execute(
+        """
+        UPDATE wr
+        SET wr.RankCode = s.RankCode,
+            wr.LastModificationDate = GETDATE(),
+            wr.LastModifier = 1
+        FROM HCM3.EmployeeWorkRecord wr
+        INNER JOIN HCM3.EmployeeStatute s
+            ON s.EmployeeRef = wr.EmployeeRef
+           AND ISNULL(s.Number, N'') = ISNULL(wr.StatuteNumber, N'')
+           AND (
+                (s.ApplyDate IS NULL AND wr.StatuteApplyDate IS NULL)
+                OR CAST(s.ApplyDate AS date) = CAST(wr.StatuteApplyDate AS date)
+           )
+        INNER JOIN master.dbo.StatuteMigrationMapping m
+            ON m.DestEmployeeStatuteID = s.EmployeeStatuteID
+        WHERE ISNULL(wr.RankCode, -1) <> ISNULL(s.RankCode, -1)
+        """
+    )
+    print(f"  -> Work-record Rank aligned to statute طبقه شغلی: {dest_cursor.rowcount}.")
+
+    print("Copying statute-type codes and filling statute year-months...")
+    dest_cursor.execute(
+        """
+        SELECT
+            s.EmployeeStatuteID,
+            s.IssueDate,
+            s.ApplyDate,
+            t.IssueTimeCode,
+            t.AfterIssueStatusCode
+        FROM HCM3.EmployeeStatute s
+        INNER JOIN master.dbo.StatuteMigrationMapping m
+            ON m.DestEmployeeStatuteID = s.EmployeeStatuteID
+        LEFT JOIN HCM3.StatuteType t ON t.StatuteTypeID = s.StatuteTypeRef
+        """
+    )
+    pending = []
+    for statute_id, issue_date, apply_date, issue_time, after_status in dest_cursor.fetchall():
+        issue_ym = gregorian_to_shamsi_year_month(issue_date)
+        pending.append(
+            (
+                int(issue_time) if issue_time is not None else None,
+                int(after_status) if after_status is not None else None,
+                issue_ym,
+                gregorian_to_shamsi_year_month(apply_date),
+                issue_date,
+                issue_ym,
+                issue_date,
+                int(statute_id),
+            )
+        )
+    if pending:
+        dest_cursor.fast_executemany = True
+        dest_cursor.executemany(
+            """
+            UPDATE HCM3.EmployeeStatute
+            SET IssueTimeCode = ?,
+                AfterIssueStatusCode = ?,
+                IssueYearMonth = ?,
+                ApplyYearMonth = ?,
+                ConfirmDate = ?,
+                ConfirmYearMonth = ?,
+                PaymentConfirmDate = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE EmployeeStatuteID = ?
+            """,
+            pending,
+        )
+    print(f"  -> Statute codes and dates updated: {len(pending)}.")
+
+
 def _fill_employment_date_and_payment_status(dest_cursor):
     """
     EmploymentDate on every statute is that employee's first statute date:
@@ -310,6 +520,20 @@ def run():
 
         print("Ensuring Statute Types from RuleType...")
         statute_type_map = ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor)
+        type_code_df = pd.read_sql(
+            """
+            SELECT StatuteTypeID, IssueTimeCode, AfterIssueStatusCode
+            FROM HCM3.StatuteType
+            """,
+            dest_cnxn,
+        )
+        type_codes = {
+            int(r['StatuteTypeID']): (
+                int(r['IssueTimeCode']) if pd.notna(r['IssueTimeCode']) else None,
+                int(r['AfterIssueStatusCode']) if pd.notna(r['AfterIssueStatusCode']) else None,
+            )
+            for _, r in type_code_df.iterrows()
+        }
 
         print("Loading org-structure mappings...")
         struct_map_df = pd.read_sql("""
@@ -366,6 +590,7 @@ def run():
                 rd.HRS_RdEndDate AS EndDate,
                 rd.HRS_RdContractEndDate AS ContractEndDate,
                 rd.HRS_RdPersonalGrade AS PersonalGrade,
+                rd.HRS_RdJobGrade AS JobGrade,
                 rd.HRS_RdNote AS Note,
                 rd.HRS_RdTitle AS Title,
                 rd.HRS_RdSummaryJob AS SummaryJob,
@@ -411,10 +636,14 @@ def run():
                 EmployeeStatuteID, EmployeeRef, EmploymentTypeRef, StatuteTypeRef,
                 Number, IssueDate, ApplyDate, ExpiryDate,
                 OrganizationalStructureRef, PostRef, DepartmentRef, JobRef,
-                WorkLocationCode, RankCode, Description, Status,
+                WorkLocationCode, RankCode, Description, Status, Extra1Code,
+                IssueTimeCode, AfterIssueStatusCode,
+                IssueYearMonth, ApplyYearMonth,
+                ConfirmDate, ConfirmYearMonth, PaymentConfirmDate,
                 CreationDate, Creator, LastModificationDate, LastModifier
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
                 GETDATE(), 1, GETDATE(), 1
             )
         """
@@ -468,7 +697,13 @@ def run():
                     row['ContractEndDate'], treat_open_end_as_null=True
                 )
 
-            rank_code = _positive_fk(row['PersonalGrade'])
+            rank_code = _job_class_rank(row['JobGrade'])
+            extra1_code = _personal_grade_extra1(row['PersonalGrade'])
+            issue_ym = gregorian_to_shamsi_year_month(issue_date)
+            apply_ym = gregorian_to_shamsi_year_month(apply_date)
+            issue_time_code, after_issue_status = type_codes.get(
+                statute_type_ref, (None, None)
+            )
 
             if source_rd_id in already:
                 dest_statute_id = already[source_rd_id]
@@ -545,6 +780,14 @@ def run():
                     rank_code,
                     description,
                     STATUTE_STATUS_PAYMENT_CONFIRMED,
+                    extra1_code,
+                    issue_time_code,
+                    after_issue_status,
+                    issue_ym,
+                    apply_ym,
+                    issue_date,
+                    issue_ym,
+                    issue_date,
                 ),
             )
             dest_cursor.execute(insert_mapping_sql, (source_rd_id, statute_last_id))
@@ -555,6 +798,7 @@ def run():
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeStatute'",
             (statute_last_id,),
         )
+        _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_cursor)
         _fill_employment_date_and_payment_status(dest_cursor)
 
         dest_cnxn.commit()

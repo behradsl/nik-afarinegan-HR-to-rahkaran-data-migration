@@ -264,6 +264,16 @@ HCM_EXTRA_FIELD_SPECS = {
         'title_path': r'systemgroup.hcm.staff\EducationExtra1Title',
         'show_path': r'systemgroup.hcm.staff\ShowEducationExtra1',
     },
+    'EmployeeStatuteExtra1': {
+        'title': 'رتبه',
+        'title_path': r'systemgroup.hcm.staff\EmpStatuteExtra1Title',
+        'show_path': r'systemgroup.hcm.staff\ShowExtra1InEmpStatute',
+    },
+    'Rank': {
+        'title': 'طبقه شغلی',
+        'title_path': r'systemgroup.hcm.staff\EmpStatuteRankTitle',
+        'show_path': r'systemgroup.hcm.staff\ShowRankInEmpStatute',
+    },
     # No Show/Title config groups for relatives Extra — LookupInfo title only
     'EmployeeRelativeExtra1': {
         'title': 'علت ایجاد تحت تکفل',

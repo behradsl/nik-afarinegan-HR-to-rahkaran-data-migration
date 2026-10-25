@@ -1815,8 +1815,8 @@ def ensure_places_as_work_locations(source_cnxn, dest_cnxn, dest_cursor):
 
 def ensure_rank_codes_from_grades(dest_cnxn, dest_cursor, grade_values):
     """
-    Ensure Rank lookup codes for personal grades (code = grade, value = رتبه {n}).
-    Returns set of ensured codes.
+    Personal grades 1-20 are EmployeeStatute Extra1.
+    The lookup value is the number alone, without the word رتبه.
     """
     code_to_value = {}
     for g in grade_values:
@@ -1824,9 +1824,15 @@ def ensure_rank_codes_from_grades(dest_cnxn, dest_cursor, grade_values):
             code = int(g)
         except (TypeError, ValueError):
             continue
-        if code <= 0:
+        if code <= 0 or code > 20:
             continue
-        code_to_value[code] = f'رتبه {code}'
+        code_to_value[code] = str(code)
     if not code_to_value:
         return {}
-    return ensure_lookup_codes(dest_cnxn, dest_cursor, 'Rank', code_to_value)
+    return ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        'EmployeeStatuteExtra1',
+        code_to_value,
+        overwrite_values=True,
+    )
