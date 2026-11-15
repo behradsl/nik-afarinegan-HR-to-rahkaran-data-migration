@@ -1,5 +1,6 @@
 """Step 11: Migrate HRS_RuleDocument → HCM3.EmployeeStatute."""
 import pandas as pd
+import pyodbc
 import warnings
 from db_core import get_connections
 from utils.data_helpers import clean_persian_text, normalize_persian
@@ -27,10 +28,17 @@ STATUTE_STATUS_PAYMENT_CONFIRMED = 10
 
 # StatuteType required defaults (Rahkaran NOT NULL columns).
 # Migrated statutes copy IssueTimeCode and AfterIssueStatusCode from the type.
-# HRS_RdPersonalGrade 1-20 → Extra1 (lookup value is the number, caption رتبه).
-# HRS_RdJobGrade PayBase parent 68 → Rank (caption طبقه شغلی).
-# Plain numeric job grades and 0 stay empty.
+# HRS_RdPersonalGrade 1-20 → Extra1, caption رتبه. Same list on both screens.
+# HRS_RdAbetGrade 1-5 is one column. The جاری screen calls it گروه تشویقی
+# (Extra2) and the خدمات کشوری screen calls it طبقه تشویقی (Extra4).
+# Which screen a row belongs to follows HRS_RdJobGrade: a plain 1-20 is جاری,
+# a PayBase parent-68 class is خدمات کشوری.
+# HRS_RdJobGrade plain numbers 1-20 → Extra3, caption گروه استحقاقی.
+# PayBase parent 68 → Rank, caption طبقه شغلی: مقدماتی..عالی.
 STATUTE_EXTRA1_LOOKUP = 'EmployeeStatuteExtra1'
+STATUTE_EXTRA2_LOOKUP = 'EmployeeStatuteExtra2'
+STATUTE_EXTRA3_LOOKUP = 'EmployeeStatuteExtra3'
+STATUTE_EXTRA4_LOOKUP = 'EmployeeStatuteExtra4'
 STATUTE_RANK_LOOKUP = 'Rank'
 STATUTE_RANK_VALUES = {
     1: 'مقدماتی',
@@ -40,6 +48,9 @@ STATUTE_RANK_VALUES = {
     5: 'عالی',
 }
 STATUTE_EXTRA1_VALUES = {code: str(code) for code in range(1, 21)}
+STATUTE_EXTRA2_VALUES = {code: str(code) for code in range(1, 6)}
+STATUTE_EXTRA3_VALUES = {code: str(code) for code in range(1, 21)}
+STATUTE_EXTRA4_VALUES = {code: str(code) for code in range(1, 6)}
 JOB_CLASS_TO_RANK = {
     680001: 1,
     680002: 2,
@@ -49,13 +60,23 @@ JOB_CLASS_TO_RANK = {
 }
 
 STATUTE_TYPE_DEFAULTS = {
-    'IssueTimeCode': 1,
+    'IssueTimeCode': 1,               # در حین استخدام
     'AfterIssueStatusCode': 1,
-    'PostSelectionTypeCode': 2,       # انتخاب از فهرست پستها
+    'PostSelectionTypeCode': 1,       # انتخاب از ساختار
     'TempPostSelectionTypeCode': 1,
     'Status': 1,
     'RelatedStatuteTypeCode': 1,
 }
+# The app treats IssueTimeCode 2 (در شروع استخدام) as the employment statute.
+# Each employee's earliest statute uses this type so later statutes can
+# inherit employment date and the other parameters from it.
+START_EMPLOYMENT_STATUTE_TITLE = 'شروع استخدام استقرار سیستم'
+START_EMPLOYMENT_ISSUE_TIME = 2
+# StatuteTypeParameter rows the app wrote for the sample employment type.
+# SetMethodCode 2 is مقدار حکم قبلی. TypeCode 2 is the only one not required.
+STATUTE_TYPE_PARAMETER_ROWS = tuple(
+    (type_code, True, 2, type_code != 2) for type_code in range(1, 14)
+)
 
 
 def _parse_shamsi_date(raw, *, treat_open_end_as_null=False):
@@ -114,7 +135,8 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
             HRS_RtID AS SourceRuleTypeID,
             HRS_RtRuleName AS RuleName,
             HRS_RtSystemCode AS RuleCode,
-            HRS_RtActive AS RuleActive
+            HRS_RtActive AS RuleActive,
+            HRS_RtDescription AS RuleDescription
         FROM dbo.HRS_RuleType
         WHERE HRS_RtID > 0
     """, source_cnxn)
@@ -153,8 +175,9 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
             StatuteTypeID, Code, Title,
             IssueTimeCode, AfterIssueStatusCode, PostSelectionTypeCode,
             TempPostSelectionTypeCode, Status, RelatedStatuteTypeCode,
+            DefaultDescription,
             CreationDate, Creator, LastModificationDate, LastModifier
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
     """
     insert_mapping_sql = """
         INSERT INTO master.dbo.StatuteTypeMigrationMapping (
@@ -217,6 +240,7 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
                 STATUTE_TYPE_DEFAULTS['TempPostSelectionTypeCode'],
                 STATUTE_TYPE_DEFAULTS['Status'],
                 STATUTE_TYPE_DEFAULTS['RelatedStatuteTypeCode'],
+                clean_persian_text(row['RuleDescription']),
             ),
         )
         dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
@@ -234,6 +258,332 @@ def ensure_statute_types(source_cnxn, dest_cnxn, dest_cursor):
         f"titles uniquified: {uniquified}. Total mapped: {len(result)}."
     )
     return result
+
+
+def _statute_type_descriptions(source_cnxn, dest_cnxn):
+    """Longest source description for each migrated statute type."""
+    source_df = pd.read_sql(
+        """
+        SELECT HRS_RtID AS SourceRuleTypeID, HRS_RtDescription AS RuleDescription
+        FROM dbo.HRS_RuleType
+        WHERE HRS_RtID > 0
+        """,
+        source_cnxn,
+    )
+    mapping_df = pd.read_sql(
+        """
+        SELECT SourceRuleTypeID, DestStatuteTypeID
+        FROM master.dbo.StatuteTypeMigrationMapping
+        """,
+        dest_cnxn,
+    )
+    if source_df.empty or mapping_df.empty:
+        return []
+    merged = mapping_df.merge(source_df, on='SourceRuleTypeID', how='inner')
+    merged['Description'] = merged['RuleDescription'].map(clean_persian_text)
+    merged = merged[merged['Description'].notna()].copy()
+    if merged.empty:
+        return []
+    merged['DescriptionLength'] = merged['Description'].str.len()
+    best = (
+        merged.sort_values(
+            ['DescriptionLength', 'SourceRuleTypeID'],
+            ascending=[False, True],
+        )
+        .drop_duplicates('DestStatuteTypeID', keep='first')
+    )
+    return [
+        (str(row.Description), int(row.DestStatuteTypeID))
+        for row in best.itertuples(index=False)
+    ]
+
+
+def _ensure_start_employment_statute_type(dest_cursor):
+    """The employment statute type. Issue time is در شروع استخدام."""
+    dest_cursor.execute(
+        "SELECT StatuteTypeID FROM HCM3.StatuteType WHERE Title = ?",
+        (START_EMPLOYMENT_STATUTE_TITLE,),
+    )
+    row = dest_cursor.fetchone()
+    if row:
+        statute_type_id = int(row[0])
+        dest_cursor.execute(
+            """
+            UPDATE HCM3.StatuteType
+            SET IssueTimeCode = ?,
+                AfterIssueStatusCode = ?,
+                PostSelectionTypeCode = ?,
+                TempPostSelectionTypeCode = ?,
+                Status = ?,
+                RelatedStatuteTypeCode = ?,
+                LastModificationDate = GETDATE(),
+                LastModifier = 1
+            WHERE StatuteTypeID = ?
+              AND (
+                IssueTimeCode <> ?
+                OR PostSelectionTypeCode <> ?
+                OR AfterIssueStatusCode <> ?
+                OR TempPostSelectionTypeCode <> ?
+                OR Status <> ?
+                OR RelatedStatuteTypeCode <> ?
+              )
+            """,
+            (
+                START_EMPLOYMENT_ISSUE_TIME,
+                STATUTE_TYPE_DEFAULTS['AfterIssueStatusCode'],
+                STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
+                STATUTE_TYPE_DEFAULTS['TempPostSelectionTypeCode'],
+                STATUTE_TYPE_DEFAULTS['Status'],
+                STATUTE_TYPE_DEFAULTS['RelatedStatuteTypeCode'],
+                statute_type_id,
+                START_EMPLOYMENT_ISSUE_TIME,
+                STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
+                STATUTE_TYPE_DEFAULTS['AfterIssueStatusCode'],
+                STATUTE_TYPE_DEFAULTS['TempPostSelectionTypeCode'],
+                STATUTE_TYPE_DEFAULTS['Status'],
+                STATUTE_TYPE_DEFAULTS['RelatedStatuteTypeCode'],
+            ),
+        )
+        return statute_type_id
+
+    last_id = ensure_table_id(dest_cursor, 'HCM3.StatuteType', 0) + 1
+    dest_cursor.execute(
+        """
+        INSERT INTO HCM3.StatuteType (
+            StatuteTypeID, Code, Title,
+            IssueTimeCode, AfterIssueStatusCode, PostSelectionTypeCode,
+            TempPostSelectionTypeCode, Status, RelatedStatuteTypeCode,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+        """,
+        (
+            last_id,
+            START_EMPLOYMENT_STATUTE_TITLE,
+            START_EMPLOYMENT_ISSUE_TIME,
+            STATUTE_TYPE_DEFAULTS['AfterIssueStatusCode'],
+            STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
+            STATUTE_TYPE_DEFAULTS['TempPostSelectionTypeCode'],
+            STATUTE_TYPE_DEFAULTS['Status'],
+            STATUTE_TYPE_DEFAULTS['RelatedStatuteTypeCode'],
+        ),
+    )
+    dest_cursor.execute(
+        "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.StatuteType'",
+        (last_id,),
+    )
+    return last_id
+
+
+def _ensure_statute_type_parameters(dest_cursor):
+    """Copy the sample parameter pattern onto every statute type that lacks it."""
+    last_id = ensure_table_id(dest_cursor, 'HCM3.StatuteTypeParameter', 0)
+    dest_cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#StatuteTypeParameterSeed') IS NOT NULL
+            DROP TABLE #StatuteTypeParameterSeed
+        CREATE TABLE #StatuteTypeParameterSeed (
+            TypeCode INT NOT NULL PRIMARY KEY,
+            Editable BIT NOT NULL,
+            SetMethodCode INT NOT NULL,
+            Required BIT NOT NULL
+        )
+        """
+    )
+    dest_cursor.fast_executemany = True
+    dest_cursor.executemany(
+        """
+        INSERT INTO #StatuteTypeParameterSeed
+            (TypeCode, Editable, SetMethodCode, Required)
+        VALUES (?, ?, ?, ?)
+        """,
+        list(STATUTE_TYPE_PARAMETER_ROWS),
+    )
+    dest_cursor.execute(
+        """
+        SET NOCOUNT ON;
+        DECLARE @base BIGINT = ?;
+        INSERT INTO HCM3.StatuteTypeParameter (
+            StatuteTypeParameterID, StatuteTypeRef, TypeCode,
+            Editable, SetMethodCode, Required,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        )
+        SELECT
+            @base + ROW_NUMBER() OVER (ORDER BY t.StatuteTypeID, p.TypeCode),
+            t.StatuteTypeID,
+            p.TypeCode,
+            p.Editable,
+            p.SetMethodCode,
+            p.Required,
+            GETDATE(), 1, GETDATE(), 1
+        FROM HCM3.StatuteType t
+        CROSS JOIN #StatuteTypeParameterSeed p
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM HCM3.StatuteTypeParameter existing
+            WHERE existing.StatuteTypeRef = t.StatuteTypeID
+              AND existing.TypeCode = p.TypeCode
+        );
+        DECLARE @inserted INT = @@ROWCOUNT;
+        UPDATE SYS3.tableIdGen
+        SET LastId = @base + @inserted
+        WHERE TableName = 'HCM3.StatuteTypeParameter';
+        SELECT @inserted;
+        """,
+        (last_id,),
+    )
+    inserted = int(dest_cursor.fetchone()[0])
+    print(f"  -> Statute type parameters inserted: {inserted}.")
+
+
+def _ensure_statute_type_factors(dest_cursor):
+    """
+    One editable StatuteTypeFactor for every employment type and factor that
+    has a property. That is the set the sample employment type holds.
+    """
+    last_id = ensure_table_id(dest_cursor, 'HCM3.StatuteTypeFactor', 0)
+    dest_cursor.execute(
+        """
+        SET NOCOUNT ON;
+        DECLARE @base BIGINT = ?;
+        INSERT INTO HCM3.StatuteTypeFactor (
+            StatuteTypeFactorID, StatuteTypeRef, EmploymentTypeRef,
+            StatuteFactorRef, Editable,
+            CreationDate, Creator, LastModificationDate, LastModifier
+        )
+        SELECT
+            @base + ROW_NUMBER() OVER (
+                ORDER BY t.StatuteTypeID, pair.EmploymentTypeRef, pair.StatuteFactorRef
+            ),
+            t.StatuteTypeID,
+            pair.EmploymentTypeRef,
+            pair.StatuteFactorRef,
+            1,
+            GETDATE(), 1, GETDATE(), 1
+        FROM HCM3.StatuteType t
+        CROSS JOIN (
+            SELECT DISTINCT EmploymentTypeRef, StatuteFactorRef
+            FROM HCM3.StatuteFactorProperty
+            WHERE EmploymentTypeRef IS NOT NULL
+              AND StatuteFactorRef IS NOT NULL
+        ) pair
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM HCM3.StatuteTypeFactor existing
+            WHERE existing.StatuteTypeRef = t.StatuteTypeID
+              AND existing.EmploymentTypeRef = pair.EmploymentTypeRef
+              AND existing.StatuteFactorRef = pair.StatuteFactorRef
+        );
+        DECLARE @inserted INT = @@ROWCOUNT;
+        UPDATE SYS3.tableIdGen
+        SET LastId = @base + @inserted
+        WHERE TableName = 'HCM3.StatuteTypeFactor';
+        SELECT @inserted;
+        """,
+        (last_id,),
+    )
+    inserted = int(dest_cursor.fetchone()[0])
+    print(f"  -> Statute type factors inserted: {inserted}.")
+
+
+def _assign_start_statute_type(dest_cursor, start_type_id):
+    """Point each employee's earliest migrated statute at the employment type."""
+    dest_cursor.execute(
+        """
+        UPDATE s
+        SET s.StatuteTypeRef = ?,
+            s.IssueTimeCode = ?,
+            s.LastModificationDate = GETDATE(),
+            s.LastModifier = 1
+        FROM HCM3.EmployeeStatute s
+        INNER JOIN (
+            SELECT EmployeeStatuteID
+            FROM (
+                SELECT
+                    es.EmployeeStatuteID,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY es.EmployeeRef
+                        ORDER BY
+                            CASE WHEN es.ApplyDate IS NULL THEN 1 ELSE 0 END,
+                            es.ApplyDate,
+                            es.IssueDate,
+                            es.EmployeeStatuteID
+                    ) AS rn
+                FROM HCM3.EmployeeStatute es
+                INNER JOIN master.dbo.StatuteMigrationMapping m
+                    ON m.DestEmployeeStatuteID = es.EmployeeStatuteID
+            ) ranked
+            WHERE ranked.rn = 1
+        ) first_statute ON first_statute.EmployeeStatuteID = s.EmployeeStatuteID
+        WHERE ISNULL(s.StatuteTypeRef, -1) <> ?
+           OR ISNULL(s.IssueTimeCode, -1) <> ?
+        """,
+        (
+            start_type_id,
+            START_EMPLOYMENT_ISSUE_TIME,
+            start_type_id,
+            START_EMPLOYMENT_ISSUE_TIME,
+        ),
+    )
+    print(f"  -> Earliest statutes set to the employment type: {dest_cursor.rowcount}.")
+
+
+def ensure_statute_type_profile(source_cnxn, dest_cnxn, dest_cursor):
+    """
+    Descriptions, post selection, parameters, and factor rows on statute types.
+    The earliest statute of each employee becomes the employment statute type.
+    """
+    print("Updating statute type descriptions and post selection...")
+    descriptions = _statute_type_descriptions(source_cnxn, dest_cnxn)
+    dest_cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#StatuteTypeDescription') IS NOT NULL
+            DROP TABLE #StatuteTypeDescription
+        CREATE TABLE #StatuteTypeDescription (
+            DestStatuteTypeID BIGINT NOT NULL PRIMARY KEY,
+            Description NVARCHAR(MAX) NULL
+        )
+        """
+    )
+    if descriptions:
+        dest_cursor.fast_executemany = False
+        dest_cursor.setinputsizes([(pyodbc.SQL_WVARCHAR, 4000, 0), None])
+        dest_cursor.executemany(
+            """
+            INSERT INTO #StatuteTypeDescription (Description, DestStatuteTypeID)
+            VALUES (?, ?)
+            """,
+            descriptions,
+        )
+    dest_cursor.execute(
+        """
+        UPDATE t
+        SET t.PostSelectionTypeCode = ?,
+            t.DefaultDescription = d.Description,
+            t.LastModificationDate = GETDATE(),
+            t.LastModifier = 1
+        FROM HCM3.StatuteType t
+        INNER JOIN (
+            SELECT DISTINCT DestStatuteTypeID
+            FROM master.dbo.StatuteTypeMigrationMapping
+        ) mapped ON mapped.DestStatuteTypeID = t.StatuteTypeID
+        LEFT JOIN #StatuteTypeDescription d
+            ON d.DestStatuteTypeID = t.StatuteTypeID
+        WHERE t.PostSelectionTypeCode <> ?
+           OR ISNULL(t.DefaultDescription, N'') COLLATE DATABASE_DEFAULT
+              <> ISNULL(d.Description, N'') COLLATE DATABASE_DEFAULT
+        """,
+        (
+            STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
+            STATUTE_TYPE_DEFAULTS['PostSelectionTypeCode'],
+        ),
+    )
+    print(f"  -> Statute types updated: {dest_cursor.rowcount}.")
+
+    start_type_id = _ensure_start_employment_statute_type(dest_cursor)
+    print(f"  -> Employment statute type: {start_type_id}.")
+    _ensure_statute_type_parameters(dest_cursor)
+    _ensure_statute_type_factors(dest_cursor)
+    _assign_start_statute_type(dest_cursor, start_type_id)
 
 
 def _resolve_structure_ref(
@@ -270,7 +620,7 @@ def _resolve_structure_ref(
 
 
 def _job_class_rank(raw):
-    """Map طبقه شغلی onto Rank. Numeric grades, 0, and unknown ids stay empty."""
+    """Map خدمات کشوری classes onto Rank (طبقه شغلی). Other values stay empty."""
     if raw is None or (isinstance(raw, float) and pd.isna(raw)):
         return None
     try:
@@ -280,12 +630,44 @@ def _job_class_rank(raw):
     return JOB_CLASS_TO_RANK.get(source_id)
 
 
-def _personal_grade_extra1(raw):
-    """Map رتبه فرد 1-20 onto Extra1. Zero and anything outside 1-20 stay empty."""
+def _entitlement_group_extra3(raw):
+    """Map جاری گروه استحقاقی numbers onto Extra3. Class ids stay empty."""
     code = _positive_fk(raw)
     if code is None or code > 20:
         return None
     return code
+
+
+def _encouragement_code(raw):
+    """HRS_RdAbetGrade 1-5. Zero and anything outside 1-5 stay empty."""
+    code = _positive_fk(raw)
+    if code is None or code > 5:
+        return None
+    return code
+
+
+def _personal_grade_extra1(raw):
+    """Map رتبه 1-20 onto Extra1. Zero and anything outside 1-20 stay empty."""
+    code = _positive_fk(raw)
+    if code is None or code > 20:
+        return None
+    return code
+
+
+def _screen_encouragement(job_grade, abet_grade):
+    """
+    Same stored number, two screen captions.
+    A plain job-grade number is the جاری screen (گروه تشویقی → Extra2).
+    A class id is the خدمات کشوری screen (طبقه تشویقی → Extra4).
+    """
+    code = _encouragement_code(abet_grade)
+    if code is None:
+        return None, None
+    if _entitlement_group_extra3(job_grade) is not None:
+        return code, None
+    if _job_class_rank(job_grade) is not None:
+        return None, code
+    return None, None
 
 
 def _statute_grade_rows(source_cnxn, dest_cursor):
@@ -295,19 +677,25 @@ def _statute_grade_rows(source_cnxn, dest_cursor):
         SELECT
             HRS_RdID AS SourceRuleDocumentID,
             HRS_RdJobGrade AS JobGrade,
-            HRS_RdPersonalGrade AS PersonalGrade
+            HRS_RdPersonalGrade AS PersonalGrade,
+            HRS_RdAbetGrade AS AbetGrade
         FROM dbo.HRS_RuleDocument
         WHERE HRS_RdID > 0
         """,
         source_cnxn,
     )
-    grade_by_source = {
-        int(row.SourceRuleDocumentID): (
+    grade_by_source = {}
+    for row in grades.itertuples(index=False):
+        group_encouragement, class_encouragement = _screen_encouragement(
+            row.JobGrade, row.AbetGrade
+        )
+        grade_by_source[int(row.SourceRuleDocumentID)] = (
             _job_class_rank(row.JobGrade),
             _personal_grade_extra1(row.PersonalGrade),
+            group_encouragement,
+            _entitlement_group_extra3(row.JobGrade),
+            class_encouragement,
         )
-        for row in grades.itertuples(index=False)
-    }
     dest_cursor.execute(
         """
         SELECT SourceRuleDocumentID, DestEmployeeStatuteID
@@ -316,20 +704,26 @@ def _statute_grade_rows(source_cnxn, dest_cursor):
     )
     rows = []
     for source_id, dest_id in dest_cursor.fetchall():
-        rank_code, extra1_code = grade_by_source.get(int(source_id), (None, None))
-        rows.append((int(dest_id), rank_code, extra1_code))
+        rank_code, extra1_code, extra2_code, extra3_code, extra4_code = (
+            grade_by_source.get(int(source_id), (None, None, None, None, None))
+        )
+        rows.append((
+            int(dest_id), rank_code, extra1_code, extra2_code, extra3_code,
+            extra4_code,
+        ))
     return rows
 
 
 def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_cursor):
     """
     On migrated statutes:
-    Rank is طبقه شغلی, Extra1 is the 1-20 personal grade,
+    Extra1 is رتبه (1-20). Extra2 is گروه تشویقی. Extra3 is گروه استحقاقی.
+    Extra4 is طبقه تشویقی. Rank stays the five طبقه شغلی classes.
     issue/apply year-months come from the dates, confirm dates follow the
     issue date, and issue-time / after-issue status are copied from the type.
     Work records that were copied from a statute take the statute's new rank.
     """
-    print("Ensuring Rank (طبقه شغلی) and Extra1 (رتبه 1-20)...")
+    print("Ensuring Extra1 (رتبه), Extra2 (گروه تشویقی), Extra3 (گروه استحقاقی), Extra4 (طبقه تشویقی)...")
     ensure_lookup_codes(
         dest_cnxn,
         dest_cursor,
@@ -344,8 +738,36 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
         STATUTE_EXTRA1_VALUES,
         overwrite_values=True,
     )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        STATUTE_EXTRA2_LOOKUP,
+        STATUTE_EXTRA2_VALUES,
+        overwrite_values=True,
+    )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        STATUTE_EXTRA3_LOOKUP,
+        STATUTE_EXTRA3_VALUES,
+        overwrite_values=True,
+    )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        STATUTE_EXTRA4_LOOKUP,
+        STATUTE_EXTRA4_VALUES,
+        overwrite_values=True,
+    )
     ensure_hcm_extra_fields(
-        dest_cursor, (STATUTE_RANK_LOOKUP, STATUTE_EXTRA1_LOOKUP)
+        dest_cursor,
+        (
+            STATUTE_RANK_LOOKUP,
+            STATUTE_EXTRA1_LOOKUP,
+            STATUTE_EXTRA2_LOOKUP,
+            STATUTE_EXTRA3_LOOKUP,
+            STATUTE_EXTRA4_LOOKUP,
+        ),
     )
     grade_rows = _statute_grade_rows(source_cnxn, dest_cursor)
     dest_cursor.execute(
@@ -354,7 +776,10 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
         CREATE TABLE #StatuteGrade (
             DestEmployeeStatuteID BIGINT NOT NULL PRIMARY KEY,
             RankCode INT NULL,
-            Extra1Code INT NULL
+            Extra1Code INT NULL,
+            Extra2Code INT NULL,
+            Extra3Code INT NULL,
+            Extra4Code INT NULL
         )
         """
     )
@@ -362,8 +787,10 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
         dest_cursor.fast_executemany = True
         dest_cursor.executemany(
             """
-            INSERT INTO #StatuteGrade (DestEmployeeStatuteID, RankCode, Extra1Code)
-            VALUES (?, ?, ?)
+            INSERT INTO #StatuteGrade (
+                DestEmployeeStatuteID, RankCode, Extra1Code, Extra2Code,
+                Extra3Code, Extra4Code
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             grade_rows,
         )
@@ -372,6 +799,9 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
         UPDATE s
         SET s.RankCode = x.RankCode,
             s.Extra1Code = x.Extra1Code,
+            s.Extra2Code = x.Extra2Code,
+            s.Extra3Code = x.Extra3Code,
+            s.Extra4Code = x.Extra4Code,
             s.LastModificationDate = GETDATE(),
             s.LastModifier = 1
         FROM HCM3.EmployeeStatute s
@@ -379,9 +809,12 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
             ON x.DestEmployeeStatuteID = s.EmployeeStatuteID
         WHERE ISNULL(s.RankCode, -1) <> ISNULL(x.RankCode, -1)
            OR ISNULL(s.Extra1Code, -1) <> ISNULL(x.Extra1Code, -1)
+           OR ISNULL(s.Extra2Code, -1) <> ISNULL(x.Extra2Code, -1)
+           OR ISNULL(s.Extra3Code, -1) <> ISNULL(x.Extra3Code, -1)
+           OR ISNULL(s.Extra4Code, -1) <> ISNULL(x.Extra4Code, -1)
         """
     )
-    print(f"  -> Statute Rank/Extra1 updated: {dest_cursor.rowcount}.")
+    print(f"  -> Statute extras updated: {dest_cursor.rowcount}.")
 
     dest_cursor.execute(
         """
@@ -455,16 +888,65 @@ def _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_
     print(f"  -> Statute codes and dates updated: {len(pending)}.")
 
 
-def _fill_employment_date_and_payment_status(dest_cursor):
+def _fill_employment_date_and_payment_status(source_cnxn, dest_cnxn, dest_cursor):
     """
-    EmploymentDate on every statute is that employee's first statute date:
+    EmploymentDate on every statute is TBL_PersonnelEmployeDate when that
+    Shamsi date parses. Otherwise it is the employee's first statute date:
     the earliest ApplyDate, or the earliest IssueDate when no apply date exists.
     Status is تایید پرداخت.
     """
+    source_df = pd.read_sql(
+        """
+        SELECT
+            TBL_PersonnelID AS SourceID,
+            TBL_PersonnelEmployeDate AS EmployDate
+        FROM dbo.TBL_Personnel
+        """,
+        source_cnxn,
+    )
+    employ_dates = {}
+    for row in source_df.itertuples(index=False):
+        parsed = shamsi_to_gregorian(row.EmployDate)
+        if parsed:
+            employ_dates[int(row.SourceID)] = parsed
+
+    emp_df = pd.read_sql(
+        "SELECT EmployeeID, Code FROM HCM3.Employee",
+        dest_cnxn,
+    )
+    rows = []
+    for row in emp_df.itertuples(index=False):
+        code = '' if row.Code is None else str(row.Code).strip()
+        if not code:
+            continue
+        try:
+            source_id = int(float(code))
+        except (TypeError, ValueError):
+            continue
+        parsed = employ_dates.get(source_id)
+        if parsed:
+            rows.append((int(row.EmployeeID), parsed))
+
+    dest_cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#PersonnelEmployDate') IS NOT NULL
+            DROP TABLE #PersonnelEmployDate
+        CREATE TABLE #PersonnelEmployDate (
+            EmployeeID BIGINT NOT NULL PRIMARY KEY,
+            EmployDate DATETIME NOT NULL
+        )
+        """
+    )
+    if rows:
+        dest_cursor.fast_executemany = True
+        dest_cursor.executemany(
+            "INSERT INTO #PersonnelEmployDate (EmployeeID, EmployDate) VALUES (?, ?)",
+            rows,
+        )
     dest_cursor.execute(
         """
         UPDATE s
-        SET s.EmploymentDate = d.FirstDate,
+        SET s.EmploymentDate = COALESCE(x.EmployDate, d.FirstDate),
             s.Status = ?,
             s.LastModificationDate = GETDATE(),
             s.LastModifier = 1
@@ -476,11 +958,13 @@ def _fill_employment_date_and_payment_status(dest_cursor):
             FROM HCM3.EmployeeStatute
             GROUP BY EmployeeRef
         ) d ON d.EmployeeRef = s.EmployeeRef
+        LEFT JOIN #PersonnelEmployDate x ON x.EmployeeID = s.EmployeeRef
         """,
         (STATUTE_STATUS_PAYMENT_CONFIRMED,),
     )
     print(
-        "  -> Employment date set from each employee's first statute date. "
+        "  -> Employment date set from the personnel employment date "
+        f"({len(rows)} employees), otherwise the first statute date. "
         f"Payment-confirmed status set on {dest_cursor.rowcount} statutes."
     )
 
@@ -798,8 +1282,9 @@ def run():
             "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'HCM3.EmployeeStatute'",
             (statute_last_id,),
         )
+        ensure_statute_type_profile(source_cnxn, dest_cnxn, dest_cursor)
         _apply_statute_rank_extra_dates_and_type_codes(source_cnxn, dest_cnxn, dest_cursor)
-        _fill_employment_date_and_payment_status(dest_cursor)
+        _fill_employment_date_and_payment_status(source_cnxn, dest_cnxn, dest_cursor)
 
         dest_cnxn.commit()
         print(

@@ -40,6 +40,9 @@ DELETE_BY_MAPPING = (
     ('DepartmentMigrationMapping', 'HCM3.Department', 'DepartmentID', 'DestDepartmentID'),
 )
 
+START_EMPLOYMENT_STATUTE_TITLE = 'شروع استخدام استقرار سیستم'
+EMPLOYEE_ENTITY_NAME = 'SystemGroup.HCM.Staff,Employee'
+
 MAPPING_TABLES_TO_CLEAR = (
     'WarriorMigrationMapping',
     'ServiceLeakageMigrationMapping',
@@ -66,6 +69,7 @@ MAPPING_TABLES_TO_CLEAR = (
     'EmploymentTypeMigrationMapping',
     'PlaceMigrationMapping',
     'PlaceRegionalDivisionMapping',
+    'ZoneRegionalDivisionMapping',
     'PostMigrationMapping',
     'DepartmentMigrationMapping',
     'PartyMigrationMapping',
@@ -189,22 +193,55 @@ def _prepare_employee_delete(cursor):
         return
 
     print("  Sweeping FKs onto migrated employees...")
-
-    # Nested: insurance under relatives of migrated employees
-    _delete_joined(cursor, 'EmployeeRelativeInsurance leftover', f"""
-        DELETE ins
-        FROM HCM3.EmployeeRelativeInsurance ins
-        INNER JOIN HCM3.EmployeeRelative r
-            ON r.EmployeeRelativeID = ins.EmployeeRelativeRef
-        INNER JOIN HCM3.Employee e ON e.EmployeeID = r.EmployeeRef
-        WHERE {_migrated_employee_filter_sql('e')}
+    _delete_joined(cursor, 'Employee entry dates', f"""
+        DELETE c
+        FROM SYS3.FieldValueContainer c
+        INNER JOIN SYS3.EntityLookup el ON el.Code = c.EntityCode
+        INNER JOIN HCM3.Employee e ON e.EmployeeID = c.RecordID
+        WHERE el.EntityName = N'{EMPLOYEE_ENTITY_NAME}'
+          AND {_migrated_employee_filter_sql('e')}
     """)
+    _release_references(
+        cursor,
+        'HCM3',
+        'Employee',
+        f"""
+        SELECT e.EmployeeID
+        FROM HCM3.Employee e
+        WHERE {_migrated_employee_filter_sql('e')}
+        """,
+    )
 
-    cursor.execute("""
+
+def _primary_key_column(cursor, schema, table):
+    cursor.execute(
+        """
+        SELECT c.name
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c
+            ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+        INNER JOIN sys.tables t ON t.object_id = i.object_id
+        INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+        WHERE i.is_primary_key = 1 AND s.name = ? AND t.name = ?
+        ORDER BY ic.key_ordinal
+        """,
+        (schema, table),
+    )
+    cols = [row[0] for row in cursor.fetchall()]
+    if len(cols) == 1:
+        return cols[0]
+    return None
+
+
+def _referencing_fks(cursor, schema, table):
+    cursor.execute(
+        """
         SELECT
-            OBJECT_SCHEMA_NAME(fk.parent_object_id) AS Sch,
-            OBJECT_NAME(fk.parent_object_id) AS Tbl,
-            COL_NAME(fc.parent_object_id, fc.parent_column_id) AS Col,
+            OBJECT_SCHEMA_NAME(fk.parent_object_id) AS ParentSchema,
+            OBJECT_NAME(fk.parent_object_id) AS ParentTable,
+            COL_NAME(fc.parent_object_id, fc.parent_column_id) AS ParentCol,
             c.is_nullable AS IsNullable
         FROM sys.foreign_keys fk
         INNER JOIN sys.foreign_key_columns fc
@@ -212,72 +249,109 @@ def _prepare_employee_delete(cursor):
         INNER JOIN sys.columns c
             ON c.object_id = fc.parent_object_id
            AND c.column_id = fc.parent_column_id
-        WHERE OBJECT_SCHEMA_NAME(fk.referenced_object_id) = N'HCM3'
-          AND OBJECT_NAME(fk.referenced_object_id) = N'Employee'
-        ORDER BY Sch, Tbl, Col
-    """)
-    fk_rows = cursor.fetchall()
+        WHERE OBJECT_SCHEMA_NAME(fk.referenced_object_id) = ?
+          AND OBJECT_NAME(fk.referenced_object_id) = ?
+        ORDER BY ParentSchema, ParentTable, ParentCol
+        """,
+        (schema, table),
+    )
+    return cursor.fetchall()
 
-    ownership_cols = {
-        'EmployeeRef', 'ParentEmployeeRef', 'RelativeRef',
-        'AppraiseeRef', 'AppraiserRef',
-    }
 
-    # Pass 1: delete ownership-style children
-    for sch, tbl, col, _nullable in fk_rows:
-        if col not in ownership_cols:
+def _release_references(cursor, schema, table, id_sql, stack=None):
+    """
+    Drop foreign keys that point at the ids in id_sql.
+    Nullable references are set to NULL. Required references delete the
+    child row, after that child's own references are released.
+    """
+    if stack is None:
+        stack = set()
+    key = (schema, table, id_sql)
+    if key in stack or len(stack) > 12:
+        return
+    stack.add(key)
+    for parent_schema, parent_table, parent_col, is_nullable in _referencing_fks(
+        cursor, schema, table
+    ):
+        same_table = parent_schema == schema and parent_table == table
+        if is_nullable or same_table:
+            if not is_nullable:
+                continue
+            cursor.execute(
+                f"""
+                UPDATE c
+                SET c.[{parent_col}] = NULL
+                FROM [{parent_schema}].[{parent_table}] c
+                WHERE c.[{parent_col}] IN ({id_sql})
+                """
+            )
+            if cursor.rowcount and cursor.rowcount > 0:
+                print(
+                    f"  -> {parent_schema}.{parent_table}.{parent_col} "
+                    f"nulled: {cursor.rowcount}"
+                )
             continue
-        if sch == 'HCM3' and tbl == 'Employee':
-            continue
-        _delete_joined(cursor, f'{sch}.{tbl}.{col} deleted', f"""
+        child_pk = _primary_key_column(cursor, parent_schema, parent_table)
+        if child_pk:
+            _release_references(
+                cursor,
+                parent_schema,
+                parent_table,
+                f"""
+                SELECT c.[{child_pk}]
+                FROM [{parent_schema}].[{parent_table}] c
+                WHERE c.[{parent_col}] IN ({id_sql})
+                """,
+                stack,
+            )
+        cursor.execute(
+            f"""
             DELETE c
-            FROM [{sch}].[{tbl}] c
-            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
-            WHERE {_migrated_employee_filter_sql('e')}
-        """)
+            FROM [{parent_schema}].[{parent_table}] c
+            WHERE c.[{parent_col}] IN ({id_sql})
+            """
+        )
+        if cursor.rowcount and cursor.rowcount > 0:
+            print(
+                f"  -> {parent_schema}.{parent_table}.{parent_col} "
+                f"deleted: {cursor.rowcount}"
+            )
 
-    # Pass 2: null nullable confirmer-style refs
-    for sch, tbl, col, is_nullable in fk_rows:
-        if col in ownership_cols:
-            continue
-        if not is_nullable:
-            continue
-        if sch == 'HCM3' and tbl == 'Employee':
-            continue
-        _exec_count(cursor, f'{sch}.{tbl}.{col} nulled', f"""
-            UPDATE c
-            SET c.[{col}] = NULL
-            FROM [{sch}].[{tbl}] c
-            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
-            WHERE {_migrated_employee_filter_sql('e')}
-        """)
 
-    # Pass 3: delete remaining non-nullable refs (cannot null)
-    for sch, tbl, col, is_nullable in fk_rows:
-        if col in ownership_cols:
-            continue
-        if is_nullable:
-            continue
-        if sch == 'HCM3' and tbl == 'Employee':
-            continue
-        _delete_joined(cursor, f'{sch}.{tbl}.{col} force-deleted', f"""
-            DELETE c
-            FROM [{sch}].[{tbl}] c
-            INNER JOIN HCM3.Employee e ON e.EmployeeID = c.[{col}]
-            WHERE {_migrated_employee_filter_sql('e')}
-        """)
+def _mapped_id_sql(mapping_table, mapping_col):
+    id_sql = (
+        f"SELECT m.{mapping_col} FROM master.dbo.{mapping_table} m"
+    )
+    if mapping_table == 'StatuteTypeMigrationMapping':
+        id_sql += f"""
+            UNION
+            SELECT StatuteTypeID
+            FROM HCM3.StatuteType
+            WHERE Title = N'{START_EMPLOYMENT_STATUTE_TITLE}'
+        """
+    return id_sql
 
 
 def _delete_by_mapping(cursor, mapping_table, dest_table, dest_pk, mapping_col):
     if not _mapping_exists(cursor, mapping_table):
         print(f"  -> {mapping_table} not found, skip {dest_table}.")
         return 0
-    return _delete_joined(cursor, dest_table, f"""
+    schema, table = dest_table.split('.')
+    _release_references(
+        cursor, schema, table, _mapped_id_sql(mapping_table, mapping_col)
+    )
+    deleted = _delete_joined(cursor, dest_table, f"""
         DELETE d
         FROM {dest_table} d
         INNER JOIN master.dbo.{mapping_table} m
             ON d.{dest_pk} = m.{mapping_col}
     """)
+    if mapping_table == 'StatuteTypeMigrationMapping':
+        deleted += _delete_joined(cursor, 'HCM3.StatuteType (employment start)', f"""
+            DELETE FROM HCM3.StatuteType
+            WHERE Title = N'{START_EMPLOYMENT_STATUTE_TITLE}'
+        """)
+    return deleted
 
 
 def _delete_migrated_addresses(cursor):
@@ -285,6 +359,12 @@ def _delete_migrated_addresses(cursor):
     if not _mapping_exists(cursor, 'AddressMigrationMapping'):
         print("  -> AddressMigrationMapping not found, skip addresses.")
         return 0
+    _release_references(
+        cursor,
+        'GNR3',
+        'Address',
+        "SELECT DestAddressID FROM master.dbo.AddressMigrationMapping",
+    )
     pa = _delete_joined(cursor, 'PartyAddress (migrated)', """
         DELETE pa
         FROM GNR3.PartyAddress pa
@@ -347,6 +427,15 @@ def _delete_migrated_statute_factors(cursor):
             INNER JOIN master.dbo.StatuteFactorPropertyMigrationMapping m
                 ON sfp.StatuteFactorPropertyID = m.DestStatuteFactorPropertyID
         """)
+        _release_references(
+            cursor,
+            'HCM3',
+            'Formula',
+            """
+            SELECT DestFormulaID
+            FROM master.dbo.StatuteFactorPropertyMigrationMapping
+            """,
+        )
         _delete_joined(cursor, 'Formula (migrated statute factor properties)', """
             DELETE f
             FROM HCM3.Formula f
@@ -594,6 +683,19 @@ def _delete_migrated_parties(cursor):
     if not _mapping_exists(cursor, 'PartyMigrationMapping'):
         print("  -> PartyMigrationMapping not found, skip Party cleanup.")
         return 0
+    _release_references(
+        cursor,
+        'GNR3',
+        'Party',
+        """
+        SELECT p.PartyID
+        FROM GNR3.Party p
+        INNER JOIN master.dbo.PartyMigrationMapping m
+            ON p.PartyID = m.DestPartyID
+        WHERE p.CreationDate >= DATEADD(HOUR, -12, m.MigrationDate)
+          AND p.CreationDate <= DATEADD(HOUR, 12, m.MigrationDate)
+        """,
+    )
     return _delete_joined(cursor, 'GNR3.Party (inserted)', """
         DELETE p
         FROM GNR3.Party p
@@ -614,14 +716,16 @@ def _clear_mapping_table(cursor, table_name):
     return count
 
 
-def run():
+def run(commit=True):
     print("\n--- Running Step 0: Cleanup Migrated Destination Data ---")
     print("This deletes destination rows tracked by migration mapping tables.")
 
     source_cnxn, dest_cnxn = get_connections()
+    dest_cnxn.timeout = 0
     dest_cursor = dest_cnxn.cursor()
     source_cnxn.close()
 
+    hold_open = False
     try:
         print("Clearing military fields updated by migration...")
         _clear_military_fields(dest_cursor)
@@ -698,6 +802,11 @@ def run():
         for table_name in MAPPING_TABLES_TO_CLEAR:
             _clear_mapping_table(dest_cursor, table_name)
 
+        if not commit:
+            hold_open = True
+            print("Cleanup statements finished. Transaction left open.")
+            return dest_cnxn
+
         dest_cnxn.commit()
         print("Success! Migrated destination data and mapping tables cleaned up.")
         print(
@@ -710,4 +819,5 @@ def run():
         print(f"Cleanup failed. Transaction rolled back. Error: {e}")
         raise e
     finally:
-        dest_cnxn.close()
+        if not hold_open:
+            dest_cnxn.close()

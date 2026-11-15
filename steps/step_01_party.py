@@ -11,6 +11,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 RELIGION_ISLAM = 1
 SUBRELIGION_SHIA = 1
 NATIONALITY_IRAN = 'ایران'
+ALLEGIANCE_IRANIAN = 'ایرانی'
 
 
 def setup_mapping_table(cursor):
@@ -104,10 +105,25 @@ def run():
         "SELECT SourceID, DestPartyID FROM master.dbo.PartyMigrationMapping",
         dest_cnxn,
     )
-    already_map = {
-        int(r['SourceID']): int(r['DestPartyID'])
-        for _, r in mapped_df.iterrows()
-    }
+    # One destination party can belong to one source person. Employee.PartyRef
+    # is unique, so a repeated DestPartyID fails the next step. The lowest
+    # source id keeps the party; every other source person gets a new party.
+    already_map = {}
+    claimed_dest = set()
+    remap_source_ids = []
+    mapping_rows = sorted(
+        (
+            (int(r['SourceID']), int(r['DestPartyID']))
+            for _, r in mapped_df.iterrows()
+        ),
+        key=lambda item: item[0],
+    )
+    for source_id, dest_party_id in mapping_rows:
+        if dest_party_id in claimed_dest:
+            remap_source_ids.append(source_id)
+            continue
+        claimed_dest.add(dest_party_id)
+        already_map[source_id] = dest_party_id
     dest_party_df = pd.read_sql("""
         SELECT
             PartyID,
@@ -165,7 +181,8 @@ def run():
                 if full_name and full_name in fullname_to_party:
                     existing_party_id = fullname_to_party[full_name]
 
-        if existing_party_id is not None:
+        if existing_party_id is not None and existing_party_id not in claimed_dest:
+            claimed_dest.add(existing_party_id)
             to_link.append((source_id, existing_party_id, fields))
             continue
 
@@ -188,7 +205,7 @@ def run():
                 BirthDate = ?, BirthPlaceRef = ?, IssuancePlaceRef = ?,
                 Mobile = ?, Tel = ?, IDNumber = ?, IDSerial = ?,
                 Gender = ?, MaritalStatus = ?,
-                Religion = ?, Subreligion = ?, Nationality = ?,
+                Religion = ?, Subreligion = ?, Nationality = ?, Allegiance = ?,
                 LastModificationDate = GETDATE(), LastModifier = 1
             WHERE PartyID = ?
         """
@@ -200,12 +217,19 @@ def run():
                 fields['IssuancePlaceRef'], fields['Mobile'], fields['Tel'],
                 fields['IDNumber'], fields['IDSerial'], fields['Gender'],
                 fields['MaritalStatus'], fields['Religion'], fields['Subreligion'],
-                fields['Nationality'], dest_party_id,
+                fields['Nationality'], ALLEGIANCE_IRANIAN, dest_party_id,
             ))
             return 1 if dest_cursor.rowcount else 0
 
         linked = 0
         updated = 0
+        split = 0
+        for source_id in remap_source_ids:
+            dest_cursor.execute(
+                "DELETE FROM master.dbo.PartyMigrationMapping WHERE SourceID = ?",
+                (source_id,),
+            )
+            split += 1
         for source_id, dest_party_id, fields in to_link:
             dest_cursor.execute(insert_mapping_sql, (source_id, dest_party_id))
             updated += apply_update(dest_party_id, fields)
@@ -229,9 +253,9 @@ def run():
                 INSERT INTO GNR3.Party (
                     PartyID, FirstName, LastName, NationalID, FatherName, BirthDate,
                     BirthPlaceRef, IssuancePlaceRef, Mobile, Tel, IDNumber, IDSerial,
-                    Gender, MaritalStatus, Religion, Subreligion, Nationality,
+                    Gender, MaritalStatus, Religion, Subreligion, Nationality, Allegiance,
                     CreationDate, Creator, LastModificationDate, LastModifier, Type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1, 0)
             """
 
             for record in to_insert:
@@ -244,6 +268,7 @@ def run():
                     record['IssuancePlaceRef'], record['Mobile'], record['Tel'],
                     record['IDNumber'], record['IDSerial'], record['Gender'], record['MaritalStatus'],
                     record['Religion'], record['Subreligion'], record['Nationality'],
+                    ALLEGIANCE_IRANIAN,
                 ))
                 dest_cursor.execute(insert_mapping_sql, (record['SourceID'], new_party_id))
                 inserted += 1
@@ -254,11 +279,23 @@ def run():
                 WHERE TableName = 'gnr3.party'
             """, (current_last_id,))
 
+        dest_cursor.execute("""
+            IF NOT EXISTS (
+                SELECT 1
+                FROM master.sys.indexes
+                WHERE name = N'UIX_PartyMigrationMapping_DestPartyID'
+                  AND object_id = OBJECT_ID(N'master.dbo.PartyMigrationMapping')
+            )
+            CREATE UNIQUE INDEX UIX_PartyMigrationMapping_DestPartyID
+                ON master.dbo.PartyMigrationMapping (DestPartyID)
+        """)
+
         dest_cnxn.commit()
         print(
             f"Success! Party inserted: {inserted}. "
             f"Linked existing parties: {linked}. "
-            f"Parties updated from source: {updated}."
+            f"Parties updated from source: {updated}. "
+            f"Source persons moved off a shared party: {split}."
             + (f" New Party LastId is {current_last_id}." if current_last_id is not None else "")
         )
 

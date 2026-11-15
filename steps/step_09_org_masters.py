@@ -42,7 +42,7 @@ def run():
         print("Migrating Places → WorkLocation lookups...")
         ensure_places_as_work_locations(source_cnxn, dest_cnxn, dest_cursor)
 
-        print("Ensuring statute Extra1 codes 1-20 from personal grades...")
+        print("Ensuring statute Extra1 codes 1-20 (رتبه) from personal grades...")
         grades_df = pd.read_sql("""
             SELECT DISTINCT HRS_RdPersonalGrade AS Grade
             FROM dbo.HRS_RuleDocument

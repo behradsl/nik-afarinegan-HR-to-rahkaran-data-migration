@@ -16,10 +16,16 @@ Per OrganizationChart (Oc) era:
     on those posts is not used. Posts outside every manager subtree keep
     their source department. Posts with no department use one technical
     department because DepartmentRef cannot be null.
-  - InsertionDate = Oc date; DeletionDate = next Oc date (NULL for latest)
+  - InsertionDate = Oc date. The screen shows a node only while
+    DeletionDate is after the selected day. Every post and department
+    closes when the next chart starts (NULL for the latest). The next
+    chart opens its own copy. An expire date on or before today can close
+    a post sooner, still inside that chart. A later expire date stays open.
   - OrganizationalStructureDescription per Oc ChangeDate
   - OrganizationalStructureItem (مصوب) on each post node
 """
+from datetime import datetime, timedelta
+
 import pandas as pd
 import warnings
 from utils.date_helpers import shamsi_to_gregorian
@@ -64,6 +70,137 @@ def _parse_shamsi_date(raw):
     if '_' in date_part or date_part.count('/') != 2:
         return None
     return shamsi_to_gregorian(date_part)
+
+
+def _day_after(iso_date):
+    """Gregorian YYYY-MM-DD of the next day."""
+    day = datetime.strptime(str(iso_date)[:10], "%Y-%m-%d").date()
+    return (day + timedelta(days=1)).isoformat()
+
+
+def _expire_is_open(expire_iso, today=None):
+    """An expire date after today does not close the post."""
+    today = today or datetime.now().date()
+    day = datetime.strptime(str(expire_iso)[:10], "%Y-%m-%d").date()
+    return day > today
+
+
+def _post_deletion(insertion, chart_deletion, expire, today=None):
+    """
+    End date of one post node.
+
+    The chart end always wins. An expire date on or before today can close
+    the post sooner, and the post is still shown on that expire date.
+    An expire date after today leaves the post open until the chart ends.
+    """
+    if not expire or _expire_is_open(expire, today):
+        return chart_deletion
+    hide_from = _day_after(expire)
+    insertion_day = str(insertion)[:10]
+    if hide_from <= insertion_day:
+        return insertion
+    if chart_deletion and hide_from > str(chart_deletion)[:10]:
+        return chart_deletion
+    return hide_from
+
+
+def repair_structure_dates(source_cnxn, dest_cursor):
+    """
+    Put existing structure dates on the screen's rule without rebuilding nodes.
+
+    Every node closes when the next chart starts. A post whose expire date
+    is on or before today may close sooner, still inside its chart. Statute
+    links are left in place.
+    """
+    dest_cursor.execute(
+        """
+        UPDATE os
+        SET os.DeletionDate = nxt.NextStart
+        FROM HCM3.OrganizationalStructure os
+        INNER JOIN (
+            SELECT
+                CAST(InsertionDate AS date) AS ChartStart,
+                LEAD(CAST(InsertionDate AS date)) OVER (
+                    ORDER BY CAST(InsertionDate AS date)
+                ) AS NextStart
+            FROM (
+                SELECT DISTINCT CAST(InsertionDate AS date) AS InsertionDate
+                FROM HCM3.OrganizationalStructure
+            ) days
+        ) nxt ON nxt.ChartStart = CAST(os.InsertionDate AS date)
+        WHERE ISNULL(CAST(os.DeletionDate AS date), '99991231')
+              <> ISNULL(CAST(nxt.NextStart AS date), '99991231')
+        """
+    )
+    charts = dest_cursor.rowcount
+    print(f"  -> Chart windows aligned to the next chart start: {charts}.")
+
+    expire_df = pd.read_sql(
+        """
+        SELECT TBL_PostID AS SourcePostID, TBL_PostExpireDate AS ExpireDate
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+        """,
+        source_cnxn,
+    )
+    today = datetime.now().date()
+    rows = []
+    for row in expire_df.itertuples(index=False):
+        expire = _parse_shamsi_date(row.ExpireDate)
+        if not expire or _expire_is_open(expire, today):
+            continue
+        rows.append((
+            int(row.SourcePostID),
+            datetime.strptime(_day_after(expire), "%Y-%m-%d").date(),
+        ))
+    expired = 0
+    if rows:
+        dest_cursor.execute(
+            """
+            IF OBJECT_ID('tempdb..#PostExpire') IS NOT NULL DROP TABLE #PostExpire
+            CREATE TABLE #PostExpire (
+                SourcePostID BIGINT NOT NULL PRIMARY KEY,
+                HideFrom DATE NOT NULL
+            )
+            """
+        )
+        dest_cursor.fast_executemany = True
+        dest_cursor.executemany(
+            "INSERT INTO #PostExpire (SourcePostID, HideFrom) VALUES (?, ?)",
+            rows,
+        )
+        dest_cursor.fast_executemany = False
+        dest_cursor.execute(
+            """
+            UPDATE os
+            SET os.DeletionDate = CASE
+                WHEN x.HideFrom <= CAST(os.InsertionDate AS date)
+                    THEN CAST(os.InsertionDate AS date)
+                ELSE x.HideFrom
+            END
+            FROM HCM3.OrganizationalStructure os
+            INNER JOIN master.dbo.OrgStructureMigrationMapping m
+                ON m.DestOrganizationalStructureID = os.OrganizationalStructureID
+               AND m.NodeKind = 'P'
+            INNER JOIN #PostExpire x ON x.SourcePostID = m.SourceID
+            WHERE os.DeletionDate IS NULL
+               OR x.HideFrom < CAST(os.DeletionDate AS date)
+            """
+        )
+        expired = dest_cursor.rowcount
+    print(f"  -> Posts closed inside their chart by an expire date: {expired}.")
+
+    dest_cursor.execute(
+        """
+        UPDATE i
+        SET i.DeletionDate = os.DeletionDate
+        FROM HCM3.OrganizationalStructureItem i
+        INNER JOIN HCM3.OrganizationalStructure os
+            ON os.OrganizationalStructureID = i.OrganizationalStructureRef
+        WHERE ISNULL(CAST(i.DeletionDate AS date), '99991231')
+              <> ISNULL(CAST(os.DeletionDate AS date), '99991231')
+        """
+    )
 
 
 def _positive_fk(val):
@@ -373,8 +510,7 @@ def run():
             oc_id = int(row['SourceOcID'])
             insertion = _parse_shamsi_date(row['OcDate']) or '1900-01-01'
             if i + 1 < len(oc_df):
-                next_date = _parse_shamsi_date(oc_df.iloc[i + 1]['OcDate'])
-                deletion = next_date  # superseded when next chart starts
+                deletion = _parse_shamsi_date(oc_df.iloc[i + 1]['OcDate'])
             else:
                 deletion = None  # current chart stays open
             oc_windows.append({
@@ -390,7 +526,8 @@ def run():
                 TBL_PostID AS SourcePostID,
                 TBL_OcID_fk AS SourceOcID,
                 TBL_DepartmentID_fk AS SourceDepartmentID,
-                TBL_PostParentID_fk AS SourceParentPostID
+                TBL_PostParentID_fk AS SourceParentPostID,
+                TBL_PostExpireDate AS ExpireDate
             FROM dbo.TBL_Post
             WHERE TBL_PostID > 0
               AND TBL_OcID_fk IS NOT NULL
@@ -487,6 +624,9 @@ def run():
                     dest_dept = unassigned_dept_id
                     unassigned_posts.add(source_post_id)
 
+                node_deletion = _post_deletion(
+                    insertion, deletion, _parse_shamsi_date(prow['ExpireDate'])
+                )
                 structure_last_id += 1
                 dest_cursor.execute(
                     insert_os_sql,
@@ -496,7 +636,7 @@ def run():
                         dest_post,
                         None,
                         insertion,
-                        deletion,
+                        node_deletion,
                     ),
                 )
                 dest_cursor.execute(
@@ -519,7 +659,7 @@ def run():
                         structure_last_id,
                         POST_TYPE_APPROVED,
                         insertion,
-                        deletion,
+                        node_deletion,
                     ),
                 )
                 items_inserted += 1
@@ -653,6 +793,7 @@ def run():
             (desc_last_id,),
         )
 
+        repair_structure_dates(source_cnxn, dest_cursor)
         dest_cnxn.commit()
         print(
             f"Success! Post nodes: {post_nodes}, "

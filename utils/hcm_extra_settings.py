@@ -239,6 +239,16 @@ HCM_EXTRA_FIELD_SPECS = {
         'title_path': r'systemgroup.hcm.organization\PostExtra2Title',
         'show_path': r'systemgroup.hcm.organization\ShowPostExtra2',
     },
+    'PostExtra3': {
+        'title': 'سطح پست',
+        'title_path': r'systemgroup.hcm.organization\PostExtra3Title',
+        'show_path': r'systemgroup.hcm.organization\ShowPostExtra3',
+    },
+    'PostExtra4': {
+        'title': 'کد حسابداری',
+        'title_path': r'systemgroup.hcm.organization\PostExtra4Title',
+        'show_path': r'systemgroup.hcm.organization\ShowPostExtra4',
+    },
     'WorkRecordExtra1': {
         'title': 'وضعیت فعال بودن',
         'title_path': r'systemgroup.hcm.staff\WorkRecordExtra1Title',
@@ -268,6 +278,21 @@ HCM_EXTRA_FIELD_SPECS = {
         'title': 'رتبه',
         'title_path': r'systemgroup.hcm.staff\EmpStatuteExtra1Title',
         'show_path': r'systemgroup.hcm.staff\ShowExtra1InEmpStatute',
+    },
+    'EmployeeStatuteExtra2': {
+        'title': 'گروه تشویقی',
+        'title_path': r'systemgroup.hcm.staff\EmpStatuteExtra2Title',
+        'show_path': r'systemgroup.hcm.staff\ShowExtra2InEmpStatute',
+    },
+    'EmployeeStatuteExtra3': {
+        'title': 'گروه استحقاقی',
+        'title_path': r'systemgroup.hcm.staff\EmpStatuteExtra3Title',
+        'show_path': r'systemgroup.hcm.staff\ShowExtra3InEmpStatute',
+    },
+    'EmployeeStatuteExtra4': {
+        'title': 'طبقه تشویقی',
+        'title_path': r'systemgroup.hcm.staff\EmpStatuteExtra4Title',
+        'show_path': r'systemgroup.hcm.staff\ShowExtra4InEmpStatute',
     },
     'Rank': {
         'title': 'طبقه شغلی',

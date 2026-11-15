@@ -12,13 +12,20 @@ CHILD_JOB_RANK_NUMBER = 1
 # Post Extra lookups (SYS3.Lookup Type / LookupInfo)
 POST_EXTRA1_LOOKUP = 'PostExtra1'  # کد توانیر / کد سازمانی پست
 POST_EXTRA2_LOOKUP = 'PostExtra2'  # شناسه HRS
+POST_EXTRA3_LOOKUP = 'PostExtra3'  # سطح پست
+POST_EXTRA4_LOOKUP = 'PostExtra4'  # کد حسابداری
 POST_EXTRA1_TITLE = 'کد توانیر'
 POST_EXTRA2_TITLE = 'شناسه HRS'
+POST_LEVEL_PAYBASE = 9508          # سطح پست سازمانی
+POST_ACCOUNT_PAYBASE = 9502        # کد حسابداری
 
 # PayBase: حوزه جغرافيايي پست values live under parent 70 (شهرستانی/استانی/ملی + levels)
 GEO_DOMAIN_ROOT_PARENT = 70
 POST_GEO_DOMAIN_PAYBASE = 9513  # حوزه جغرافيايي پست
 POST_HRIS_PAYBASE = 9505        # شناسه HRS
+# Post.ExtraNCode and SYS3.Lookup.Code are SQL int. A numeric extra can use
+# that number as both the code and the value, which is what the post screen shows.
+SQL_INT_MAX = 2147483647
 
 
 def ensure_table_id(cursor, table_name, default_last_id=0):
@@ -129,6 +136,7 @@ def setup_place_regional_division_mapping_table(cursor):
 RD_TYPE_COUNTRY = 1
 RD_TYPE_PROVINCE = 2
 RD_TYPE_CITY = 3
+RD_TYPE_COUNTY = 4
 
 
 def _get_iran_regional_division_id(dest_cursor):
@@ -144,16 +152,16 @@ def _get_iran_regional_division_id(dest_cursor):
     return int(row[0])
 
 
-def _insert_city_under_iran(dest_cursor, name, iran_id):
-    """Insert Type=city node as rightmost child of Iran (nested-set Left/Right)."""
+def _insert_regional_division(dest_cursor, name, parent_id, node_type):
+    """Insert a node as the rightmost child of parent_id (nested-set Left/Right)."""
     dest_cursor.execute("""
         SELECT [Right]
         FROM GNR3.RegionalDivision WITH (UPDLOCK, HOLDLOCK)
         WHERE RegionalDivisionID = ?
-    """, (iran_id,))
+    """, (parent_id,))
     row = dest_cursor.fetchone()
     if not row:
-        raise RuntimeError(f"Iran RegionalDivisionID={iran_id} not found.")
+        raise RuntimeError(f"RegionalDivisionID={parent_id} not found.")
     parent_right = int(row[0])
 
     dest_cursor.execute(
@@ -170,12 +178,17 @@ def _insert_city_under_iran(dest_cursor, name, iran_id):
         INSERT INTO GNR3.RegionalDivision (
             RegionalDivisionID, Name, ParentRef, Type, [Left], [Right]
         ) VALUES (?, ?, ?, ?, ?, ?)
-    """, (new_id, name, iran_id, RD_TYPE_CITY, parent_right, parent_right + 1))
+    """, (new_id, name, parent_id, node_type, parent_right, parent_right + 1))
     dest_cursor.execute(
         "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = 'GNR3.RegionalDivision'",
         (new_id,),
     )
     return new_id
+
+
+def _insert_city_under_iran(dest_cursor, name, iran_id):
+    """Insert Type=city node as rightmost child of Iran (nested-set Left/Right)."""
+    return _insert_regional_division(dest_cursor, name, iran_id, RD_TYPE_CITY)
 
 
 def ensure_places_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor):
@@ -280,6 +293,261 @@ def ensure_places_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor):
     print(
         f"  -> Places→RegionalDivision mapped: {matched} "
         f"(created cities: {created}). Total: {len(result)}."
+    )
+    return result
+
+
+def _compact_place_name(name):
+    return ''.join(name.split()) if name else ''
+
+
+def _same_place_name(left, right):
+    return bool(left and right and _compact_place_name(left) == _compact_place_name(right))
+
+
+def _bare_county_name(name):
+    prefix = 'شهرستان '
+    if name and name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+
+def setup_zone_regional_division_mapping_table(cursor):
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT * FROM master.sys.tables WHERE name = 'ZoneRegionalDivisionMapping'
+        )
+        BEGIN
+            CREATE TABLE master.dbo.ZoneRegionalDivisionMapping (
+                SourceZoneID INT PRIMARY KEY,
+                DestRegionalDivisionID BIGINT NOT NULL,
+                ZoneName NVARCHAR(200) NULL,
+                MatchKind NVARCHAR(20) NULL,
+                MigrationDate DATETIME DEFAULT GETDATE()
+            )
+        END
+    """)
+    cursor.commit()
+
+
+def ensure_zones_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor):
+    """
+    Resolve TBL_Zone -> GNR3.RegionalDivisionID for Post.RegionalDivisionRef.
+
+    The post's place is not used. A zone is matched inside its own province:
+      - the Iran zone -> country
+      - a province zone -> that province
+      - a city name, ignoring spaces -> that city
+      - a county name -> that county
+      - otherwise a city is created under the parent county, or under the province
+    """
+    setup_zone_regional_division_mapping_table(dest_cursor)
+
+    used_df = pd.read_sql("""
+        SELECT DISTINCT TBL_ZoneID_fk AS SourceZoneID
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+          AND TBL_ZoneID_fk IS NOT NULL
+          AND TBL_ZoneID_fk > 0
+    """, source_cnxn)
+    zone_df = pd.read_sql("""
+        SELECT
+            TBL_ZoneID AS SourceZoneID,
+            TBL_ZoneName AS ZoneName,
+            TBL_ZoneParentID_fk AS ParentZoneID
+        FROM dbo.TBL_Zone
+        WHERE TBL_ZoneID > 0
+    """, source_cnxn)
+
+    existing_df = pd.read_sql(
+        "SELECT SourceZoneID, DestRegionalDivisionID "
+        "FROM master.dbo.ZoneRegionalDivisionMapping",
+        dest_cnxn,
+    )
+    result = {
+        int(row['SourceZoneID']): int(row['DestRegionalDivisionID'])
+        for _, row in existing_df.iterrows()
+    }
+    if used_df.empty:
+        print("  -> No source zones on posts.")
+        return result
+
+    zone_name = {}
+    zone_parent = {}
+    for _, row in zone_df.iterrows():
+        zone_id = int(row['SourceZoneID'])
+        zone_name[zone_id] = clean_persian_text(row['ZoneName'])
+        parent_id = row['ParentZoneID']
+        if pd.isna(parent_id):
+            zone_parent[zone_id] = None
+        else:
+            parent_id = int(parent_id)
+            zone_parent[zone_id] = parent_id if parent_id > 0 else None
+
+    def _province_zone_id(zone_id):
+        seen = set()
+        current = zone_id
+        while current and current not in seen:
+            seen.add(current)
+            parent_id = zone_parent.get(current)
+            if zone_name.get(parent_id) == 'ایران':
+                return current
+            current = parent_id
+        return None
+
+    rd_df = pd.read_sql("""
+        SELECT RegionalDivisionID, Name, ParentRef, Type
+        FROM GNR3.RegionalDivision
+    """, dest_cnxn)
+    by_id = {}
+    for _, row in rd_df.iterrows():
+        parent_ref = row['ParentRef']
+        by_id[int(row['RegionalDivisionID'])] = {
+            'name': clean_persian_text(row['Name']),
+            'parent': None if pd.isna(parent_ref) else int(parent_ref),
+            'type': int(row['Type']),
+        }
+
+    def _province_rd_id(node_id):
+        seen = set()
+        current = node_id
+        while current and current not in seen:
+            seen.add(current)
+            row = by_id.get(current)
+            if row is None:
+                return None
+            if row['type'] == RD_TYPE_PROVINCE:
+                return current
+            current = row['parent']
+        return None
+
+    provinces = []
+    counties = []
+    cities = []
+    country_id = None
+    for node_id, row in by_id.items():
+        if row['type'] == RD_TYPE_COUNTRY and country_id is None:
+            country_id = node_id
+        elif row['type'] == RD_TYPE_PROVINCE:
+            provinces.append((node_id, row['name']))
+        elif row['type'] == RD_TYPE_COUNTY:
+            counties.append((node_id, row['name'], _province_rd_id(node_id)))
+        elif row['type'] == RD_TYPE_CITY:
+            cities.append((node_id, row['name'], _province_rd_id(node_id), row['parent']))
+
+    def _province_rd(province_name):
+        target = _compact_place_name('استان ' + province_name)
+        bare = _compact_place_name(province_name)
+        hits = [
+            node_id for node_id, name in provinces
+            if _compact_place_name(name) in (target, bare)
+        ]
+        if len(hits) == 1:
+            return hits[0]
+        return None
+
+    def _county_in_province(name, province_rd):
+        hits = []
+        for node_id, county_name, county_province in counties:
+            if county_province != province_rd:
+                continue
+            if (
+                _same_place_name(county_name, name)
+                or _same_place_name(_bare_county_name(county_name), name)
+            ):
+                hits.append(node_id)
+        if len(hits) == 1:
+            return hits[0]
+        return None
+
+    iran_id = country_id or _get_iran_regional_division_id(dest_cursor)
+    insert_mapping_sql = """
+        INSERT INTO master.dbo.ZoneRegionalDivisionMapping (
+            SourceZoneID, DestRegionalDivisionID, ZoneName, MatchKind
+        ) VALUES (?, ?, ?, ?)
+    """
+    created = 0
+    matched = 0
+    ambiguous = 0
+
+    for source_id in sorted(int(v) for v in used_df['SourceZoneID'].tolist()):
+        if source_id in result:
+            continue
+        name = zone_name.get(source_id)
+        if not name:
+            continue
+        province_zone = _province_zone_id(source_id)
+        province_name = zone_name.get(province_zone)
+        province_rd = _province_rd(province_name) if province_name else None
+        parent_zone = zone_parent.get(source_id)
+        parent_name = zone_name.get(parent_zone)
+
+        dest_id = None
+        match_kind = None
+        if name == 'ایران':
+            dest_id = iran_id
+            match_kind = 'country'
+        elif province_zone == source_id:
+            dest_id = province_rd
+            match_kind = 'province'
+        else:
+            city_hits = []
+            if province_rd:
+                city_hits = [
+                    node_id for node_id, city_name, city_province, _parent
+                    in cities
+                    if city_province == province_rd and _same_place_name(city_name, name)
+                ]
+            if len(city_hits) > 1 and parent_name:
+                narrowed = []
+                for node_id in city_hits:
+                    parent_node = by_id[node_id]['parent']
+                    county_row = by_id.get(parent_node) if parent_node else None
+                    county_name = county_row['name'] if county_row else None
+                    if _same_place_name(_bare_county_name(county_name), parent_name):
+                        narrowed.append(node_id)
+                if len(narrowed) == 1:
+                    city_hits = narrowed
+            if len(city_hits) == 1:
+                dest_id = city_hits[0]
+                match_kind = 'city'
+            elif len(city_hits) > 1:
+                ambiguous += 1
+                print(f"  -> Zone {source_id} {name} matches {len(city_hits)} cities. Left empty.")
+                continue
+            else:
+                county_id = _county_in_province(name, province_rd) if province_rd else None
+                if county_id:
+                    dest_id = county_id
+                    match_kind = 'county'
+                else:
+                    parent_county = (
+                        _county_in_province(parent_name, province_rd)
+                        if province_rd and parent_name else None
+                    )
+                    create_under = parent_county or province_rd or iran_id
+                    dest_id = _insert_regional_division(
+                        dest_cursor, name, create_under, RD_TYPE_CITY
+                    )
+                    by_id[dest_id] = {
+                        'name': name,
+                        'parent': create_under,
+                        'type': RD_TYPE_CITY,
+                    }
+                    cities.append((dest_id, name, province_rd, create_under))
+                    match_kind = 'created'
+                    created += 1
+
+        if not dest_id:
+            continue
+        dest_cursor.execute(insert_mapping_sql, (source_id, dest_id, name, match_kind))
+        result[source_id] = dest_id
+        matched += 1
+
+    print(
+        f"  -> Zones→RegionalDivision mapped: {matched} "
+        f"(created cities: {created}, ambiguous: {ambiguous}). "
+        f"Total: {len(result)}."
     )
     return result
 
@@ -816,13 +1084,69 @@ def ensure_regional_division_types_from_geo_domain(source_cnxn, dest_cnxn, dest_
     return {int(c): int(c) for c in code_to_value}
 
 
+def _same_number_code(raw):
+    """Positive SQL int whose lookup code and value are that same number."""
+    text = str(raw).strip()
+    if text.endswith('.0'):
+        text = text[:-2]
+    if not text.isdigit():
+        return None
+    number = int(text)
+    if number <= 0 or number > SQL_INT_MAX:
+        return None
+    return number
+
+
+def _drop_unused_lookup_codes(dest_cursor, lookup_type, keep_codes):
+    """Remove lookup rows whose code is no longer stored on a post extra."""
+    dest_cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#KeepLookupCode') IS NOT NULL DROP TABLE #KeepLookupCode
+        CREATE TABLE #KeepLookupCode (Code INT NOT NULL PRIMARY KEY)
+        """
+    )
+    if keep_codes:
+        dest_cursor.fast_executemany = True
+        dest_cursor.executemany(
+            "INSERT INTO #KeepLookupCode (Code) VALUES (?)",
+            [(int(code),) for code in keep_codes],
+        )
+        dest_cursor.fast_executemany = False
+    dest_cursor.execute(
+        """
+        DELETE l
+        FROM SYS3.Lookup l
+        WHERE l.Type = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM #KeepLookupCode k WHERE k.Code = l.Code
+          )
+        """,
+        (lookup_type,),
+    )
+    removed = dest_cursor.rowcount
+    dest_cursor.execute("DROP TABLE #KeepLookupCode")
+    if removed:
+        print(f"  -> Removed {removed} unused {lookup_type} code(s).")
+
+
 def _load_post_extra_maps(source_cnxn, dest_cnxn, dest_cursor):
     """
-    Build Extra1 (کد توانیر) and Extra2 (شناسه HRS) value→code maps,
-    plus per-post source values.
-    Returns (extra1_by_post, extra2_by_post) where values are dest lookup codes.
+    Build Extra1 (کد توانیر), Extra2 (شناسه HRS), Extra3 (سطح پست) and
+    Extra4 (کد حسابداری) maps, plus per-post source values.
+    Returns four dicts of source post id -> dest lookup code.
+
+    When the source value is a number that fits in the lookup code, the code
+    and the value are that same number. The post screen shows the code.
     """
-    ensure_hcm_extra_fields(dest_cursor, (POST_EXTRA1_LOOKUP, POST_EXTRA2_LOOKUP))
+    ensure_hcm_extra_fields(
+        dest_cursor,
+        (
+            POST_EXTRA1_LOOKUP,
+            POST_EXTRA2_LOOKUP,
+            POST_EXTRA3_LOOKUP,
+            POST_EXTRA4_LOOKUP,
+        ),
+    )
 
     org_df = pd.read_sql("""
         SELECT
@@ -844,44 +1168,148 @@ def _load_post_extra_maps(source_cnxn, dest_cnxn, dest_cursor):
           AND NULLIF(LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(100)))), N'') IS NOT NULL
     """, source_cnxn, params=[POST_HRIS_PAYBASE])
 
-    org_values = [
-        normalize_persian(str(v).strip())
-        for v in org_df['OrgCode'].tolist()
-        if v is not None and str(v).strip()
-    ]
-    hris_values = [
-        normalize_persian(str(v).strip())
-        for v in hris_df['HrisValue'].tolist()
-        if v is not None and str(v).strip()
-    ]
-
-    org_name_to_code = sync_lookup(
-        dest_cnxn, dest_cursor, POST_EXTRA1_LOOKUP, list(dict.fromkeys(org_values))
-    ) if org_values else {}
-    hris_name_to_code = sync_lookup(
-        dest_cnxn, dest_cursor, POST_EXTRA2_LOOKUP, list(dict.fromkeys(hris_values))
-    ) if hris_values else {}
-
     extra1_by_post = {}
     for _, row in org_df.iterrows():
-        val = normalize_persian(str(row['OrgCode']).strip())
-        code = org_name_to_code.get(val)
+        code = _same_number_code(row['OrgCode'])
         if code is not None:
-            extra1_by_post[int(row['SourcePostID'])] = int(code)
-
+            extra1_by_post[int(row['SourcePostID'])] = code
     extra2_by_post = {}
     for _, row in hris_df.iterrows():
-        val = normalize_persian(str(row['HrisValue']).strip())
-        code = hris_name_to_code.get(val)
+        code = _same_number_code(row['HrisValue'])
         if code is not None:
-            # Prefer first non-null; later rows overwrite (last wins)
-            extra2_by_post[int(row['SourcePostID'])] = int(code)
+            extra2_by_post[int(row['SourcePostID'])] = code
+
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        POST_EXTRA1_LOOKUP,
+        {code: str(code) for code in set(extra1_by_post.values())},
+        overwrite_values=True,
+    )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        POST_EXTRA2_LOOKUP,
+        {code: str(code) for code in set(extra2_by_post.values())},
+        overwrite_values=True,
+    )
+
+    level_df = pd.read_sql("""
+        SELECT
+            TBL_PostID AS SourcePostID,
+            TBL_PostLevelID_fk AS LevelID
+        FROM dbo.TBL_Post
+        WHERE TBL_PostID > 0
+          AND ISNULL(TBL_PostLevelID_fk, 0) > 0
+    """, source_cnxn)
+    level_fallback = pd.read_sql("""
+        SELECT
+            pe.TBL_PostID_fk AS SourcePostID,
+            LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))) AS LevelValue
+        FROM dbo.TBL_PostExtraInfo pe
+        WHERE pe.HRS_PayBaseID_fk = ?
+          AND pe.TBL_PostID_fk > 0
+          AND NULLIF(LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))), N'') IS NOT NULL
+          AND LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))) NOT IN (N'0', N'0.0')
+    """, source_cnxn, params=[POST_LEVEL_PAYBASE])
+    level_by_post = {
+        int(row.SourcePostID): int(row.LevelID)
+        for row in level_df.itertuples(index=False)
+    }
+    for row in level_fallback.itertuples(index=False):
+        source_id = int(row.SourcePostID)
+        if source_id in level_by_post:
+            continue
+        try:
+            level_id = int(float(str(row.LevelValue).strip()))
+        except (TypeError, ValueError):
+            continue
+        if level_id > 0:
+            level_by_post[source_id] = level_id
+    level_ids = sorted(set(level_by_post.values()))
+    level_names = {}
+    if level_ids:
+        name_df = pd.read_sql(
+            """
+            SELECT HRS_PayBaseID AS PayBaseID, HRS_PayBaseName AS Name
+            FROM dbo.HRS_PayBase
+            WHERE HRS_PayBaseID IN ({})
+            """.format(','.join(str(int(i)) for i in level_ids)),
+            source_cnxn,
+        )
+        for row in name_df.itertuples(index=False):
+            level_names[int(row.PayBaseID)] = (
+                clean_persian_text(row.Name) or str(int(row.PayBaseID))
+            )
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        POST_EXTRA3_LOOKUP,
+        {level_id: level_names.get(level_id, str(level_id)) for level_id in level_ids},
+        overwrite_values=True,
+    )
+
+    account_df = pd.read_sql("""
+        SELECT
+            pe.TBL_PostID_fk AS SourcePostID,
+            LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))) AS AccountCode
+        FROM dbo.TBL_PostExtraInfo pe
+        WHERE pe.HRS_PayBaseID_fk = ?
+          AND pe.TBL_PostID_fk > 0
+          AND NULLIF(LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))), N'') IS NOT NULL
+          AND LTRIM(RTRIM(CAST(pe.TBL_PeiValue AS nvarchar(50)))) NOT IN (N'0', N'0.0')
+    """, source_cnxn, params=[POST_ACCOUNT_PAYBASE])
+    account_by_post = {}
+    overflow_text_by_post = {}
+    for row in account_df.itertuples(index=False):
+        text = str(row.AccountCode).strip()
+        if text.endswith('.0'):
+            text = text[:-2]
+        if not text.isdigit() or int(text) <= 0:
+            continue
+        source_id = int(row.SourcePostID)
+        code = _same_number_code(text)
+        if code is not None:
+            account_by_post[source_id] = code
+        else:
+            # Wider than SQL int, so the code cannot be the account number.
+            # The lookup value keeps the full number.
+            overflow_text_by_post[source_id] = text
+    used_codes = set(account_by_post.values())
+    next_code = 1
+    overflow_code_by_text = {}
+    for text in dict.fromkeys(overflow_text_by_post.values()):
+        while next_code in used_codes:
+            next_code += 1
+        overflow_code_by_text[text] = next_code
+        used_codes.add(next_code)
+        next_code += 1
+    for source_id, text in overflow_text_by_post.items():
+        account_by_post[source_id] = overflow_code_by_text[text]
+    ensure_lookup_codes(
+        dest_cnxn,
+        dest_cursor,
+        POST_EXTRA4_LOOKUP,
+        {code: str(code) for code in set(account_by_post.values())
+         if code not in overflow_code_by_text.values()},
+        overwrite_values=True,
+    )
+    if overflow_code_by_text:
+        ensure_lookup_codes(
+            dest_cnxn,
+            dest_cursor,
+            POST_EXTRA4_LOOKUP,
+            {code: text for text, code in overflow_code_by_text.items()},
+            overwrite_values=True,
+        )
 
     print(
         f"  -> Post Extra1 (کد توانیر) mapped for {len(extra1_by_post)} post(s); "
-        f"Extra2 (شناسه HRS) for {len(extra2_by_post)} post(s)."
+        f"Extra2 (شناسه HRS) for {len(extra2_by_post)} post(s); "
+        f"Extra3 (سطح پست) for {len(level_by_post)} post(s); "
+        f"Extra4 (کد حسابداری) for {len(account_by_post)} post(s)."
     )
-    return extra1_by_post, extra2_by_post
+    return extra1_by_post, extra2_by_post, level_by_post, account_by_post
 
 
 def _load_post_geo_domain_codes(source_cnxn):
@@ -913,10 +1341,10 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
 
     jg_to_level = ensure_post_levels_from_job_grades(source_cnxn, dest_cnxn, dest_cursor)
     type_to_code = ensure_post_types_from_paybase(source_cnxn, dest_cnxn, dest_cursor)
-    place_to_rd = ensure_places_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor)
+    zone_to_rd = ensure_zones_as_regional_divisions(source_cnxn, dest_cnxn, dest_cursor)
     ensure_regional_division_types_from_geo_domain(source_cnxn, dest_cnxn, dest_cursor)
-    extra1_by_post, extra2_by_post = _load_post_extra_maps(
-        source_cnxn, dest_cnxn, dest_cursor
+    extra1_by_post, extra2_by_post, extra3_by_post, extra4_by_post = (
+        _load_post_extra_maps(source_cnxn, dest_cnxn, dest_cursor)
     )
     geo_by_post = _load_post_geo_domain_codes(source_cnxn)
 
@@ -927,7 +1355,7 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             TBL_PostCode AS PostCode,
             TBL_PostActive AS PostActive,
             TBL_JgID_fk AS SourceJobGradeID,
-            TBL_PlaceID_fk AS SourcePlaceID,
+            TBL_ZoneID_fk AS SourceZoneID,
             TBL_PostTypeID_fk AS SourcePostTypeID,
             TBL_JobID_fk AS SourceJobID
         FROM dbo.TBL_Post
@@ -966,12 +1394,14 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
         return _lookup_code(row, 'SourcePostTypeID', type_to_code)
 
     def _regional_ref(row):
-        return _lookup_code(row, 'SourcePlaceID', place_to_rd)
+        return _lookup_code(row, 'SourceZoneID', zone_to_rd)
 
     def _extra_fields(source_id):
         return (
             extra1_by_post.get(source_id),
             extra2_by_post.get(source_id),
+            extra3_by_post.get(source_id),
+            extra4_by_post.get(source_id),
             geo_by_post.get(source_id),
         )
 
@@ -998,9 +1428,9 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             INSERT INTO HCM3.Post (
                 PostID, Code, Title, LevelCode, TypeCode,
                 RegionalDivisionTypeCode, RegionalDivisionRef,
-                Extra1Code, Extra2Code, Status,
+                Extra1Code, Extra2Code, Extra3Code, Extra4Code, Status,
                 CreationDate, Creator, LastModificationDate, LastModifier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), 1, GETDATE(), 1)
         """
 
         for _, row in missing_df.iterrows():
@@ -1012,7 +1442,7 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             level_code = _level_code(row)
             type_code = _type_code(row)
             regional_ref = _regional_ref(row)
-            extra1, extra2, rd_type = _extra_fields(source_id)
+            extra1, extra2, extra3, extra4, rd_type = _extra_fields(source_id)
 
             # Conceptual match: (Code, Title) only — Extra fields are not identity
             existing_id = code_title_index.get(_code_title_key(code, title))
@@ -1028,7 +1458,7 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
                 insert_sql,
                 (
                     last_id, code, title, level_code, type_code,
-                    rd_type, regional_ref, extra1, extra2, status,
+                    rd_type, regional_ref, extra1, extra2, extra3, extra4, status,
                 ),
             )
             dest_cursor.execute(insert_mapping_sql, (source_id, last_id))
@@ -1054,7 +1484,8 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
         UPDATE HCM3.Post
         SET Title = ?, LevelCode = ?, TypeCode = ?,
             RegionalDivisionTypeCode = ?, RegionalDivisionRef = ?,
-            Extra1Code = ?, Extra2Code = ?, Status = ?,
+            Extra1Code = ?, Extra2Code = ?, Extra3Code = ?, Extra4Code = ?,
+            Status = ?,
             LastModificationDate = GETDATE(), LastModifier = 1
         WHERE PostID = ?
           AND (
@@ -1065,6 +1496,8 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
             OR ISNULL(RegionalDivisionRef, -1) <> ISNULL(?, -1)
             OR ISNULL(Extra1Code, -2147483648) <> ISNULL(?, -2147483648)
             OR ISNULL(Extra2Code, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(Extra3Code, -2147483648) <> ISNULL(?, -2147483648)
+            OR ISNULL(Extra4Code, -2147483648) <> ISNULL(?, -2147483648)
             OR ISNULL(Status, -1) <> ISNULL(?, -1)
           )
     """
@@ -1080,20 +1513,30 @@ def ensure_posts(source_cnxn, dest_cnxn, dest_cursor):
         level_code = _level_code(row)
         type_code = _type_code(row)
         regional_ref = _regional_ref(row)
-        extra1, extra2, rd_type = _extra_fields(source_id)
+        extra1, extra2, extra3, extra4, rd_type = _extra_fields(source_id)
         dest_cursor.execute(
             update_sql,
             (
                 title, level_code, type_code, rd_type, regional_ref,
-                extra1, extra2, status, dest_id,
+                extra1, extra2, extra3, extra4, status, dest_id,
                 title, level_code, type_code, rd_type, regional_ref,
-                extra1, extra2, status,
+                extra1, extra2, extra3, extra4, status,
             ),
         )
         if dest_cursor.rowcount:
             updated += 1
     if updated:
         print(f"  -> Posts updated: {updated}.")
+
+    _drop_unused_lookup_codes(
+        dest_cursor, POST_EXTRA1_LOOKUP, set(extra1_by_post.values())
+    )
+    _drop_unused_lookup_codes(
+        dest_cursor, POST_EXTRA2_LOOKUP, set(extra2_by_post.values())
+    )
+    _drop_unused_lookup_codes(
+        dest_cursor, POST_EXTRA4_LOOKUP, set(extra4_by_post.values())
+    )
 
     return result
 
@@ -1815,8 +2258,8 @@ def ensure_places_as_work_locations(source_cnxn, dest_cnxn, dest_cursor):
 
 def ensure_rank_codes_from_grades(dest_cnxn, dest_cursor, grade_values):
     """
-    Personal grades 1-20 are EmployeeStatute Extra1.
-    The lookup value is the number alone, without the word رتبه.
+    Personal grades 1-20 are EmployeeStatute Extra1 (رتبه).
+    The lookup value is the number alone. Rank (طبقه شغلی) is the five job classes.
     """
     code_to_value = {}
     for g in grade_values:

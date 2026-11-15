@@ -22,6 +22,8 @@ import warnings
 from db_core import get_connections
 from utils.date_helpers import shamsi_to_gregorian
 from utils.roll_formula_properties import (
+    DETAIL_LIVE_FILTER,
+    SCORE_LIVE_FILTER,
     SCORE_PARENT_ID,
     STATUTE_PARENT_ID,
     load_service_history_factor_ids,
@@ -41,18 +43,7 @@ VALUE_DETAIL_PRICE = "detail_price"
 VALUE_SCORE_SYSTEM = "score_system"
 VALUE_SCORE_USER = "score_user"
 
-_NOT_DELETED_DETAIL = """
-    AND (
-        d.HRS_RddDeleteDate IS NULL
-        OR LTRIM(RTRIM(d.HRS_RddDeleteDate)) IN (N'', N'0')
-    )
-"""
-_NOT_DELETED_SCORE = """
-    AND (
-        s.HRS_RdsDeleteDate IS NULL
-        OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
-    )
-"""
+_NOT_DELETED_SCORE = SCORE_LIVE_FILTER
 
 
 def setup_value_mapping_table(cursor):
@@ -260,12 +251,14 @@ def _load_detail_prices(source_cnxn):
             d.HRS_RdID_fk AS SourceRuleDocumentID,
             d.PAY_PfID_fk AS SourcePayrollFactorID,
             CAST(d.HRS_RddPrice AS decimal(28, 6)) AS Amount,
-            d.HRS_RddRegisterDate AS RegisterDate
+            d.HRS_RddRegisterDate AS RegisterDate,
+            CASE WHEN ISNULL(d.HRS_RddActive, 0) = 1 THEN 1 ELSE 0 END
+                AS PreferActive
         FROM dbo.HRS_RuleDocumentDetail d
         INNER JOIN dbo.PAY_PayrollFactor pf ON pf.PAY_PfID = d.PAY_PfID_fk
         WHERE pf.PAY_PfParentID_fk = {STATUTE_PARENT_ID}
           AND d.PAY_PfID_fk > 0
-          {_NOT_DELETED_DETAIL}
+          {DETAIL_LIVE_FILTER}
         """,
         source_cnxn,
     )
@@ -279,7 +272,9 @@ def _load_score_amounts(source_cnxn, parent_id, amount_column):
             s.PAY_PfID_fk AS SourcePayrollFactorID,
             TRY_CAST(s.{amount_column} AS decimal(28, 6)) AS Amount,
             LTRIM(RTRIM(s.{amount_column})) AS RawAmount,
-            s.HRS_RdsRegisterDate AS RegisterDate
+            s.HRS_RdsRegisterDate AS RegisterDate,
+            CASE WHEN ISNULL(s.HRS_RdsActive, 0) = 1 THEN 1 ELSE 0 END
+                AS PreferActive
         FROM dbo.HRS_RuleDocumentScores s
         INNER JOIN dbo.PAY_PayrollFactor pf ON pf.PAY_PfID = s.PAY_PfID_fk
         WHERE pf.PAY_PfParentID_fk = {int(parent_id)}
@@ -310,7 +305,9 @@ def _load_service_user_amounts(source_cnxn, factor_ids):
             s.PAY_PfID_fk AS SourcePayrollFactorID,
             TRY_CAST(s.HRS_RdsUserAmount AS decimal(28, 6)) AS Amount,
             LTRIM(RTRIM(s.HRS_RdsUserAmount)) AS RawAmount,
-            s.HRS_RdsRegisterDate AS RegisterDate
+            s.HRS_RdsRegisterDate AS RegisterDate,
+            CASE WHEN ISNULL(s.HRS_RdsActive, 0) = 1 THEN 1 ELSE 0 END
+                AS PreferActive
         FROM dbo.HRS_RuleDocumentScores s
         WHERE s.PAY_PfID_fk IN ({id_list})
           AND NULLIF(LTRIM(RTRIM(s.HRS_RdsUserAmount)), N'') IS NOT NULL
@@ -364,10 +361,11 @@ def _dedupe(frame, exceptions, source_name):
         return frame
     work = frame.copy()
     work["RegisterDate"] = work["RegisterDate"].fillna("").astype(str).str.strip()
-    work = work.sort_values(
-        ["SourceRuleDocumentID", "SourcePayrollFactorID", "RegisterDate"],
-        kind="mergesort",
-    )
+    sort_cols = ["SourceRuleDocumentID", "SourcePayrollFactorID"]
+    if "PreferActive" in work.columns:
+        sort_cols.append("PreferActive")
+    sort_cols.append("RegisterDate")
+    work = work.sort_values(sort_cols, kind="mergesort")
     duplicate = work.duplicated(
         ["SourceRuleDocumentID", "SourcePayrollFactorID"], keep="last"
     )
@@ -378,7 +376,11 @@ def _dedupe(frame, exceptions, source_name):
             int(row["SourceRuleDocumentID"]),
             int(row["SourcePayrollFactorID"]),
             source_name,
-            "kept the latest register date",
+            (
+                "kept the active row, then the latest register date"
+                if "PreferActive" in work.columns
+                else "kept the latest register date"
+            ),
         )
     extra = int(duplicate.sum()) - len(dropped.head(EXCEPTION_LIMIT))
     if extra > 0:
@@ -555,6 +557,109 @@ def run():
         dest_cnxn.rollback()
         print(
             "Migration failed during Employee Statute Factor values. "
+            f"Transaction rolled back. Error: {exc}"
+        )
+        raise
+    finally:
+        dest_cnxn.close()
+        source_cnxn.close()
+
+
+def insert_missing_detail_prices(include_detail=True, include_scores=True):
+    """Insert amounts the old delete-token filter left out.
+
+    Rows already in the mapping stay as they are. run() still rebuilds
+    every stored value when the step is executed from the migrator.
+    """
+    print("\n--- Backfill: live factor amounts skipped by the delete token ---")
+    source_cnxn, dest_cnxn = get_connections()
+    dest_cursor = dest_cnxn.cursor()
+    exceptions = _ExceptionLog()
+    try:
+        setup_value_mapping_table(dest_cursor)
+        dest_cnxn.commit()
+        statutes = _load_statutes(dest_cnxn)
+        factor_map = {
+            int(r["SourcePayrollFactorID"]): int(r["DestStatuteFactorID"])
+            for _, r in pd.read_sql(
+                "SELECT SourcePayrollFactorID, DestStatuteFactorID "
+                "FROM master.dbo.StatuteFactorMigrationMapping",
+                dest_cnxn,
+            ).iterrows()
+        }
+        properties = _load_property_index(dest_cnxn)
+        mapped = pd.read_sql(
+            """
+            SELECT SourceRuleDocumentID, SourcePayrollFactorID
+            FROM master.dbo.EmployeeStatuteFactorMigrationMapping
+            """,
+            dest_cnxn,
+        )
+        mapped_keys = set(
+            zip(
+                mapped["SourceRuleDocumentID"].astype(int),
+                mapped["SourcePayrollFactorID"].astype(int),
+            )
+        ) if not mapped.empty else set()
+        sources = []
+        if include_detail:
+            sources.append((VALUE_DETAIL_PRICE, _load_detail_prices(source_cnxn)))
+        if include_scores:
+            sources.append((
+                VALUE_SCORE_SYSTEM,
+                _load_score_amounts(
+                    source_cnxn, SCORE_PARENT_ID, "HRS_RdsSystemAmount"
+                ),
+            ))
+            sources.append((
+                VALUE_SCORE_USER,
+                _load_service_user_amounts(
+                    source_cnxn, load_service_history_factor_ids(source_cnxn)
+                ),
+            ))
+        dest_cursor = dest_cnxn.cursor()
+        next_id = _ensure_table_id(dest_cursor, "HCM3.EmployeeStatuteFactor")
+        total = 0
+        for source_name, frame in sources:
+            frame = _dedupe(frame, exceptions, source_name)
+            if mapped_keys and not frame.empty:
+                mask = [
+                    (int(rd), int(pf)) not in mapped_keys
+                    for rd, pf in zip(
+                        frame["SourceRuleDocumentID"],
+                        frame["SourcePayrollFactorID"],
+                    )
+                ]
+                frame = frame[mask]
+            print(f"  -> {source_name} not yet stored: {len(frame)}.")
+            next_id, inserted = _migrate_frame(
+                frame,
+                source_name,
+                statutes,
+                factor_map,
+                properties,
+                exceptions,
+                dest_cursor,
+                next_id,
+            )
+            if not frame.empty:
+                mapped_keys.update(zip(
+                    frame["SourceRuleDocumentID"].astype(int),
+                    frame["SourcePayrollFactorID"].astype(int),
+                ))
+            total += inserted
+            print(f"  -> {source_name}: inserted {inserted}.")
+        dest_cursor.execute(
+            "UPDATE SYS3.tableIdGen SET LastId = ? WHERE TableName = ?",
+            (next_id, "HCM3.EmployeeStatuteFactor"),
+        )
+        exceptions.write()
+        dest_cnxn.commit()
+        print(f"Success! Missing factor amounts inserted: {total}.")
+    except Exception as exc:
+        dest_cnxn.rollback()
+        print(
+            "Backfill failed for skipped factor amounts. "
             f"Transaction rolled back. Error: {exc}"
         )
         raise

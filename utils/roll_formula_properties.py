@@ -36,6 +36,26 @@ from utils.formula_break import (
 STATUTE_PARENT_ID = 2
 # امتیازات فردی. Same statute-factor path as عوامل حکمی; TypeCode is فرعی.
 SCORE_PARENT_ID = 22
+# HRS_RddDeleteDate is nchar and is not a delete date. It holds a blank,
+# 0, a username, or a numeric token. The source screen keeps the row when
+# HRS_RddActive = 1. An inactive row stays only when that token is empty,
+# which is the set already migrated before this rule.
+DETAIL_LIVE_FILTER = """
+    AND (
+        ISNULL(d.HRS_RddActive, 0) = 1
+        OR d.HRS_RddDeleteDate IS NULL
+        OR LTRIM(RTRIM(d.HRS_RddDeleteDate)) IN (N'', N'0')
+    )
+"""
+# Same column shape on HRS_RuleDocumentScores. Every non-empty token
+# seen locally is on an active parent-22 row.
+SCORE_LIVE_FILTER = """
+    AND (
+        ISNULL(s.HRS_RdsActive, 0) = 1
+        OR s.HRS_RdsDeleteDate IS NULL
+        OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
+    )
+"""
 STATUTE_PARENT_IDS = (STATUTE_PARENT_ID, SCORE_PARENT_ID)
 SERVICE_HISTORY_NOTE = (
     "FxHRS_RuleDocumentPersonnelScoresCMSL reads "
@@ -701,8 +721,9 @@ def _earliest_stored_apply_months(source_cnxn, dest_cnxn) -> dict[tuple[int, int
     (source factor, destination employment type).
 
     Parent 2 uses HRS_RddPrice, parent 22 uses HRS_RdsSystemAmount,
-    سابقه خدمت uses HRS_RdsUserAmount. A stored 0 counts. Deleted rows
-    do not. This month is the property ApplyYearMonth when it is earlier
+    سابقه خدمت uses HRS_RdsUserAmount. A stored 0 counts. A detail
+    row counts when HRS_RddActive = 1, or when its delete token is empty.
+    This month is the property ApplyYearMonth when it is earlier
     than the month the factor was defined.
     """
     et_map = load_et_maps(dest_cnxn)
@@ -731,10 +752,7 @@ def _earliest_stored_apply_months(source_cnxn, dest_cnxn) -> dict[tuple[int, int
               AND d.PAY_PfID_fk > 0
               AND d.HRS_RddPrice IS NOT NULL
               AND rd.TBL_EtID_fk IS NOT NULL
-              AND (
-                    d.HRS_RddDeleteDate IS NULL
-                    OR LTRIM(RTRIM(d.HRS_RddDeleteDate)) IN (N'', N'0')
-                  )
+              {DETAIL_LIVE_FILTER}
             UNION ALL
             SELECT s.PAY_PfID_fk, rd.TBL_EtID_fk, {ym_rd}
             FROM dbo.HRS_RuleDocumentScores s
@@ -744,10 +762,7 @@ def _earliest_stored_apply_months(source_cnxn, dest_cnxn) -> dict[tuple[int, int
               AND s.PAY_PfID_fk > 0
               AND rd.TBL_EtID_fk IS NOT NULL
               AND NULLIF(LTRIM(RTRIM(s.HRS_RdsSystemAmount)), N'') IS NOT NULL
-              AND (
-                    s.HRS_RdsDeleteDate IS NULL
-                    OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
-                  )
+              {SCORE_LIVE_FILTER}
             UNION ALL
             SELECT s.PAY_PfID_fk, rd.TBL_EtID_fk, {ym_rd}
             FROM dbo.HRS_RuleDocumentScores s
@@ -755,10 +770,7 @@ def _earliest_stored_apply_months(source_cnxn, dest_cnxn) -> dict[tuple[int, int
             WHERE s.PAY_PfID_fk > 0
               AND rd.TBL_EtID_fk IS NOT NULL
               AND NULLIF(LTRIM(RTRIM(s.HRS_RdsUserAmount)), N'') IS NOT NULL
-              AND (
-                    s.HRS_RdsDeleteDate IS NULL
-                    OR LTRIM(RTRIM(s.HRS_RdsDeleteDate)) IN (N'', N'0')
-                  )
+              {SCORE_LIVE_FILTER}
               {service_filter}
         ) amounts
         WHERE YM IS NOT NULL
